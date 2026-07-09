@@ -52,6 +52,7 @@ export function ProjectModal({ open, onClose, project }: ProjectModalProps) {
     } else {
       setForm(emptyForm);
     }
+    setActiveTab('general');
     setErrors([]);
   }, [project, open]);
 
@@ -301,21 +302,42 @@ export function ProjectModal({ open, onClose, project }: ProjectModalProps) {
 
             {/* Modal Footer Controls */}
             <div className="border-t border-line pt-4 flex gap-3.5 justify-end">
-              <button 
-                type="button" 
-                onClick={onClose} 
-                className="px-5 py-2.5 rounded-xl bg-surface-2 hover:bg-surface-3 border border-line text-xs font-bold text-ink-soft hover:text-ink transition-colors"
-              >
-                Cancel
-              </button>
-              <button 
-                type="submit" 
-                disabled={mutation.isPending} 
-                className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-accent to-accent-hover hover:scale-[1.02] text-accent-on font-bold text-xs transition-all disabled:opacity-40 disabled:scale-100 flex items-center gap-1.5 shadow-[0_4px_15px_-3px_var(--accent)]/30"
-              >
-                <ShieldCheck size={14} className="stroke-[3]" />
-                {mutation.isPending ? 'SAVING...' : 'SAVE CONFIG'}
-              </button>
+              {activeTab === 'general' ? (
+                <>
+                  <button 
+                    type="button" 
+                    onClick={onClose} 
+                    className="px-5 py-2.5 rounded-xl bg-surface-2 hover:bg-surface-3 border border-line text-xs font-bold text-ink-soft hover:text-ink transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="button" 
+                    onClick={() => setActiveTab('auth')} 
+                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-accent to-accent-hover hover:scale-[1.02] text-accent-on font-bold text-xs transition-all flex items-center gap-1.5 shadow-[0_4px_15px_-3px_var(--accent)]/30"
+                  >
+                    Next
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button 
+                    type="button" 
+                    onClick={() => setActiveTab('general')} 
+                    className="px-5 py-2.5 rounded-xl bg-surface-2 hover:bg-surface-3 border border-line text-xs font-bold text-ink-soft hover:text-ink transition-colors"
+                  >
+                    Back
+                  </button>
+                  <button 
+                    type="submit" 
+                    disabled={mutation.isPending} 
+                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-accent to-accent-hover hover:scale-[1.02] text-accent-on font-bold text-xs transition-all disabled:opacity-40 disabled:scale-100 flex items-center gap-1.5 shadow-[0_4px_15px_-3px_var(--accent)]/30"
+                  >
+                    <ShieldCheck size={14} className="stroke-[3]" />
+                    {mutation.isPending ? 'SAVING...' : 'SAVE CONFIG'}
+                  </button>
+                </>
+              )}
             </div>
           </form>
         </div>

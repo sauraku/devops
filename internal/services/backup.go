@@ -58,10 +58,8 @@ func (s *BackupService) Create(projectID, branch, reason string) (*models.Deploy
 		"BACKUP_REASON":        reason,
 		"BACKUP_DIR_PATH":      backupDir,
 		"BACKUP_MANIFEST_FILE": manifestFile,
-		"BASE_DIR":             s.cfg.BaseDir,
 		"ENV_FILE":             filepath.Join(s.cfg.BaseDir, "Projects", projectID, ".env."+branch),
-		"FIREBASE_STORAGE_BUCKET": os.Getenv("FIREBASE_STORAGE_BUCKET"),
-		"GOOGLE_APPLICATION_CREDENTIALS": os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+		"BASE_DIR":             s.cfg.BaseDir,
 	}
 
 	deployment := &models.Deployment{
@@ -101,10 +99,7 @@ func (s *BackupService) runBackup(d *models.Deployment, p *models.Project, env m
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	script := filepath.Join(p.AppDir, "scripts", "backup-db.sh")
-	if _, err := os.Stat(script); os.IsNotExist(err) {
-		script = filepath.Join(s.cfg.ProjectRoot, "scripts", "backup-db.sh")
-	}
+	script := filepath.Join(s.cfg.ProjectRoot, "scripts", "backup-db.sh")
 	appDir := p.AppDir
 	args := []string{script}
 
@@ -398,11 +393,8 @@ func (s *BackupService) Restore(projectID, backupID string) (*models.Deployment,
 		"BACKUP_ID":            backupID,
 		"BACKUP_DIR_PATH":      backupDir,
 		"BACKUP_MANIFEST_FILE": manifestFile,
-		"BASE_DIR":             s.cfg.BaseDir,
 		"ENV_FILE":             filepath.Join(s.cfg.BaseDir, "Projects", projectID, ".env."+p.BranchName),
 		"COMPOSE_FILE":         filepath.Join(s.cfg.BaseDir, "Projects", projectID, "docker-compose.yml"),
-		"FIREBASE_STORAGE_BUCKET": os.Getenv("FIREBASE_STORAGE_BUCKET"),
-		"GOOGLE_APPLICATION_CREDENTIALS": os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
 	}
 
 	deployment := &models.Deployment{
@@ -440,10 +432,7 @@ func (s *BackupService) runRestore(d *models.Deployment, p *models.Project, env 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
-	script := filepath.Join(p.AppDir, "scripts", "restore-db.sh")
-	if _, err := os.Stat(script); os.IsNotExist(err) {
-		script = filepath.Join(s.cfg.ProjectRoot, "scripts", "restore-db.sh")
-	}
+	script := filepath.Join(s.cfg.ProjectRoot, "scripts", "restore-db.sh")
 	args := []string{script, backupID}
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)

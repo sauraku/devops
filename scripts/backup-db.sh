@@ -187,23 +187,41 @@ PY
 # ── Upload to Firebase Storage when configured ──
 FIREBASE_BUCKET="${FIREBASE_STORAGE_BUCKET:-}"
 FIREBASE_CREDS="${GOOGLE_APPLICATION_CREDENTIALS:-}"
-if [ -n "${FIREBASE_BUCKET}" ] && [ -n "${FIREBASE_CREDS}" ] && [ -f "${FIREBASE_CREDS}" ]; then
+FIREBASE_CLIENT="${FIREBASE_CLIENT_EMAIL:-}"
+FIREBASE_PK_B64="${FIREBASE_PRIVATE_KEY_B64:-}"
+FIREBASE_TOKEN_URI="${FIREBASE_TOKEN_URI:-https://oauth2.googleapis.com/token}"
+if [ -n "${FIREBASE_BUCKET}" ]; then
   echo "Uploading backup to Firebase Storage..."
   ACCESS_TOKEN=$(python3 -c "
-import json, time, jwt, urllib.request, urllib.parse
-with open('${FIREBASE_CREDS}') as f:
-    key = json.load(f)
+import json, time, jwt, base64, urllib.request, urllib.parse
+
+creds_path = '${FIREBASE_CREDS}'
+client_email = '${FIREBASE_CLIENT}'
+pk_b64 = '${FIREBASE_PK_B64}'
+token_uri = '${FIREBASE_TOKEN_URI}'
+
+if creds_path and __import__('os').path.isfile(creds_path):
+    with open(creds_path) as f:
+        key = json.load(f)
+    client_email = key['client_email']
+    token_uri = key.get('token_uri', token_uri)
+    private_key = key['private_key']
+elif pk_b64:
+    private_key = base64.b64decode(pk_b64).decode()
+else:
+    raise RuntimeError('no Firebase credentials available')
+
 now = int(time.time())
 payload = {
-    'iss': key['client_email'],
+    'iss': client_email,
     'scope': 'https://www.googleapis.com/auth/devstorage.read_write',
-    'aud': key['token_uri'],
+    'aud': token_uri,
     'exp': now + 3600,
     'iat': now,
 }
-jwt_token = jwt.encode(payload, key['private_key'], algorithm='RS256')
+jwt_token = jwt.encode(payload, private_key, algorithm='RS256')
 data = urllib.parse.urlencode({'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': jwt_token}).encode()
-req = urllib.request.Request(key['token_uri'], data=data)
+req = urllib.request.Request(token_uri, data=data)
 with urllib.request.urlopen(req) as resp:
     token_data = json.loads(resp.read())
 print(token_data['access_token'])
