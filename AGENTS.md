@@ -2,6 +2,20 @@
 
 > **Critical rule:** Never commit, push, or otherwise modify git remotes unless explicitly told to. Wait for instruction.
 
+> **Prod-readiness mandate:** Every single change — no matter how small — MUST be vetted for production security and reliability before committing or pushing. Ask yourself:
+>   1. Does this leak secrets, tokens, or internal paths to logs, error messages, HTTP responses, or the UI?
+>   2. Does this change operate on the correct Docker resources (containers, volumes, networks) and could it accidentally affect non-devops containers?
+>   3. Does this introduce a crash, hang, or unhandled error path that could take the control plane or a project offline?
+>   4. Does this change work correctly when the env file contains session vars (HOME, PATH, PWD, SHLVL, etc.) that override critical shell state?
+>   5. Does this change rely on a file, directory, or service that may not exist or may have restrictive permissions in production?
+>   6. Does this change handle the case where the server has zero devops projects, or the Projects directory is empty, missing, or permission-denied?
+>   7. For any docker command — are the right filters in place? Never use `docker rm -f $(docker ps -aq)` or equivalent blanket operations.
+>   8. For any bash script sourcing an env file — are HOME/PATH/PWD restored afterward to avoid breaking subsequent commands?
+>   9. Does this regenerate or expose the devops token, JWT_SECRET, or registry passwords anywhere they shouldn't be?
+>   10. If this modifies a deploy/backup/teardown script — does it work when curl-piped into bash (non-interactive, no tty)?
+>   
+>   **If any answer is "no" or "I'm not sure," STOP and fix before pushing.**
+
 ## Quick Reference
 
 | What | Command |
