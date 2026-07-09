@@ -257,7 +257,7 @@ func (s *ProjectService) Status(projectID string) (*models.ProjectStatus, error)
 	health := make(map[string]*models.ServiceHealth)
 
 	for _, svc := range services {
-		containerName := DeploymentContainerName(svc, p.BranchName, p.ID)
+		containerName := s.FindContainerName(p.ID, svc, p.BranchName)
 		summary := s.docker.ContainerSummary(containerName)
 		containers["current"][svc] = summary.State
 		health[svc] = s.CheckServiceHealth(svc, containerName, summary)
@@ -394,7 +394,7 @@ func (s *ProjectService) ReconcileContainers() {
 	for _, p := range projects {
 		services := s.composeServices(p)
 		for _, svc := range services {
-			containerName := DeploymentContainerName(svc, p.BranchName, p.ID)
+			containerName := s.FindContainerName(p.ID, svc, p.BranchName)
 			summary := s.docker.ContainerSummary(containerName)
 			if !summary.Exists {
 				log.Printf("Reconcile: container %s does not exist (project %s, service %s) — skipping", containerName, p.ID, svc)
@@ -709,6 +709,30 @@ func (s *ProjectService) RunnerAction(projectID, action string) (string, error) 
 		msg = "Runner restart initiated."
 	}
 	return msg, nil
+}
+
+// FindContainerName resolves a project service container name.
+// First tries the branch-derived name; if not found, scans Docker for any
+// container matching {projectID}-*-{service} (handles COMPOSE_PROJECT_NAME
+// differing from the branch name).
+func (s *ProjectService) FindContainerName(projectID, service, branch string) string {
+	derived := DeploymentContainerName(service, branch, projectID)
+	summary := s.docker.ContainerSummary(derived)
+	if summary.Exists {
+		return derived
+	}
+	prefix := projectID + "-"
+	suffix := "-" + service
+	names, err := s.docker.ListContainers("name=^/" + prefix)
+	if err != nil {
+		return derived
+	}
+	for _, name := range names {
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
+			return name
+		}
+	}
+	return derived
 }
 
 func DeploymentContainerName(service, branch, projectID string) string {

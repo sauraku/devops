@@ -60,7 +60,7 @@ func (h *Handler) DebugInfo(w http.ResponseWriter, r *http.Request) {
 	for _, p := range projects {
 		pd := projectDebug{ID: p.ID, Containers: make(map[string]string), ServiceHealth: make(map[string]*models.ServiceHealth)}
 		for _, svc := range svcNames {
-			containerName := services.DeploymentContainerName(svc, p.BranchName, p.ID)
+			containerName := h.projects.FindContainerName(p.ID, svc, p.BranchName)
 			summary := h.projects.Docker().ContainerSummary(containerName)
 			pd.Containers[svc] = summary.State
 			pd.ServiceHealth[svc] = h.projects.CheckServiceHealth(svc, containerName, summary)
