@@ -375,6 +375,27 @@ done
 
 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d --force-recreate --remove-orphans ${PULL_FLAGS}
 
+# Create admin user if MEDUSA_ADMIN_EMAIL is set
+set -a
+# shellcheck source=/dev/null
+source "${ENV_FILE}" 2>/dev/null || true
+set +a
+if [ -n "${MEDUSA_ADMIN_EMAIL:-}" ] && [ -n "${MEDUSA_ADMIN_PASSWORD:-}" ]; then
+  BACKEND_CONTAINER="${COMPOSE_PROJECT_NAME}-backend"
+  echo "Creating admin user ${MEDUSA_ADMIN_EMAIL}..."
+  # Wait for backend to be healthy
+  for i in $(seq 1 30); do
+    health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}running{{end}}' "${BACKEND_CONTAINER}" 2>/dev/null || echo "")
+    if [ "${health}" = "healthy" ] || [ "${health}" = "running" ]; then
+      break
+    fi
+    sleep 2
+  done
+  docker exec "${BACKEND_CONTAINER}" npx medusa user \
+    -e "${MEDUSA_ADMIN_EMAIL}" -p "${MEDUSA_ADMIN_PASSWORD}" 2>&1 || \
+    echo "Warning: admin user creation failed (may already exist)"
+fi
+
 DEPLOY_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 export PROJECT_ID BRANCH IMAGE_TAG DEPLOY_ID DEPLOY_STARTED_AT DEPLOY_FINISHED_AT COMPOSE_PROJECT_NAME COMPOSE_FILE ENV_FILE GITHUB_RUN_ID GITHUB_RUN_NUMBER GITHUB_ACTOR GITHUB_REPOSITORY GITHUB_WORKFLOW COMMIT_MESSAGE
 
