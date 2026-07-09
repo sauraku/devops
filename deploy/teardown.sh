@@ -39,7 +39,7 @@ DEV_IMAGES=$(docker images --filter "reference=ghcr.io/${GITHUB_ORG}/devops" --f
 # Derive compose project names from registered projects in the data directory
 PROJECT_NAMES=""
 if [ -d "${DATA_DIR}/Projects" ]; then
-  PROJECT_NAMES=$(cd "${DATA_DIR}/Projects" && ls -1 2>/dev/null)
+  PROJECT_NAMES=$(ls -1 "${DATA_DIR}/Projects/" 2>/dev/null || sudo -n ls -1 "${DATA_DIR}/Projects/" 2>/dev/null || true)
 fi
 
 # Collect all project containers managed via compose — match known project prefixes only
@@ -52,7 +52,7 @@ for project in ${PROJECT_NAMES}; do
     [ -f "${envf}" ] || continue
     cpn=""
     # shellcheck disable=SC1090
-    cpn=$(grep -s '^COMPOSE_PROJECT_NAME=' "${envf}" | tail -1 | cut -d= -f2)
+    cpn=$(grep -s '^COMPOSE_PROJECT_NAME=' "${envf}" 2>/dev/null | tail -1 | cut -d= -f2)
     [ -z "${cpn}" ] && cpn="${project}"
     # Match containers and volumes with this prefix
     matched_containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${cpn}-" || true)
@@ -160,10 +160,10 @@ done
 # Remove persistent data
 if [ -d "${DATA_DIR}" ]; then
   echo "  Removing persistent data: ${DATA_DIR}"
-  rm -rf "${DATA_DIR}" 2>/dev/null || sudo rm -rf "${DATA_DIR}" 2>/dev/null || {
+  rm -rf "${DATA_DIR}" 2>/dev/null || sudo -n rm -rf "${DATA_DIR}" 2>/dev/null || {
     docker run --rm -v "${DATA_DIR}:/data" alpine sh -c 'rm -rf /data/[!.]* /data/.[!.]* /data/..?*' 2>/dev/null
     rmdir "${DATA_DIR}" 2>/dev/null || true
-  } || echo "  ⚠ Could not fully remove ${DATA_DIR}"
+  } || echo "  ⚠ Could not remove ${DATA_DIR} (try: sudo rm -rf ${DATA_DIR})"
 fi
 
 echo ""
