@@ -36,32 +36,20 @@ DEV_VOLUMES=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '^devo
 DEV_NETWORKS=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^devops-orchestrator-')
 DEV_IMAGES=$(docker images --filter "reference=ghcr.io/${GITHUB_ORG}/devops" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)
 
-# Derive compose project names from registered projects in the data directory
+# Collect project containers/volumes from registered projects in the data directory.
+# Match by project name prefix — catches all branches/envs (medusa-main-*, medusa-dev-*, medusa_*, etc.).
 PROJECT_NAMES=""
+COMPOSE_CONTAINERS=""
+COMPOSE_VOLUMES=""
 if [ -d "${DATA_DIR}/Projects" ]; then
   PROJECT_NAMES=$(ls -1 "${DATA_DIR}/Projects/" 2>/dev/null || sudo -n ls -1 "${DATA_DIR}/Projects/" 2>/dev/null || true)
 fi
-
-# Collect all project containers managed via compose — match known project prefixes only
-COMPOSE_CONTAINERS=""
-COMPOSE_VOLUMES=""
 for project in ${PROJECT_NAMES}; do
-  # Each project may have env files: .env, .env.dev, .env.main, etc.
-  # Derive compose project names from each env file
-  for envf in "${DATA_DIR}/Projects/${project}/.env" "${DATA_DIR}/Projects/${project}/.env."*; do
-    [ -f "${envf}" ] || continue
-    cpn=""
-    # shellcheck disable=SC1090
-    cpn=$(grep -s '^COMPOSE_PROJECT_NAME=' "${envf}" 2>/dev/null | tail -1 | cut -d= -f2)
-    [ -z "${cpn}" ] && cpn="${project}"
-    # Match containers and volumes with this prefix
-    matched_containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${cpn}-" || true)
-    matched_volumes=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E "^${cpn}_" || true)
-    COMPOSE_CONTAINERS="${COMPOSE_CONTAINERS} ${matched_containers}"
-    COMPOSE_VOLUMES="${COMPOSE_VOLUMES} ${matched_volumes}"
-  done
+  matched_containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${project}-" || true)
+  matched_volumes=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E "^${project}_" || true)
+  COMPOSE_CONTAINERS="${COMPOSE_CONTAINERS} ${matched_containers}"
+  COMPOSE_VOLUMES="${COMPOSE_VOLUMES} ${matched_volumes}"
 done
-# Deduplicate
 COMPOSE_CONTAINERS=$(echo "${COMPOSE_CONTAINERS}" | tr ' ' '\n' | sort -u | xargs)
 COMPOSE_VOLUMES=$(echo "${COMPOSE_VOLUMES}" | tr ' ' '\n' | sort -u | xargs)
 
