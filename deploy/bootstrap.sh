@@ -79,10 +79,12 @@ docker run -d \
   --add-host host.docker.internal:host-gateway \
   -e "BASE_DIR=$DATA_DIR" \
   -e SSH_HOST=host.docker.internal \
+  -e SSH_DIR="$HOME/.ssh" \
   -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
   --env-file "$ENV_FILE" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$DATA_DIR":"$DATA_DIR" \
+  -v "$HOME/.ssh":"$HOME/.ssh":ro \
   -p "${HOST_PORT}:8787" \
   "$IMAGE"
 

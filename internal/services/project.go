@@ -318,8 +318,11 @@ func (s *ProjectService) validateRepoURL(url string) error {
 }
 
 func (s *ProjectService) startRunner(p *models.Project, runnerToken string) error {
-	homeDir, _ := os.UserHomeDir()
-	sshDir := filepath.Join(homeDir, ".ssh")
+	sshDir := os.Getenv("SSH_DIR")
+	if sshDir == "" {
+		homeDir, _ := os.UserHomeDir()
+		sshDir = filepath.Join(homeDir, ".ssh")
+	}
 	// Generate scoped runner token to avoid leaking the master deploy token
 	mac := hmac.New(sha256.New, []byte(s.cfg.Token))
 	mac.Write([]byte("runner:" + p.ID))
