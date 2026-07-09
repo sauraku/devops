@@ -35,10 +35,20 @@ if [ ! -f "${DEPLOY_ENV_FILE}" ]; then
   exit 1
 fi
 
+# Save critical host env vars that the project env file may override
+_SAVED_HOME="${HOME}"
+_SAVED_PATH="${PATH}"
+_SAVED_PWD="${PWD}"
+_SAVED_SHLVL="${SHLVL}"
 set -a
 # shellcheck source=/dev/null
 source "${DEPLOY_ENV_FILE}"
 set +a
+# Restore critical host env vars
+HOME="${_SAVED_HOME}"
+PATH="${_SAVED_PATH}"
+PWD="${_SAVED_PWD}"
+SHLVL="${_SAVED_SHLVL}"
 
 ENV_NAME="${ENV_NAME:-${TARGET_BRANCH:-rc}}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${PROJECT_ID:-project}-${ENV_NAME}}"
@@ -193,34 +203,45 @@ FIREBASE_TOKEN_URI="${FIREBASE_TOKEN_URI:-https://oauth2.googleapis.com/token}"
 if [ -n "${FIREBASE_BUCKET}" ]; then
   echo "Uploading backup to Firebase Storage..."
   ACCESS_TOKEN=$(python3 -c "
-import json, time, jwt, base64, urllib.request, urllib.parse
+import json, time, base64, urllib.request, urllib.parse, subprocess, os, tempfile
 
 creds_path = '${FIREBASE_CREDS}'
 client_email = '${FIREBASE_CLIENT}'
 pk_b64 = '${FIREBASE_PK_B64}'
 token_uri = '${FIREBASE_TOKEN_URI}'
 
-if creds_path and __import__('os').path.isfile(creds_path):
+if creds_path and os.path.isfile(creds_path):
     with open(creds_path) as f:
         key = json.load(f)
     client_email = key['client_email']
     token_uri = key.get('token_uri', token_uri)
-    private_key = key['private_key']
+    pem_bytes = key['private_key'].encode()
 elif pk_b64:
-    private_key = base64.b64decode(pk_b64).decode()
+    pem_bytes = base64.b64decode(pk_b64)
 else:
     raise RuntimeError('no Firebase credentials available')
 
 now = int(time.time())
-payload = {
+header_b64 = base64.urlsafe_b64encode(json.dumps({'alg':'RS256','typ':'JWT'}, separators=(',',':')).encode()).rstrip(b'=').decode()
+payload_b64 = base64.urlsafe_b64encode(json.dumps({
     'iss': client_email,
     'scope': 'https://www.googleapis.com/auth/devstorage.read_write',
     'aud': token_uri,
     'exp': now + 3600,
     'iat': now,
-}
-jwt_token = jwt.encode(payload, private_key, algorithm='RS256')
-data = urllib.parse.urlencode({'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': jwt_token}).encode()
+}, separators=(',',':')).encode()).rstrip(b'=').decode()
+sign_input = (header_b64 + '.' + payload_b64).encode()
+
+with tempfile.NamedTemporaryFile(delete=False) as tf:
+    tf.write(pem_bytes)
+    key_path = tf.name
+result = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', key_path], input=sign_input, capture_output=True)
+os.unlink(key_path)
+result.check_returncode()
+signature = base64.urlsafe_b64encode(result.stdout).rstrip(b'=').decode()
+
+jwt_assertion = f'{sign_input.decode()}.{signature}'
+data = urllib.parse.urlencode({'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': jwt_assertion}).encode()
 req = urllib.request.Request(token_uri, data=data)
 with urllib.request.urlopen(req) as resp:
     token_data = json.loads(resp.read())
