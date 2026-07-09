@@ -222,7 +222,7 @@ func (c *Client) ComposeUp(composeFile, projectName string, envVars map[string]s
 	defer cancel()
 
 	cmdArgs := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
-	cmdArgs = append(cmdArgs, "up", "-d", "--build")
+	cmdArgs = append(cmdArgs, "up", "-d")
 	cmdArgs = append(cmdArgs, services...)
 
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)

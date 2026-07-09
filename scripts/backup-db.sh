@@ -184,4 +184,49 @@ with open(manifest_path, "a", encoding="utf-8") as handle:
 print(json.dumps(entry, sort_keys=True))
 PY
 
+# ── Upload to Firebase Storage when configured ──
+FIREBASE_BUCKET="${FIREBASE_STORAGE_BUCKET:-}"
+FIREBASE_CREDS="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+if [ -n "${FIREBASE_BUCKET}" ] && [ -n "${FIREBASE_CREDS}" ] && [ -f "${FIREBASE_CREDS}" ]; then
+  echo "Uploading backup to Firebase Storage..."
+  ACCESS_TOKEN=$(python3 -c "
+import json, time, jwt, urllib.request, urllib.parse
+with open('${FIREBASE_CREDS}') as f:
+    key = json.load(f)
+now = int(time.time())
+payload = {
+    'iss': key['client_email'],
+    'scope': 'https://www.googleapis.com/auth/devstorage.read_write',
+    'aud': key['token_uri'],
+    'exp': now + 3600,
+    'iat': now,
+}
+jwt_token = jwt.encode(payload, key['private_key'], algorithm='RS256')
+data = urllib.parse.urlencode({'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': jwt_token}).encode()
+req = urllib.request.Request(key['token_uri'], data=data)
+with urllib.request.urlopen(req) as resp:
+    token_data = json.loads(resp.read())
+print(token_data['access_token'])
+" 2>/dev/null || echo "")
+
+  if [ -n "${ACCESS_TOKEN:-}" ]; then
+    REMOTE_PATH="backups/${COMPOSE_PROJECT_NAME}/${BACKUP_ID}.dump.gz"
+    ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${REMOTE_PATH}', safe=''))" 2>/dev/null)
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -X POST \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+      -H "Content-Type: application/octet-stream" \
+      --data-binary "@${BACKUP_FILE}" \
+      "https://storage.googleapis.com/upload/storage/v1/b/${FIREBASE_BUCKET}/o?uploadType=media&name=${ENCODED_PATH}" 2>&1)
+
+    if [ "${HTTP_CODE}" = "200" ]; then
+      echo "Firebase upload complete."
+    else
+      echo "WARNING: Firebase upload failed (HTTP ${HTTP_CODE}). Backup is available locally." >&2
+    fi
+  else
+    echo "WARNING: Could not obtain Firebase access token. Backup saved locally only." >&2
+  fi
+fi
+
 echo "Backup complete: ${BACKUP_ID}"
