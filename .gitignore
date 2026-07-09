@@ -1,0 +1,41 @@
+# Live secrets and host-specific environment files
+.env
+.env.*
+!.env.template
+
+# Agent session logs and internal tracking (not for public repo)
+HANDOFF.md
+docs/TODO.md
+
+# Runtime state, logs, backups, and release manifests
+Backups/
+Logs/
+Releases/
+State/
+
+# Base data directory
+data/
+
+# Go build artifacts
+/devops-control
+/devops-control.exe
+tmp/
+
+# UI build artifacts
+ui/node_modules/
+ui/dist/
+
+# Embedded UI dist (build artifact, not source)
+internal/api/ui/dist/
+
+# Local/generated files
+__pycache__/
+*.py[cod]
+.DS_Store
+.vscode/
+.idea/
+.docker/
+
+# Generic project configs
+Projects/*
+!Projects/.gitkeep

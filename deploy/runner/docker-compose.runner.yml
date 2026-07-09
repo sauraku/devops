@@ -1,0 +1,47 @@
+name: ${RUNNER_COMPOSE_PROJECT_NAME:-devops-runner}
+
+services:
+  github-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    container_name: ${RUNNER_CONTAINER_NAME:-devops-github-runner}
+    user: root
+    restart: unless-stopped
+    extra_hosts:
+      - "deploy-control:host-gateway"
+    environment:
+      - REPO_URL=${REPO_URL}
+      - RUNNER_TOKEN=${RUNNER_TOKEN}
+      - RUNNER_NAME=${RUNNER_NAME:-devops-runner}
+      - RUNNER_DIR=${RUNNER_STATE_DIR:-/runner-state}
+      - RUNNER_ALLOW_RUNASROOT=1
+      - REPO_HOST_DIR=${REPO_HOST_DIR:?REPO_HOST_DIR is required}
+      - PYTHONUNBUFFERED=1
+      - RUNNER_LABELS=${RUNNER_LABELS:-development}
+      - DEPLOY_BRANCH=${DEPLOY_BRANCH:-main}
+      - DEPLOY_BRANCH_SLUG=${DEPLOY_BRANCH_SLUG:-main}
+      - DEPLOY_CONTROL_TOKEN=${DEPLOY_CONTROL_TOKEN}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount host SSH keys for git operations
+      - ${SSH_DIR:?SSH_DIR is required}:/root/.ssh:ro
+      # Persist runner configuration without host bind-mount chown failures.
+      - runner-state:${RUNNER_STATE_DIR:-/runner-state}
+      # Mount the project directory so deploy.sh runs in a matching path on the host
+      - ${REPO_HOST_DIR:?REPO_HOST_DIR is required}:${REPO_HOST_DIR:?REPO_HOST_DIR is required}
+      # Mount orchestrator directory
+      - ${BASE_DIR:?BASE_DIR is required}:${BASE_DIR:?BASE_DIR is required}
+      # Mount the project-specific logs directory
+      - ${PROJECT_LOG_DIR:-./Logs}:/logs
+    networks:
+      - orchestrator-net
+
+volumes:
+  runner-state:
+    name: ${RUNNER_STATE_VOLUME:-devops-github-runner-state}
+
+networks:
+  orchestrator-net:
+    name: devops-orchestrator-net
+    driver: bridge
