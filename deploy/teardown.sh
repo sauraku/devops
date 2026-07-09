@@ -36,9 +36,34 @@ DEV_VOLUMES=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '^devo
 DEV_NETWORKS=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^devops-orchestrator-')
 DEV_IMAGES=$(docker images --filter "reference=ghcr.io/${GITHUB_ORG}/devops" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)
 
-# Also collect all project containers managed via compose
-COMPOSE_CONTAINERS=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -vE '^devops-control$|^devops-runner-')
-COMPOSE_VOLUMES=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -vE '^devops-runner-')
+# Derive compose project names from registered projects in the data directory
+PROJECT_NAMES=""
+if [ -d "${DATA_DIR}/Projects" ]; then
+  PROJECT_NAMES=$(cd "${DATA_DIR}/Projects" && ls -1 2>/dev/null)
+fi
+
+# Collect all project containers managed via compose — match known project prefixes only
+COMPOSE_CONTAINERS=""
+COMPOSE_VOLUMES=""
+for project in ${PROJECT_NAMES}; do
+  # Each project may have env files: .env, .env.dev, .env.main, etc.
+  # Derive compose project names from each env file
+  for envf in "${DATA_DIR}/Projects/${project}/.env" "${DATA_DIR}/Projects/${project}/.env."*; do
+    [ -f "${envf}" ] || continue
+    cpn=""
+    # shellcheck disable=SC1090
+    cpn=$(grep -s '^COMPOSE_PROJECT_NAME=' "${envf}" | tail -1 | cut -d= -f2)
+    [ -z "${cpn}" ] && cpn="${project}"
+    # Match containers and volumes with this prefix
+    matched_containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${cpn}-" || true)
+    matched_volumes=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E "^${cpn}_" || true)
+    COMPOSE_CONTAINERS="${COMPOSE_CONTAINERS} ${matched_containers}"
+    COMPOSE_VOLUMES="${COMPOSE_VOLUMES} ${matched_volumes}"
+  done
+done
+# Deduplicate
+COMPOSE_CONTAINERS=$(echo "${COMPOSE_CONTAINERS}" | tr ' ' '\n' | sort -u | xargs)
+COMPOSE_VOLUMES=$(echo "${COMPOSE_VOLUMES}" | tr ' ' '\n' | sort -u | xargs)
 
 HAS_ANY=false
 
@@ -90,11 +115,10 @@ if [ "${HAS_ANY}" = false ]; then
   exit 0
 fi
 
-echo "⚠  WARNING: Project containers and volumes will ALSO be removed."
-echo "   ALL Docker containers and MOST volumes will be destroyed."
-echo "   Only devops-* prefixed resources and persistent data are safe (they are listed above)."
+echo "⚠  WARNING: Only the resources listed above will be removed."
+echo "   Unrelated containers (jellyfin, immich, etc.) will NOT be touched."
 echo ""
-echo -n "Type 'yes' to confirm permanent deletion of ALL resources: "
+echo -n "Type 'yes' to confirm permanent deletion of listed resources: "
 read -r CONFIRM
 if [ "${CONFIRM}" != "yes" ]; then
   echo "Aborted."
@@ -112,28 +136,35 @@ if [ -n "${DEVOP_PID}" ]; then
   sleep 1
 fi
 
-# Stop and remove ALL containers (full purge)
-echo "  Removing all containers..."
-docker ps -aq 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+# Remove only the resources listed above
+for c in ${DEV_CONTAINERS} ${COMPOSE_CONTAINERS}; do
+  echo "  Removing container: ${c}"
+  docker rm -f "${c}" 2>/dev/null || true
+done
 
-# Remove all images
-echo "  Removing all images..."
-docker images -q 2>/dev/null | xargs -r docker rmi -f 2>/dev/null || true
+for v in ${DEV_VOLUMES} ${COMPOSE_VOLUMES}; do
+  echo "  Removing volume: ${v}"
+  docker volume rm -f "${v}" 2>/dev/null || true
+done
 
-# Remove all volumes
-echo "  Removing all volumes..."
-docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f 2>/dev/null || true
+for n in ${DEV_NETWORKS}; do
+  echo "  Removing network: ${n}"
+  docker network rm "${n}" 2>/dev/null || true
+done
 
-# Remove all custom networks (preserve default bridge/host/none)
-echo "  Removing custom networks..."
-docker network ls --format '{{.Name}}' 2>/dev/null | grep -vE '^(bridge|host|none)$' | xargs -r docker network rm 2>/dev/null || true
+for img in ${DEV_IMAGES}; do
+  echo "  Removing image: ${img}"
+  docker rmi -f "${img}" 2>/dev/null || true
+done
 
 # Remove persistent data
-echo "  Removing persistent data: ${DATA_DIR}"
-rm -rf "${DATA_DIR}" 2>/dev/null || sudo rm -rf "${DATA_DIR}" 2>/dev/null || {
-  docker run --rm -v "${DATA_DIR}:/data" alpine sh -c 'rm -rf /data/[!.]* /data/.[!.]* /data/..?*' 2>/dev/null
-  rmdir "${DATA_DIR}" 2>/dev/null || true
-} || echo "  ⚠ Could not fully remove ${DATA_DIR}"
+if [ -d "${DATA_DIR}" ]; then
+  echo "  Removing persistent data: ${DATA_DIR}"
+  rm -rf "${DATA_DIR}" 2>/dev/null || sudo rm -rf "${DATA_DIR}" 2>/dev/null || {
+    docker run --rm -v "${DATA_DIR}:/data" alpine sh -c 'rm -rf /data/[!.]* /data/.[!.]* /data/..?*' 2>/dev/null
+    rmdir "${DATA_DIR}" 2>/dev/null || true
+  } || echo "  ⚠ Could not fully remove ${DATA_DIR}"
+fi
 
 echo ""
-echo "==> Teardown complete. ALL Docker resources removed."
+echo "==> Teardown complete. Only devops resources were removed."
