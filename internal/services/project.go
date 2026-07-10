@@ -155,11 +155,11 @@ func (s *ProjectService) CreateOrUpdate(req *models.ProjectRequest) (*models.Pro
 	}
 
 	runnerToken := ""
-	if req.RunnerToken != nil {
-		runnerToken = strings.TrimSpace(*req.RunnerToken)
-	}
-	if runnerToken == "" && s.cfg.GithubToken != "" {
+	// Prefer PAT (GITHUB_TOKEN) over a registration token — PAT doesn't expire
+	if s.cfg.GithubToken != "" {
 		runnerToken = s.cfg.GithubToken
+	} else if req.RunnerToken != nil {
+		runnerToken = strings.TrimSpace(*req.RunnerToken)
 	}
 	listenerActive := false
 	if req.ListenerActive != nil {
