@@ -36,6 +36,9 @@ __pycache__/
 .idea/
 .docker/
 
+# Playwright MCP browser automation artifacts
+.playwright-mcp/
+
 # Generic project configs
 Projects/*
 !Projects/.gitkeep
