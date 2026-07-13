@@ -170,12 +170,13 @@ func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request, proje
 		return
 	}
 
-	if _, err := h.projects.Get(projectID); err != nil {
+	p, err := h.projects.Get(projectID)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
 
-	logDir := filepath.Join(h.cfg.BaseDir, "Logs", projectID)
+	logDir := h.projects.LogDir(p)
 	logPath := filepath.Join(logDir, filepath.Base(logName))
 
 	streamer := NewLogStreamer()

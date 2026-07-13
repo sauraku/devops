@@ -127,6 +127,24 @@ export function getDeploymentLog(projectId: string, deployId: string) {
   );
 }
 
+export function getProjectLogs(projectId: string) {
+  return request<{ logs: { name: string; size: string; mod: string }[] }>(
+    `/api/projects/${encodeURIComponent(projectId)}/logs`
+  );
+}
+
+export function getProjectLogContent(projectId: string, logName: string) {
+  return request<string>(
+    `/api/projects/${encodeURIComponent(projectId)}/logs/${encodeURIComponent(logName)}`
+  );
+}
+
+export function getContainerLogs(projectId: string, service: string, tail = 200) {
+  return request<string>(
+    `/api/projects/${encodeURIComponent(projectId)}/containers/${encodeURIComponent(service)}/logs?tail=${tail}`
+  );
+}
+
 export function runnerAction(projectId: string, action: string) {
   return request<{ ok: boolean; message: string }>(
     `/api/projects/${encodeURIComponent(projectId)}/runner`,
@@ -164,5 +182,24 @@ export function saveEnvConfig(projectId: string, overrides: Record<string, strin
   return request<{ ok: boolean }>(
     `/api/projects/${encodeURIComponent(projectId)}/env-config`,
     { method: 'POST', body: JSON.stringify({ overrides }) }
+  );
+}
+
+export function getContainerLogFiles(projectId: string) {
+  return request<{ logs: { service: string; path: string; size: string }[] }>(
+    `/api/projects/${encodeURIComponent(projectId)}/container-log-files`
+  );
+}
+
+export function getContainerLogFileContent(projectId: string, service: string) {
+  return request<string>(
+    `/api/projects/${encodeURIComponent(projectId)}/container-log-files/${encodeURIComponent(service)}`
+  );
+}
+
+export function containerAction(projectId: string, service: string, action: string) {
+  return request<{ ok: boolean; message: string }>(
+    `/api/projects/${encodeURIComponent(projectId)}/containers/${encodeURIComponent(service)}/${encodeURIComponent(action)}`,
+    { method: 'POST' }
   );
 }

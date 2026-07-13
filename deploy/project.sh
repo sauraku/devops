@@ -373,6 +373,28 @@ for name in $(docker ps -a --filter "name=${PROJECT_ID}-.*-${BRANCH_SLUG}" --for
   docker rm -f "$name" 2>/dev/null || true
 done
 
+# Resolve port conflicts: stop containers from other branches using the same ports
+while IFS='=' read -r key value; do
+  case "$key" in
+    *_PORT)
+      port="$value"
+      conflicting=$(docker ps --filter "publish=$port" --format '{{.Names}}' 2>/dev/null || true)
+      if [ -n "$conflicting" ]; then
+        echo "$conflicting" | while read -r name; do
+          case "$name" in
+            "${PROJECT_ID}-${BRANCH_SLUG}"*|"${COMPOSE_PROJECT_NAME}"*) ;;
+            *)
+              echo "Port $port is in use by $name — stopping it"
+              docker stop "$name" >/dev/null 2>&1 || true
+              docker rm "$name" >/dev/null 2>&1 || true
+              ;;
+          esac
+        done
+      fi
+      ;;
+  esac
+done < <(grep '^[^#]*_PORT=' "$ENV_FILE" 2>/dev/null || true)
+
 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d --force-recreate --remove-orphans ${PULL_FLAGS}
 
 # Create admin user if MEDUSA_ADMIN_EMAIL is set

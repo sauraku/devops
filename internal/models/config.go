@@ -51,5 +51,6 @@ type ProjectStatus struct {
 	Deployments []*Deployment            `json:"recent_deployments"`
 	Backups     []*Backup                `json:"recent_backups"`
 	Capabilities map[string]bool         `json:"capabilities"`
+	LogDir      string                   `json:"log_dir"`
 	ServerTime  string                   `json:"server_time"`
 }

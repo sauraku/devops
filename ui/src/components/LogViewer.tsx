@@ -3,7 +3,9 @@ import { useQuery } from '@tanstack/react-query';
 import * as api from '../lib/api';
 import { useWebSocket } from '../hooks/useWebSocket';
 import type { Project } from '../types';
-import { Download, Wifi, WifiOff, Loader2, PlayCircle, Copy, Check } from 'lucide-react';
+import { Download, Wifi, WifiOff, Loader2, PlayCircle, Copy, Check, FileText, Container } from 'lucide-react';
+
+type LogSource = 'deployment' | 'container' | 'file' | 'container-file';
 
 interface LogViewerProps {
   project: Project;
@@ -12,7 +14,11 @@ interface LogViewerProps {
 }
 
 export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps) {
+  const [logSource, setLogSource] = useState<LogSource>('deployment');
   const [activeDeployId, setActiveDeployId] = useState(deployId);
+  const [activeService, setActiveService] = useState('');
+  const [activeLogFile, setActiveLogFile] = useState('');
+  const [activeContainerFileService, setActiveContainerFileService] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -27,6 +33,10 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
   });
 
   const deployments = projectStatus?.recent_deployments ?? [];
+  const containerStates = projectStatus?.containers?.current ?? {};
+  const services = Object.keys(containerStates);
+  const logDir = projectStatus?.log_dir ?? '';
+
   const effectiveDeployId = activeDeployId || deployments[0]?.id || '';
 
   useEffect(() => {
@@ -40,19 +50,102 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
     }
   }, [deployments, activeDeployId, onDeploySelect]);
 
+  // Fetch deployment logs
   const { data: historicalLog, isFetching: logLoading } = useQuery({
     queryKey: ['deployment-log', project.id, effectiveDeployId],
     queryFn: () => api.getDeploymentLog(project.id, effectiveDeployId),
-    enabled: !!effectiveDeployId && !isStreaming,
+    enabled: logSource === 'deployment' && !!effectiveDeployId && !isStreaming,
   });
 
+  // Fetch container logs
+  const { data: containerLogData, isFetching: containerLogLoading } = useQuery({
+    queryKey: ['container-logs', project.id, activeService],
+    queryFn: () => api.getContainerLogs(project.id, activeService, 500),
+    enabled: logSource === 'container' && !!activeService,
+    refetchInterval: 5000,
+  });
+
+  // Fetch log files list
+  const { data: logFilesData } = useQuery({
+    queryKey: ['project-logs', project.id],
+    queryFn: () => api.getProjectLogs(project.id),
+    enabled: logSource === 'file',
+    refetchInterval: 10000,
+  });
+
+  const logFiles = logFilesData?.logs ?? [];
+
+  // Fetch container-internal log files list
+  const { data: containerLogFilesData } = useQuery({
+    queryKey: ['container-log-files', project.id],
+    queryFn: () => api.getContainerLogFiles(project.id),
+    enabled: logSource === 'container-file',
+    refetchInterval: 10000,
+  });
+
+  const containerLogFiles = containerLogFilesData?.logs ?? [];
+
+  // Fetch specific container-internal log file content
+  const { data: containerFileContent, isFetching: containerFileLoading } = useQuery({
+    queryKey: ['container-log-file-content', project.id, activeContainerFileService],
+    queryFn: () => api.getContainerLogFileContent(project.id, activeContainerFileService),
+    enabled: logSource === 'container-file' && !!activeContainerFileService,
+    refetchInterval: 5000,
+  });
+  const { data: logFileContent, isFetching: logFileLoading } = useQuery({
+    queryKey: ['log-file-content', project.id, activeLogFile],
+    queryFn: () => api.getProjectLogContent(project.id, activeLogFile),
+    enabled: logSource === 'file' && !!activeLogFile,
+    refetchInterval: 5000,
+  });
+
+  // Set logs based on source
   useEffect(() => {
-    if (historicalLog && !isStreaming) {
+    if (logSource === 'deployment' && historicalLog && !isStreaming) {
       setLogs(historicalLog.split('\n').filter(Boolean));
     }
-  }, [historicalLog, isStreaming]);
+  }, [historicalLog, isStreaming, logSource]);
 
-  const wsUrl = activeDeployId
+  useEffect(() => {
+    if (logSource === 'container' && containerLogData) {
+      setLogs(containerLogData.split('\n').filter(Boolean));
+    }
+  }, [containerLogData, logSource]);
+
+  useEffect(() => {
+    if (logSource === 'file' && logFileContent) {
+      setLogs(logFileContent.split('\n').filter(Boolean));
+    }
+  }, [logFileContent, logSource]);
+
+  useEffect(() => {
+    if (logSource === 'container-file' && containerFileContent) {
+      setLogs(containerFileContent.split('\n').filter(Boolean));
+    }
+  }, [containerFileContent, logSource]);
+
+  // Auto-select first service if none selected
+  useEffect(() => {
+    if (logSource === 'container' && !activeService && services.length > 0) {
+      setActiveService(services[0]);
+    }
+  }, [logSource, services, activeService]);
+
+  // Auto-select first log file if none selected
+  useEffect(() => {
+    if (logSource === 'file' && !activeLogFile && logFiles.length > 0) {
+      setActiveLogFile(logFiles[0].name);
+    }
+  }, [logSource, logFiles, activeLogFile]);
+
+  // Auto-select first container-internal log file if none selected
+  useEffect(() => {
+    if (logSource === 'container-file' && !activeContainerFileService && containerLogFiles.length > 0) {
+      setActiveContainerFileService(containerLogFiles[0].service);
+    }
+  }, [logSource, containerLogFiles, activeContainerFileService]);
+
+  const wsUrl = logSource === 'deployment' && activeDeployId
     ? `/api/projects/${encodeURIComponent(project.id)}/deployments/${encodeURIComponent(activeDeployId)}/stream?name=${encodeURIComponent(activeDeployId)}.log`
     : null;
 
@@ -100,17 +193,20 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
   };
 
   const handleDownload = async () => {
-    if (!effectiveDeployId) return;
-    try {
-      const text = await api.getDeploymentLog(project.id, effectiveDeployId);
-      const blob = new Blob([text], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `deploy-${effectiveDeployId}.log`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch { /* ignore */ }
+    let text = logs.join('\n');
+    if (!text && effectiveDeployId && logSource === 'deployment') {
+      try {
+        text = await api.getDeploymentLog(project.id, effectiveDeployId);
+      } catch { /* ignore */ }
+    }
+    if (!text) return;
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${logSource}-${Date.now()}.log`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const filteredLogs = useMemo(() => {
@@ -129,35 +225,152 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
     return result;
   }, [logs, logFilter, logLevel]);
 
+  const isLoading = (logSource === 'deployment' && logLoading) ||
+    (logSource === 'container' && containerLogLoading) ||
+    (logSource === 'file' && logFileLoading) ||
+    (logSource === 'container-file' && containerFileLoading);
+
   return (
     <div className="flex flex-col gap-4 min-h-0 flex-1">
+      {/* Log Directory Info */}
+      {logDir && (
+        <div className="glass-panel border border-line rounded-2xl p-3 shadow-md">
+          <div className="flex items-center gap-2 text-[10px] font-mono text-muted">
+            <FileText size={12} className="text-accent shrink-0" />
+            <span className="uppercase tracking-wider font-bold">Log Directory:</span>
+            <code className="text-ink-soft select-all">{logDir}</code>
+          </div>
+        </div>
+      )}
+
       {/* Controls Strip */}
       <div className="glass-panel border border-line rounded-2xl p-5 shadow-md">
         <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
-          <div className="flex-1">
-            <label className="block text-[10px] text-ink-soft uppercase tracking-wider font-extrabold mb-1.5 flex items-center gap-1">
-              <PlayCircle size={12} className="text-accent" /> Target Release Deployment logs
-            </label>
-            <select
-              value={effectiveDeployId}
-              onChange={(e) => { 
-                setActiveDeployId(e.target.value); 
-                onDeploySelect(e.target.value); 
-                setLogs([]); 
-                setIsStreaming(false); 
-              }}
-              className="w-full px-3.5 py-2 rounded-xl bg-surface-2/65 border border-line text-ink text-xs focus:outline-none focus:border-accent/40 focus:bg-surface-2 transition-all font-mono"
-            >
-              {deployments.length === 0 ? (
-                <option value="">No deployments detected</option>
-              ) : (
-                deployments.map((d) => (
-                  <option key={d.id} value={d.id}>
-                    [{d.status.toUpperCase()}] Run {d.id.slice(0, 8)} · {d.commit_message?.slice(0, 40) || 'Manual Trigger'}
-                  </option>
-                ))
-              )}
-            </select>
+          <div className="flex-1 space-y-3">
+            {/* Log Source Selector */}
+            <div className="flex items-center gap-2">
+              {([
+                { id: 'deployment' as LogSource, label: 'Deployment Logs', icon: PlayCircle },
+                { id: 'container' as LogSource, label: 'Container Logs', icon: Container },
+                { id: 'file' as LogSource, label: 'Log Files', icon: FileText },
+                { id: 'container-file' as LogSource, label: 'Container Log Files', icon: FileText },
+              ]).map(src => {
+                const Icon = src.icon;
+                const active = logSource === src.id;
+                return (
+                  <button
+                    key={src.id}
+                    onClick={() => { setLogSource(src.id); setLogs([]); setIsStreaming(false); }}
+                    className={`px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 border ${
+                      active
+                        ? 'bg-accent/15 text-accent border-accent/25'
+                        : 'bg-surface-2/65 text-ink-soft border-line hover:bg-surface-2'
+                    }`}
+                  >
+                    <Icon size={12} />
+                    {src.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Source-specific selector */}
+            {logSource === 'deployment' && (
+              <div>
+                <label className="block text-[10px] text-ink-soft uppercase tracking-wider font-extrabold mb-1.5 flex items-center gap-1">
+                  <PlayCircle size={12} className="text-accent" /> Deployment
+                </label>
+                <select
+                  value={effectiveDeployId}
+                  onChange={(e) => { 
+                    setActiveDeployId(e.target.value); 
+                    onDeploySelect(e.target.value); 
+                    setLogs([]); 
+                    setIsStreaming(false); 
+                  }}
+                  className="w-full px-3.5 py-2 rounded-xl bg-surface-2/65 border border-line text-ink text-xs focus:outline-none focus:border-accent/40 focus:bg-surface-2 transition-all font-mono"
+                >
+                  {deployments.length === 0 ? (
+                    <option value="">No deployments detected</option>
+                  ) : (
+                    deployments.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        [{d.status.toUpperCase()}] Run {d.id.slice(0, 8)} · {d.commit_message?.slice(0, 40) || 'Manual Trigger'}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+            )}
+
+            {logSource === 'container' && (
+              <div>
+                <label className="block text-[10px] text-ink-soft uppercase tracking-wider font-extrabold mb-1.5 flex items-center gap-1">
+                  <Container size={12} className="text-accent" /> Container
+                </label>
+                <select
+                  value={activeService}
+                  onChange={(e) => { setActiveService(e.target.value); setLogs([]); }}
+                  className="w-full px-3.5 py-2 rounded-xl bg-surface-2/65 border border-line text-ink text-xs focus:outline-none focus:border-accent/40 focus:bg-surface-2 transition-all font-mono"
+                >
+                  {services.length === 0 ? (
+                    <option value="">No containers detected</option>
+                  ) : (
+                    services.map((svc) => (
+                      <option key={svc} value={svc}>
+                        {svc} ({containerStates[svc]})
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+            )}
+
+            {logSource === 'file' && (
+              <div>
+                <label className="block text-[10px] text-ink-soft uppercase tracking-wider font-extrabold mb-1.5 flex items-center gap-1">
+                  <FileText size={12} className="text-accent" /> Log File
+                </label>
+                <select
+                  value={activeLogFile}
+                  onChange={(e) => { setActiveLogFile(e.target.value); setLogs([]); }}
+                  className="w-full px-3.5 py-2 rounded-xl bg-surface-2/65 border border-line text-ink text-xs focus:outline-none focus:border-accent/40 focus:bg-surface-2 transition-all font-mono"
+                >
+                  {logFiles.length === 0 ? (
+                    <option value="">No log files found</option>
+                  ) : (
+                    logFiles.map((f) => (
+                      <option key={f.name} value={f.name}>
+                        {f.name} ({(Number(f.size) / 1024).toFixed(1)} KB)
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+            )}
+
+            {logSource === 'container-file' && (
+              <div>
+                <label className="block text-[10px] text-ink-soft uppercase tracking-wider font-extrabold mb-1.5 flex items-center gap-1">
+                  <FileText size={12} className="text-accent" /> Container Log File
+                </label>
+                <select
+                  value={activeContainerFileService}
+                  onChange={(e) => { setActiveContainerFileService(e.target.value); setLogs([]); }}
+                  className="w-full px-3.5 py-2 rounded-xl bg-surface-2/65 border border-line text-ink text-xs focus:outline-none focus:border-accent/40 focus:bg-surface-2 transition-all font-mono"
+                >
+                  {containerLogFiles.length === 0 ? (
+                    <option value="">No container log files found</option>
+                  ) : (
+                    containerLogFiles.map((f) => (
+                      <option key={f.service} value={f.service}>
+                        {f.service} ({(Number(f.size) / 1024).toFixed(1)} KB)
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+            )}
           </div>
           
           <div className="flex items-center gap-2 select-none shrink-0 self-stretch md:self-auto justify-end">
@@ -181,7 +394,7 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
 
             <button 
               onClick={handleDownload} 
-              disabled={!effectiveDeployId} 
+              disabled={logs.length === 0}
               className="px-4 py-1.5 rounded-xl bg-surface-2 hover:bg-surface-3 border border-line text-xs font-bold text-ink-soft hover:text-ink disabled:opacity-30 transition-all flex items-center gap-1 shadow-sm h-[32px]"
             >
               <Download size={13} /> Export
@@ -196,7 +409,7 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
               {copied ? 'Copied' : 'Copy'}
             </button>
 
-            {!isStreaming && effectiveDeployId && (
+            {logSource === 'deployment' && !isStreaming && effectiveDeployId && (
               <button 
                 onClick={reconnect} 
                 className="px-4 py-1.5 rounded-xl bg-accent/15 text-accent border border-accent/25 hover:bg-accent/25 text-xs font-bold uppercase tracking-wider transition-all h-[32px]"
@@ -218,7 +431,7 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
             <div className="w-2.5 h-2.5 rounded-full bg-good/60"></div>
           </div>
           <span className="text-[10px] font-mono text-muted tracking-widest uppercase">
-            bash - console_stream
+            {logSource === 'deployment' ? 'deployment_log' : logSource === 'container' ? `container_log:${activeService}` : logSource === 'container-file' ? `container_file:${activeContainerFileService}` : `file_log:${activeLogFile}`}
           </span>
           <div className="w-10"></div>
         </div>
@@ -249,15 +462,18 @@ export function LogViewer({ project, deployId, onDeploySelect }: LogViewerProps)
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 bg-bg font-mono text-[11px] leading-relaxed text-ink-soft">
-          {logLoading ? (
+          {isLoading ? (
             <div className="flex items-center justify-center py-20 gap-2 text-muted font-extrabold uppercase tracking-wider">
-              <Loader2 size={14} className="animate-spin text-accent" /> Fetching release payload output...
+              <Loader2 size={14} className="animate-spin text-accent" /> Fetching logs...
             </div>
           ) : logs.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-20 text-muted gap-2">
               <span className="text-[10px] uppercase font-bold tracking-widest">Console Inactive</span>
               <p className="text-xs">
-                {isStreaming ? 'Pipe open. Waiting for deployment payload logs...' : 'No historical logs found for the selected release run.'}
+                {logSource === 'deployment' && (isStreaming ? 'Pipe open. Waiting for deployment payload logs...' : 'No historical logs found for the selected release run.')}
+                {logSource === 'container' && 'Select a container to view its logs.'}
+                {logSource === 'file' && 'Select a log file to view its contents.'}
+                {logSource === 'container-file' && 'Select a container log file to view its contents.'}
               </p>
             </div>
           ) : (

@@ -74,6 +74,7 @@ export interface ProjectStatus {
   recent_deployments: Deployment[];
   recent_backups: Backup[];
   capabilities: Record<string, boolean>;
+  log_dir: string;
   server_time: string;
 }
 

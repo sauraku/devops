@@ -3,7 +3,7 @@
 # For production, use ./start.sh (requires pre-built binary + .env.prod).
 set -euo pipefail
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
 # ── Gather what we need ──────────────────────────────────────────────
@@ -58,6 +58,7 @@ COOKIE_SECRET=$COOKIE_SECRET
 ENCRYPTION_KEY=$ENCRYPTION_KEY
 DEPLOY_CONTROL_TOKEN=$DEPLOY_CONTROL_TOKEN
 DEPLOY_CONTROL_HOST=${DEPLOY_CONTROL_HOST:-0.0.0.0}
+ENV_NAME=${ENV_NAME:-dev}
 BASE_DIR=$BASE_DIR
 EOF
 if [ -n "${GITHUB_TOKEN:-}" ]; then
@@ -79,17 +80,39 @@ echo "==> Build done."
 # ── Start ────────────────────────────────────────────────────────────
 echo ""
 
-# Tear down any existing process on port 8787 (local dev only)
-PORT_PID=$(lsof -ti :8787 2>/dev/null || true)
-if [ -n "${PORT_PID:-}" ]; then
-  echo "==> Killing existing process on port 8787 (pid=$PORT_PID)"
-  kill -9 $PORT_PID 2>/dev/null || true
-  sleep 0.3
+# Tear down any existing process or container on port 8787 (local dev only)
+CONTAINER_ID=$(docker ps -q --filter "publish=8787" 2>/dev/null || true)
+if [ -n "${CONTAINER_ID:-}" ]; then
+  echo "==> Stopping Docker container(s) on port 8787..."
+  echo "$CONTAINER_ID" | while read -r cid; do
+    cname=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')
+    echo "    stopping container=$cname ($(echo "$cid" | cut -c1-12))"
+    docker stop "$cid" >/dev/null 2>&1 || true
+  done
+  for i in 1 2 3 4 5; do
+    if ! docker ps -q --filter "publish=8787" | grep -q .; then break; fi
+    sleep 0.5
+  done
+fi
+PORT_PIDS=$(lsof -ti :8787 2>/dev/null || true)
+if [ -n "${PORT_PIDS:-}" ]; then
+  echo "==> Killing existing process(es) on port 8787..."
+  echo "$PORT_PIDS" | while read -r pid; do
+    echo "    killing pid=$pid ($(ps -p "$pid" -o comm= 2>/dev/null || echo '?'))"
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  for i in 1 2 3 4 5; do
+    if ! lsof -ti :8787 >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
 fi
 
-echo "==> Starting DevOps Control on http://localhost:8787"
+echo "==> Starting DevOps Control in background..."
+"$BINARY" &
+BGPID=$!
+disown
+echo "    URL:   http://localhost:8787"
+echo "    PID:   $BGPID"
 echo "    Data:  $BASE_DIR"
-echo "    PID:   $$"
 echo ""
-
-exec "$BINARY"
+echo "    Stop with: kill $BGPID"

@@ -222,15 +222,16 @@ func (r *Router) routeProjectAction(w http.ResponseWriter, req *http.Request, pr
 		"env-config": true,
 	}
 	readActions := map[string]bool{
-		"config":          true,
-		"backups":         true,
-		"backups/verify":  true,
-		"restore/dry-run": true,
-		"logs":            true,
-		"env-template":    true,
-		"deployments":     true,
+		"config":               true,
+		"backups":              true,
+		"backups/verify":       true,
+		"restore/dry-run":      true,
+		"logs":                 true,
+		"container-log-files":  true,
+		"env-template":         true,
+		"deployments":          true,
 	}
-	if strings.HasPrefix(action, "logs/") || strings.HasPrefix(action, "deployments/") {
+	if strings.HasPrefix(action, "logs/") || strings.HasPrefix(action, "deployments/") || strings.HasPrefix(action, "containers/") || strings.HasPrefix(action, "container-log-files/") {
 		readActions[action] = true
 	}
 
@@ -270,6 +271,8 @@ func (r *Router) routeProjectAction(w http.ResponseWriter, req *http.Request, pr
 		r.h.ProjectDelete(w, req, projectID)
 	case "logs":
 		r.h.ProjectLogs(w, req, projectID)
+	case "container-log-files":
+		r.h.ProjectContainerLogFiles(w, req, projectID)
 	case "env-template":
 		r.h.ProjectEnvTemplate(w, req, projectID)
 	case "env-config":
@@ -278,6 +281,26 @@ func (r *Router) routeProjectAction(w http.ResponseWriter, req *http.Request, pr
 		r.h.ProjectStatus(w, req, projectID) // fallback for deployments list
 	default:
 		// Check for nested routes
+		if strings.HasPrefix(action, "containers/") {
+			sub := strings.TrimPrefix(action, "containers/")
+			if strings.HasSuffix(sub, "/logs") {
+				service := strings.TrimSuffix(sub, "/logs")
+				r.h.ProjectContainerLogs(w, req, projectID, service)
+				return
+			}
+			parts := strings.Split(sub, "/")
+			if len(parts) == 2 {
+				r.h.ProjectContainerAction(w, req, projectID, parts[0], parts[1])
+				return
+			}
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if strings.HasPrefix(action, "container-log-files/") {
+			service := strings.TrimPrefix(action, "container-log-files/")
+			r.h.ProjectContainerLogFileContent(w, req, projectID, service)
+			return
+		}
 		if strings.HasPrefix(action, "logs/") {
 			logName := strings.TrimPrefix(action, "logs/")
 			r.h.ProjectLogContent(w, req, projectID, logName)

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -448,6 +449,22 @@ func (h *Handler) ProjectRunnerAction(w http.ResponseWriter, r *http.Request, pr
 	})
 }
 
+func (h *Handler) ProjectContainerAction(w http.ResponseWriter, r *http.Request, projectID, service, action string) {
+	if err := h.projects.ContainerAction(projectID, service, action); err != nil {
+		if strings.Contains(err.Error(), "invalid service name format") || strings.Contains(err.Error(), "invalid action:") {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"message": fmt.Sprintf("Container %s of project %s: %s successful", service, projectID, action),
+	})
+}
+
 func (h *Handler) ProjectDelete(w http.ResponseWriter, r *http.Request, projectID string) {
 	var body struct {
 		Confirmation string `json:"confirmation"`
@@ -475,11 +492,12 @@ func (h *Handler) ProjectDelete(w http.ResponseWriter, r *http.Request, projectI
 }
 
 func (h *Handler) ProjectLogs(w http.ResponseWriter, r *http.Request, projectID string) {
-	if _, err := h.projects.Get(projectID); err != nil {
+	p, err := h.projects.Get(projectID)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
-	logDir := filepath.Join(h.cfg.BaseDir, "Logs", projectID)
+	logDir := h.projects.LogDir(p)
 	entries, _ := filepath.Glob(filepath.Join(logDir, "*"))
 	var logs []map[string]string
 	for _, entry := range entries {
@@ -497,11 +515,12 @@ func (h *Handler) ProjectLogs(w http.ResponseWriter, r *http.Request, projectID 
 }
 
 func (h *Handler) ProjectLogContent(w http.ResponseWriter, r *http.Request, projectID, logName string) {
-	if _, err := h.projects.Get(projectID); err != nil {
+	p, err := h.projects.Get(projectID)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
-	logDir := filepath.Join(h.cfg.BaseDir, "Logs", projectID)
+	logDir := h.projects.LogDir(p)
 	safeName := filepath.Base(logName)
 	logPath := filepath.Join(logDir, safeName)
 	info, err := os.Stat(logPath)
@@ -521,12 +540,94 @@ func (h *Handler) ProjectLogContent(w http.ResponseWriter, r *http.Request, proj
 	writeText(w, http.StatusOK, string(data))
 }
 
+func (h *Handler) ProjectContainerLogFiles(w http.ResponseWriter, r *http.Request, projectID string) {
+	p, err := h.projects.Get(projectID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	containerLogs := h.projects.ContainerLogFiles(p)
+	if containerLogs == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"logs": []map[string]string{}})
+		return
+	}
+	var logs []map[string]string
+	for svc, path := range containerLogs {
+		containerName := h.projects.FindContainerName(p.ID, svc, p.BranchName)
+		content, readErr := h.projects.Docker().ContainerReadFile(containerName, path)
+		size := 0
+		if readErr == nil {
+			size = len(content)
+		}
+		logs = append(logs, map[string]string{
+			"service": svc,
+			"path":    path,
+			"size":    fmt.Sprintf("%d", size),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"logs": logs})
+}
+
+func (h *Handler) ProjectContainerLogFileContent(w http.ResponseWriter, r *http.Request, projectID, service string) {
+	p, err := h.projects.Get(projectID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	containerLogs := h.projects.ContainerLogFiles(p)
+	if containerLogs == nil {
+		writeText(w, http.StatusOK, "No container log files configured.\n")
+		return
+	}
+	filePath, ok := containerLogs[service]
+	if !ok {
+		writeText(w, http.StatusOK, "No log file configured for this service.\n")
+		return
+	}
+	containerName := h.projects.FindContainerName(p.ID, service, p.BranchName)
+	content, err := h.projects.Docker().ContainerReadFile(containerName, filePath)
+	if err != nil {
+		writeText(w, http.StatusOK, fmt.Sprintf("Log file not available: %s\n", err))
+		return
+	}
+	if len(content) > 10*1024*1024 {
+		writeText(w, http.StatusOK, "Log file exceeds 10MB limit.\n")
+		return
+	}
+	writeText(w, http.StatusOK, content)
+}
+
+func (h *Handler) ProjectContainerLogs(w http.ResponseWriter, r *http.Request, projectID, service string) {
+	p, err := h.projects.Get(projectID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+
+	containerName := h.projects.FindContainerName(p.ID, service, p.BranchName)
+	tail := 100
+	if t := queryParam(r, "tail"); t != "" {
+		if v, err := strconv.Atoi(t); err == nil && v > 0 && v <= 10000 {
+			tail = v
+		}
+	}
+	since := queryParam(r, "since")
+
+	logs := h.projects.Docker().ContainerLogsSince(containerName, tail, since)
+	writeText(w, http.StatusOK, logs)
+}
+
 func (h *Handler) ProjectDeploymentLog(w http.ResponseWriter, r *http.Request, projectID, deployID string) {
 	// Sanitize deployID to prevent path traversal
 	safeDeployID := filepath.Base(deployID)
 	logContent, err := h.deploys.GetLog(safeDeployID)
 	if err != nil {
-		logDir := filepath.Join(h.cfg.BaseDir, "Logs", projectID)
+		p, pErr := h.projects.Get(projectID)
+		if pErr != nil {
+			writeText(w, http.StatusOK, "Waiting for deployment log...\n")
+			return
+		}
+		logDir := h.projects.LogDir(p)
 		logPath := filepath.Join(logDir, safeDeployID+".log")
 		info, statErr := os.Stat(logPath)
 		if statErr != nil {

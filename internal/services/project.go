@@ -60,6 +60,13 @@ func (s *ProjectService) SlugID(raw string) string {
 	return slug
 }
 
+func envDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 func isAlphanumericStart(s string) bool {
 	if s == "" {
 		return false
@@ -82,7 +89,7 @@ func (s *ProjectService) CreateOrUpdate(req *models.ProjectRequest) (*models.Pro
 		ID:               projectID,
 		Name:             projectID,
 		RepoURL:          "",
-		BranchName:       "rc",
+		BranchName:       envDefault("ENV_NAME", "dev"),
 		DeploymentMode:   models.DeploymentModeComposeImage,
 		AutoApply:        true,
 		RegistryHost:     "ghcr.io",
@@ -276,6 +283,7 @@ func (s *ProjectService) Status(projectID string) (*models.ProjectStatus, error)
 		Deployments: deployments,
 		Backups:     backups,
 		Capabilities: s.capabilities(p),
+		LogDir:      s.LogDir(p),
 		ServerTime:  time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
@@ -613,8 +621,15 @@ func (s *ProjectService) SaveEnvConfig(projectID string, overrides map[string]st
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
+	existing := s.loadEnvOverridesFromState(projectID)
 	envMap := make(map[string]any, len(overrides))
 	for k, v := range overrides {
+		if v == "********" {
+			if oldVal, ok := existing[k]; ok {
+				envMap[k] = oldVal
+			}
+			continue
+		}
 		envMap[k] = v
 	}
 	metadata["env_overrides"] = envMap
@@ -711,6 +726,80 @@ func (s *ProjectService) RunnerAction(projectID, action string) (string, error) 
 	return msg, nil
 }
 
+func (s *ProjectService) ContainerAction(projectID, service, action string) error {
+	if !regexp.MustCompile(`^[a-z0-9_.-]+$`).MatchString(service) {
+		return fmt.Errorf("invalid service name format")
+	}
+
+	p, err := s.db.GetProject(projectID)
+	if err != nil {
+		return err
+	}
+
+	containerName := s.FindContainerName(p.ID, service, p.BranchName)
+
+	switch action {
+	case "start":
+		s.audit.Log("container_start", "running", projectID, fmt.Sprintf("Starting container for service %s", service), "")
+		if err := s.docker.StartContainer(containerName); err != nil {
+			s.audit.Log("container_start", "failed", projectID, err.Error(), "")
+			return err
+		}
+		s.audit.Log("container_start", "ok", projectID, fmt.Sprintf("Started container for service %s", service), "")
+	case "stop":
+		s.audit.Log("container_stop", "running", projectID, fmt.Sprintf("Stopping container for service %s", service), "")
+		if err := s.docker.StopContainer(containerName); err != nil {
+			s.audit.Log("container_stop", "failed", projectID, err.Error(), "")
+			return err
+		}
+		s.audit.Log("container_stop", "ok", projectID, fmt.Sprintf("Stopped container for service %s", service), "")
+	case "restart":
+		s.audit.Log("container_restart", "running", projectID, fmt.Sprintf("Restarting container for service %s", service), "")
+		if err := s.docker.RestartContainer(containerName); err != nil {
+			s.audit.Log("container_restart", "failed", projectID, err.Error(), "")
+			return err
+		}
+		s.audit.Log("container_restart", "ok", projectID, fmt.Sprintf("Restarted container for service %s", service), "")
+	case "pause":
+		s.audit.Log("container_pause", "running", projectID, fmt.Sprintf("Pausing container for service %s", service), "")
+		if err := s.docker.PauseContainer(containerName); err != nil {
+			s.audit.Log("container_pause", "failed", projectID, err.Error(), "")
+			return err
+		}
+		s.audit.Log("container_pause", "ok", projectID, fmt.Sprintf("Paused container for service %s", service), "")
+	case "resume":
+		s.audit.Log("container_resume", "running", projectID, fmt.Sprintf("Resuming container for service %s", service), "")
+		if err := s.docker.UnpauseContainer(containerName); err != nil {
+			s.audit.Log("container_resume", "failed", projectID, err.Error(), "")
+			return err
+		}
+		s.audit.Log("container_resume", "ok", projectID, fmt.Sprintf("Resumed container for service %s", service), "")
+	case "recreate":
+		s.audit.Log("container_recreate", "running", projectID, fmt.Sprintf("Recreating container for service %s", service), "")
+		branchSlug := branchSlug(p.BranchName)
+		projectDir := filepath.Join(s.cfg.BaseDir, "Projects", projectID)
+		composeFile := filepath.Join(projectDir, "docker-compose.yml")
+		envFile := filepath.Join(projectDir, ".env."+branchSlug)
+		projectName := fmt.Sprintf("%s-%s", projectID, branchSlug)
+
+		overrides := s.loadEnvOverridesFromState(projectID)
+		if err := updateEnvFileWithOverrides(envFile, overrides, projectID, branchSlug); err != nil {
+			s.audit.Log("container_recreate", "failed", projectID, fmt.Sprintf("Failed to sync env overrides: %s", err.Error()), "")
+			return err
+		}
+
+		if err := s.docker.ComposeRecreate(composeFile, projectName, envFile, service); err != nil {
+			s.audit.Log("container_recreate", "failed", projectID, err.Error(), "")
+			return err
+		}
+		s.audit.Log("container_recreate", "ok", projectID, fmt.Sprintf("Recreated container for service %s", service), "")
+	default:
+		return fmt.Errorf("invalid action: %s", action)
+	}
+
+	return nil
+}
+
 // FindContainerName resolves a project service container name.
 // First tries the branch-derived name; if not found, scans Docker for any
 // container matching {projectID}-*-{service} (handles COMPOSE_PROJECT_NAME
@@ -720,6 +809,12 @@ func (s *ProjectService) FindContainerName(projectID, service, branch string) st
 	summary := s.docker.ContainerSummary(derived)
 	if summary.Exists {
 		return derived
+	}
+	// Support alternative convention: {projectID}-{service}-{branchSlug}
+	altFormat := fmt.Sprintf("%s-%s-%s", projectID, service, branchSlug(branch))
+	summaryAlt := s.docker.ContainerSummary(altFormat)
+	if summaryAlt.Exists {
+		return altFormat
 	}
 	prefix := projectID + "-"
 	suffix := "-" + service
@@ -823,6 +918,50 @@ func (s *ProjectService) CheckServiceHealth(service, containerName string, summa
 	return h
 }
 
+func (s *ProjectService) LogDir(p *models.Project) string {
+	defaultDir := filepath.Join(s.cfg.BaseDir, "Logs", p.ID)
+	devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
+	data, err := os.ReadFile(devopsPath)
+	if err != nil {
+		return defaultDir
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return defaultDir
+	}
+	logsCfg, ok := cfg["logs"].(map[string]interface{})
+	if !ok {
+		return defaultDir
+	}
+	if dir, ok := logsCfg["directory"].(string); ok && dir != "" {
+		return dir
+	}
+	return defaultDir
+}
+
+func (s *ProjectService) ContainerLogFiles(p *models.Project) map[string]string {
+	devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
+	cfg := s.loadDevopsConfig(devopsPath)
+	if cfg == nil {
+		return nil
+	}
+	logsCfg, ok := cfg["logs"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	internal, ok := logsCfg["container_internal"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	result := make(map[string]string)
+	for svc, path := range internal {
+		if p, ok := path.(string); ok && p != "" {
+			result[svc] = p
+		}
+	}
+	return result
+}
+
 func (s *ProjectService) loadDevopsConfig(path string) map[string]interface{} {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -861,4 +1000,55 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+func updateEnvFileWithOverrides(envFile string, overrides map[string]string, projectID, branchSlug string) error {
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			var lines []string
+			envMap := make(map[string]string)
+			for k, v := range overrides {
+				envMap[k] = v
+			}
+			if projectID != "" && branchSlug != "" {
+				envMap["COMPOSE_PROJECT_NAME"] = fmt.Sprintf("%s-%s", projectID, branchSlug)
+				envMap["ENV_NAME"] = branchSlug
+			}
+			for k, v := range envMap {
+				lines = append(lines, fmt.Sprintf("%s=%s", k, v))
+			}
+			return os.WriteFile(envFile, []byte(strings.Join(lines, "\n")+"\n"), 0600)
+		}
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	envMap := make(map[string]string)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		}
+	}
+
+	for k, v := range overrides {
+		envMap[k] = v
+	}
+
+	if projectID != "" && branchSlug != "" {
+		envMap["COMPOSE_PROJECT_NAME"] = fmt.Sprintf("%s-%s", projectID, branchSlug)
+		envMap["ENV_NAME"] = branchSlug
+	}
+
+	var newLines []string
+	for k, v := range envMap {
+		newLines = append(newLines, fmt.Sprintf("%s=%s", k, v))
+	}
+	return os.WriteFile(envFile, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
 }

@@ -20,7 +20,7 @@
 
 | What | Command |
 |------|---------|
-| **Local dev** | `./local.sh` (token: `apple`, BASE_DIR: `./data`) |
+| **Local dev** | `./deploy/local.sh` (token: `apple`, BASE_DIR: `./data`) |
 | **Prod deploy** | `bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)` |
 | **Prod teardown** | `bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/teardown.sh)` |
 | **Devops UI** | `http://localhost:8787` (local) / `http://{server-ip}:8787` (prod) |
@@ -47,7 +47,7 @@ Go binary (cmd/devops-control) — embeds React UI via //go:embed ui/dist
 
 ### Local Development
 ```bash
-./local.sh
+./deploy/local.sh
 # Prompts: token (type "apple"), BASE_DIR (accept default ./data)
 # Builds UI + Go binary, starts on http://localhost:8787
 # Auto-kills old process on port 8787

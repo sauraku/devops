@@ -150,6 +150,35 @@ func (c *Client) ContainerLogs(name string, tail int) string {
 	return string(output)
 }
 
+func (c *Client) ContainerLogsSince(name string, tail int, since string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	args := []string{"logs", "--tail", fmt.Sprintf("%d", tail)}
+	if since != "" {
+		args = append(args, "--since", since)
+	}
+	args = append(args, name)
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Sprintf("Unable to read docker logs for %s: %s\n", name, err)
+	}
+	return string(output)
+}
+
+func (c *Client) ContainerReadFile(containerName, filePath string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "exec", containerName, "cat", filePath)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("read file %s from container %s: %w", filePath, containerName, err)
+	}
+	return string(output), nil
+}
+
 func (c *Client) WaitForRunnerReady(name string, timeout time.Duration) (bool, string, string) {
 	deadline := time.Now().Add(timeout)
 	failurePatterns := []string{
@@ -287,6 +316,70 @@ func (c *Client) StartContainer(name string) error {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	exec.CommandContext(ctx2, "docker", "update", "--restart", "unless-stopped", name).Run()
+	return nil
+}
+
+func (c *Client) StopContainer(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "stop", name)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("stop container %s: %s: %s", name, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (c *Client) RestartContainer(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "restart", name)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("restart container %s: %s: %s", name, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (c *Client) PauseContainer(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "pause", name)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("pause container %s: %s: %s", name, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (c *Client) UnpauseContainer(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "unpause", name)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("unpause container %s: %s: %s", name, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (c *Client) ComposeRecreate(composeFile, projectName, envFile string, service string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	cmdArgs := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
+	if envFile != "" {
+		if _, err := os.Stat(envFile); err == nil {
+			cmdArgs = append(cmdArgs, "--env-file", envFile)
+		}
+	}
+	cmdArgs = append(cmdArgs, "up", "-d", "--force-recreate", service)
+
+	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+	cmd.Env = os.Environ()
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("compose recreate service %s failed: %w: %s", service, err, strings.TrimSpace(string(output)))
+	}
 	return nil
 }
 
