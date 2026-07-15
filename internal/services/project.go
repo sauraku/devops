@@ -20,6 +20,8 @@ import (
 	"github.com/sauraku/devops-control/internal/models"
 )
 
+var serviceNameRE = regexp.MustCompile(`^[a-z0-9_.-]+$`)
+
 type ProjectService struct {
 	db     *db.DB
 	docker *docker.Client
@@ -162,11 +164,11 @@ func (s *ProjectService) CreateOrUpdate(req *models.ProjectRequest) (*models.Pro
 	}
 
 	runnerToken := ""
-	// Prefer PAT (GITHUB_TOKEN) over a registration token — PAT doesn't expire
-	if s.cfg.GithubToken != "" {
-		runnerToken = s.cfg.GithubToken
-	} else if req.RunnerToken != nil {
+	// Prioritize explicitly provided project-specific runner token, fall back to global GITHUB_TOKEN (PAT)
+	if req.RunnerToken != nil && strings.TrimSpace(*req.RunnerToken) != "" {
 		runnerToken = strings.TrimSpace(*req.RunnerToken)
+	} else if s.cfg.GithubToken != "" {
+		runnerToken = s.cfg.GithubToken
 	}
 	listenerActive := false
 	if req.ListenerActive != nil {
@@ -346,6 +348,7 @@ func (s *ProjectService) startRunner(p *models.Project, runnerToken string) erro
 		"DEPLOY_BRANCH_SLUG":    branchSlug(p.BranchName),
 		"REPO_HOST_DIR":         s.cfg.BaseDir,
 		"BASE_DIR":              s.cfg.BaseDir,
+		"PROJECT_ROOT":          s.cfg.ProjectRoot,
 		"SSH_DIR":               sshDir,
 		"DEPLOY_CONTROL_TOKEN":  scopedToken,
 	}
@@ -726,8 +729,17 @@ func (s *ProjectService) RunnerAction(projectID, action string) (string, error) 
 	return msg, nil
 }
 
+func (s *ProjectService) getProjectPaths(p *models.Project) (string, string, string) {
+	slug := branchSlug(p.BranchName)
+	projectDir := filepath.Join(s.cfg.BaseDir, "Projects", p.ID)
+	composeFile := filepath.Join(projectDir, "docker-compose.yml")
+	envFile := filepath.Join(projectDir, ".env."+slug)
+	projectName := fmt.Sprintf("%s-%s", p.ID, slug)
+	return composeFile, envFile, projectName
+}
+
 func (s *ProjectService) ContainerAction(projectID, service, action string) error {
-	if !regexp.MustCompile(`^[a-z0-9_.-]+$`).MatchString(service) {
+	if !serviceNameRE.MatchString(service) {
 		return fmt.Errorf("invalid service name format")
 	}
 
@@ -738,52 +750,13 @@ func (s *ProjectService) ContainerAction(projectID, service, action string) erro
 
 	containerName := s.FindContainerName(p.ID, service, p.BranchName)
 
-	switch action {
-	case "start":
-		s.audit.Log("container_start", "running", projectID, fmt.Sprintf("Starting container for service %s", service), "")
-		if err := s.docker.StartContainer(containerName); err != nil {
-			s.audit.Log("container_start", "failed", projectID, err.Error(), "")
-			return err
-		}
-		s.audit.Log("container_start", "ok", projectID, fmt.Sprintf("Started container for service %s", service), "")
-	case "stop":
-		s.audit.Log("container_stop", "running", projectID, fmt.Sprintf("Stopping container for service %s", service), "")
-		if err := s.docker.StopContainer(containerName); err != nil {
-			s.audit.Log("container_stop", "failed", projectID, err.Error(), "")
-			return err
-		}
-		s.audit.Log("container_stop", "ok", projectID, fmt.Sprintf("Stopped container for service %s", service), "")
-	case "restart":
-		s.audit.Log("container_restart", "running", projectID, fmt.Sprintf("Restarting container for service %s", service), "")
-		if err := s.docker.RestartContainer(containerName); err != nil {
-			s.audit.Log("container_restart", "failed", projectID, err.Error(), "")
-			return err
-		}
-		s.audit.Log("container_restart", "ok", projectID, fmt.Sprintf("Restarted container for service %s", service), "")
-	case "pause":
-		s.audit.Log("container_pause", "running", projectID, fmt.Sprintf("Pausing container for service %s", service), "")
-		if err := s.docker.PauseContainer(containerName); err != nil {
-			s.audit.Log("container_pause", "failed", projectID, err.Error(), "")
-			return err
-		}
-		s.audit.Log("container_pause", "ok", projectID, fmt.Sprintf("Paused container for service %s", service), "")
-	case "resume":
-		s.audit.Log("container_resume", "running", projectID, fmt.Sprintf("Resuming container for service %s", service), "")
-		if err := s.docker.UnpauseContainer(containerName); err != nil {
-			s.audit.Log("container_resume", "failed", projectID, err.Error(), "")
-			return err
-		}
-		s.audit.Log("container_resume", "ok", projectID, fmt.Sprintf("Resumed container for service %s", service), "")
-	case "recreate":
+	if action == "recreate" {
 		s.audit.Log("container_recreate", "running", projectID, fmt.Sprintf("Recreating container for service %s", service), "")
-		branchSlug := branchSlug(p.BranchName)
-		projectDir := filepath.Join(s.cfg.BaseDir, "Projects", projectID)
-		composeFile := filepath.Join(projectDir, "docker-compose.yml")
-		envFile := filepath.Join(projectDir, ".env."+branchSlug)
-		projectName := fmt.Sprintf("%s-%s", projectID, branchSlug)
+		composeFile, envFile, projectName := s.getProjectPaths(p)
+		slug := branchSlug(p.BranchName)
 
 		overrides := s.loadEnvOverridesFromState(projectID)
-		if err := updateEnvFileWithOverrides(envFile, overrides, projectID, branchSlug); err != nil {
+		if err := updateEnvFileWithOverrides(envFile, overrides, projectID, slug); err != nil {
 			s.audit.Log("container_recreate", "failed", projectID, fmt.Sprintf("Failed to sync env overrides: %s", err.Error()), "")
 			return err
 		}
@@ -793,10 +766,38 @@ func (s *ProjectService) ContainerAction(projectID, service, action string) erro
 			return err
 		}
 		s.audit.Log("container_recreate", "ok", projectID, fmt.Sprintf("Recreated container for service %s", service), "")
-	default:
+		return nil
+	}
+
+	validActions := map[string]bool{
+		"start":   true,
+		"stop":    true,
+		"restart": true,
+		"pause":   true,
+		"resume":  true,
+	}
+	if !validActions[action] {
 		return fmt.Errorf("invalid action: %s", action)
 	}
 
+	auditKey := "container_" + action
+	presentTense := action + "ing"
+	if action == "stop" {
+		presentTense = "stopping"
+	} else if action == "resume" {
+		presentTense = "resuming"
+	}
+	pastTense := action + "ed"
+	if action == "resume" {
+		pastTense = "resumed"
+	}
+
+	s.audit.Log(auditKey, "running", projectID, fmt.Sprintf("%s container for service %s", strings.Title(presentTense), service), "")
+	if err := s.docker.ContainerAction(action, containerName); err != nil {
+		s.audit.Log(auditKey, "failed", projectID, err.Error(), "")
+		return err
+	}
+	s.audit.Log(auditKey, "ok", projectID, fmt.Sprintf("%s container for service %s", strings.Title(pastTense), service), "")
 	return nil
 }
 
@@ -817,14 +818,40 @@ func (s *ProjectService) FindContainerName(projectID, service, branch string) st
 		return altFormat
 	}
 	prefix := projectID + "-"
-	suffix := "-" + service
 	names, err := s.docker.ListContainers("name=^/" + prefix)
 	if err != nil {
 		return derived
 	}
+
+	escapedProj := regexp.QuoteMeta(projectID)
+	escapedSvc := regexp.QuoteMeta(service)
+	pattern1 := regexp.MustCompile(fmt.Sprintf(`^%s-(.+)-%s(-[0-9]+)?$`, escapedProj, escapedSvc))
+	pattern2 := regexp.MustCompile(fmt.Sprintf(`^%s-%s-(.+)(-[0-9]+)?$`, escapedProj, escapedSvc))
+
+	// Get all project IDs to prevent crosstalk via longest prefix match
+	var otherProjectIDs []string
+	if projects, err := s.db.ListProjects(); err == nil {
+		for _, proj := range projects {
+			if proj.ID != projectID {
+				otherProjectIDs = append(otherProjectIDs, proj.ID)
+			}
+		}
+	}
+
 	for _, name := range names {
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
-			return name
+		if pattern1.MatchString(name) || pattern2.MatchString(name) {
+			// Prevent crosstalk: ensure no other project ID has a longer prefix match
+			hasLongerMatch := false
+			for _, otherID := range otherProjectIDs {
+				otherPrefix := otherID + "-"
+				if strings.HasPrefix(name, otherPrefix) && len(otherPrefix) > len(prefix) {
+					hasLongerMatch = true
+					break
+				}
+			}
+			if !hasLongerMatch {
+				return name
+			}
 		}
 	}
 	return derived
@@ -898,12 +925,17 @@ func (s *ProjectService) CheckServiceHealth(service, containerName string, summa
 
 	// If the project has a devops.json, look up health config for this service
 	composeFile := filepath.Join(s.cfg.BaseDir, "Projects", containerName[:strings.Index(containerName, "-")], "devops.json")
-	if devopsCfg := s.loadDevopsConfig(composeFile); devopsCfg != nil {
-		if svcCfg, ok := devopsCfg["services"].(map[string]interface{})[service]; ok {
-			if svcMap, ok := svcCfg.(map[string]interface{}); ok {
-				if healthCfg, ok := svcMap["health"].(map[string]interface{}); ok {
-					port := int(healthCfg["port"].(float64))
-					path, _ := healthCfg["path"].(string)
+	if devopsCfg := s.loadDevopsConfig(composeFile); devopsCfg != nil && devopsCfg.Services != nil {
+		if svcCfg, ok := devopsCfg.Services[service].(map[string]interface{}); ok {
+			if healthCfg, ok := svcCfg["health"].(map[string]interface{}); ok {
+				var port int
+				if pFloat, ok := healthCfg["port"].(float64); ok {
+					port = int(pFloat)
+				} else if pInt, ok := healthCfg["port"].(int); ok {
+					port = pInt
+				}
+				path, _ := healthCfg["path"].(string)
+				if port > 0 {
 					execStatus, execDetail := s.docker.ExecHTTPHealth(containerName, port, path)
 					h.Status = execStatus
 					h.Detail = execDetail
@@ -918,23 +950,26 @@ func (s *ProjectService) CheckServiceHealth(service, containerName string, summa
 	return h
 }
 
+type DevopsConfig struct {
+	Version     string                 `json:"version"`
+	ProjectName string                 `json:"project_name"`
+	ComposeFile string                 `json:"compose_file"`
+	EnvTemplate string                 `json:"env_template"`
+	Services    map[string]interface{} `json:"services"`
+	Logs        *DevopsLogsConfig      `json:"logs"`
+}
+
+type DevopsLogsConfig struct {
+	Directory         string            `json:"directory"`
+	ContainerInternal map[string]string `json:"container_internal"`
+}
+
 func (s *ProjectService) LogDir(p *models.Project) string {
 	defaultDir := filepath.Join(s.cfg.BaseDir, "Logs", p.ID)
 	devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
-	data, err := os.ReadFile(devopsPath)
-	if err != nil {
-		return defaultDir
-	}
-	var cfg map[string]interface{}
-	if json.Unmarshal(data, &cfg) != nil {
-		return defaultDir
-	}
-	logsCfg, ok := cfg["logs"].(map[string]interface{})
-	if !ok {
-		return defaultDir
-	}
-	if dir, ok := logsCfg["directory"].(string); ok && dir != "" {
-		return dir
+	cfg := s.loadDevopsConfig(devopsPath)
+	if cfg != nil && cfg.Logs != nil && cfg.Logs.Directory != "" {
+		return cfg.Logs.Directory
 	}
 	return defaultDir
 }
@@ -942,36 +977,28 @@ func (s *ProjectService) LogDir(p *models.Project) string {
 func (s *ProjectService) ContainerLogFiles(p *models.Project) map[string]string {
 	devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
 	cfg := s.loadDevopsConfig(devopsPath)
-	if cfg == nil {
-		return nil
-	}
-	logsCfg, ok := cfg["logs"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	internal, ok := logsCfg["container_internal"].(map[string]interface{})
-	if !ok {
+	if cfg == nil || cfg.Logs == nil || cfg.Logs.ContainerInternal == nil {
 		return nil
 	}
 	result := make(map[string]string)
-	for svc, path := range internal {
-		if p, ok := path.(string); ok && p != "" {
-			result[svc] = p
+	for svc, path := range cfg.Logs.ContainerInternal {
+		if path != "" {
+			result[svc] = path
 		}
 	}
 	return result
 }
 
-func (s *ProjectService) loadDevopsConfig(path string) map[string]interface{} {
+func (s *ProjectService) loadDevopsConfig(path string) *DevopsConfig {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
-	var cfg map[string]interface{}
+	var cfg DevopsConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil
 	}
-	return cfg
+	return &cfg
 }
 
 // composeServices returns service names for a project by reading docker-compose.yml
@@ -981,11 +1008,9 @@ func (s *ProjectService) composeServices(p *models.Project) []string {
 	if err != nil || len(svcNames) == 0 {
 		// Fallback: read from devops.json services section
 		devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
-		if cfg := s.loadDevopsConfig(devopsPath); cfg != nil {
-			if svcs, ok := cfg["services"].(map[string]interface{}); ok {
-				for name := range svcs {
-					svcNames = append(svcNames, name)
-				}
+		if cfg := s.loadDevopsConfig(devopsPath); cfg != nil && cfg.Services != nil {
+			for name := range cfg.Services {
+				svcNames = append(svcNames, name)
 			}
 		}
 	}
