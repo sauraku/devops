@@ -490,6 +490,7 @@ const (
 	runnerRegistrationRequestMarker = "DEVOPS_RUNNER_REGISTRATION_REQUIRED"
 	runnerRegistrationTokenPath     = "/run/devops-runner-registration/token"
 	runnerRegistrationStagingPath   = "/run/devops-runner-registration/.token.tmp"
+	runnerReadyTimeout              = 5 * time.Minute
 )
 
 func isGitHubPersonalAccessToken(token string) bool {
@@ -591,37 +592,27 @@ func (s *ProjectService) waitForRunnerRegistrationRequest(containerName string, 
 	return false, fmt.Errorf("runner did not request a registration credential")
 }
 
-// copyRunnerRegistrationToken writes the short-lived token beneath the
-// controller's protected runtime directory, copies it into the runner's tmpfs,
-// and removes the host copy immediately. The token is never a command argument
-// or environment variable.
+// copyRunnerRegistrationToken streams the short-lived token through docker
+// exec's standard input into the runner-owned registration tmpfs. Docker cp
+// cannot target a tmpfs below a read-only container root filesystem. The token
+// is never persisted on the controller, passed as a command argument, or made
+// an environment variable. The runner observes it only after the atomic move.
 func (s *ProjectService) copyRunnerRegistrationToken(ctx context.Context, containerName, token string) error {
-	secretDir, err := os.MkdirTemp(s.cfg.RunDir, ".runner-registration-")
-	if err != nil {
-		return fmt.Errorf("create runner registration secret directory: %w", err)
+	if err := validateSingleLineSecret(token); err != nil {
+		return fmt.Errorf("invalid runner registration credential")
 	}
-	defer os.RemoveAll(secretDir)
-	if err := os.Chmod(secretDir, 0o700); err != nil {
-		return fmt.Errorf("secure runner registration secret directory: %w", err)
-	}
-	secretPath := filepath.Join(secretDir, "token")
-	if err := os.WriteFile(secretPath, []byte(token), 0o600); err != nil {
-		return fmt.Errorf("write runner registration secret: %w", err)
-	}
-	// docker cp retains the file mode and creates the file as root. The runner
-	// needs only read access; the runner-owned tmpfs directory permits removal.
-	if err := os.Chmod(secretPath, 0o604); err != nil {
-		return fmt.Errorf("prepare runner registration secret permissions: %w", err)
-	}
-	cmd := exec.CommandContext(ctx, "docker", "cp", secretPath, containerName+":"+runnerRegistrationStagingPath)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("copy runner registration secret: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	// Publish atomically so the entrypoint cannot observe a partially copied
-	// credential. The runner owns the tmpfs directory and can rename the file.
-	publish := exec.CommandContext(ctx, "docker", "exec", containerName, "mv", "--", runnerRegistrationStagingPath, runnerRegistrationTokenPath)
+	// The entrypoint runs as the unprivileged runner user, which owns the tmpfs.
+	// Write a private staging file and rename it only after the complete stdin
+	// stream arrives so it cannot consume a partially written credential.
+	publish := exec.CommandContext(
+		ctx,
+		"docker", "exec", "-i", containerName,
+		"sh", "-ceu",
+		"umask 077; cat > \"$1\"; mv -f -- \"$1\" \"$2\"",
+		"runner-registration-publisher", runnerRegistrationStagingPath, runnerRegistrationTokenPath,
+	)
 	publish.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	publish.Stdin = strings.NewReader(token)
 	if output, err := publish.CombinedOutput(); err != nil {
 		return fmt.Errorf("publish runner registration secret: %w: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -672,7 +663,10 @@ func (s *ProjectService) startRunner(p *models.Project, runnerToken string) erro
 		}
 	}
 
-	ready, state, logs := s.docker.WaitForRunnerReady(p.RunnerContainer, 90*time.Second)
+	// GitHub may retain a replaced runner's previous session briefly. The runner
+	// client retries that transient conflict itself, so do not tear down a
+	// correctly registered runner after only one retry interval.
+	ready, state, logs := s.docker.WaitForRunnerReady(p.RunnerContainer, runnerReadyTimeout)
 	if !ready {
 		s.docker.RemoveContainer(p.RunnerContainer)
 		return fmt.Errorf("runner did not become ready (state=%s): %s", state, truncateStr(logs, 200))
