@@ -31,8 +31,8 @@ var upgrader = websocket.Upgrader{
 }
 
 type LogStreamer struct {
-	mu       sync.RWMutex
-	clients  map[string]map[*websocket.Conn]bool
+	mu      sync.RWMutex
+	clients map[string]map[*websocket.Conn]bool
 }
 
 func NewLogStreamer() *LogStreamer {

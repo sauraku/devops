@@ -1,7 +1,5 @@
 const CSRF_TOKEN =
   document.querySelector<HTMLMetaElement>('meta[name="csrf-token"]')?.content ?? '';
-const AUTH_TOKEN =
-  document.querySelector<HTMLMetaElement>('meta[name="auth-token"]')?.content ?? '';
 
 const REQUEST_TIMEOUT = 30000;
 
@@ -19,7 +17,6 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       headers: {
         'Content-Type': 'application/json',
         'X-CSRF-Token': CSRF_TOKEN,
-        'X-Deploy-Control-Token': AUTH_TOKEN,
         ...options.headers,
       },
     });
@@ -41,7 +38,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 }
 
-import type { Project, ProjectListResponse, ProjectStatus, Deployment, Backup } from '../types';
+import type { Project, ProjectListResponse, ProjectStatus, Deployment, DeploymentOperation, Backup } from '../types';
+import type { EnvTemplateVariable } from './env';
 
 export function listProjects() {
   return request<ProjectListResponse>('/api/projects');
@@ -59,9 +57,16 @@ export function createProject(body: Record<string, any>) {
 }
 
 export function deployProject(projectId: string, body: Record<string, any>) {
-  return request<{ ok: boolean; operation: Deployment }>(
+  return request<{ ok: boolean; operation: DeploymentOperation; status_url: string }>(
     `/api/projects/${encodeURIComponent(projectId)}/deploy`,
     { method: 'POST', body: JSON.stringify(body) }
+  );
+}
+
+export function approveDeployment(projectId: string, deployId: string) {
+  return request<{ ok: boolean; operation: DeploymentOperation; status_url: string }>(
+    `/api/projects/${encodeURIComponent(projectId)}/deployments/${encodeURIComponent(deployId)}/approve`,
+    { method: 'POST', body: JSON.stringify({ confirmation: `approve ${deployId}` }) }
   );
 }
 
@@ -173,7 +178,7 @@ export function dryRunRestore(projectId: string, backupId: string) {
 }
 
 export function getEnvTemplate(projectId: string) {
-  return request<{ variables: { key: string; default: string; is_secret: boolean }[]; overrides: Record<string, string> }>(
+  return request<{ variables: EnvTemplateVariable[]; overrides: Record<string, string> }>(
     `/api/projects/${encodeURIComponent(projectId)}/env-template`
   );
 }

@@ -28,6 +28,29 @@ func (db *DB) UpdateDeploymentStatus(id string, status models.DeploymentStatus, 
 	return err
 }
 
+func (db *DB) TransitionDeploymentStatus(id string, from, to models.DeploymentStatus) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE deployments SET status = ? WHERE id = ? AND status = ?
+	`, to, id, from)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
+func (db *DB) CompleteActiveDeployment(id string, status models.DeploymentStatus, exitCode int, finishedAt time.Time) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE deployments SET status = ?, exit_code = ?, finished_at = ?
+		WHERE id = ? AND status IN ('pending', 'running')
+	`, status, exitCode, finishedAt.Format(time.RFC3339), id)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
 func (db *DB) ListDeployments(projectID string, limit int) ([]*models.Deployment, error) {
 	rows, err := db.Query(`
 		SELECT id, project_id, kind, status, ref, sha, image_tag, branch, commit_message,
@@ -51,12 +74,12 @@ func (db *DB) ListDeployments(projectID string, limit int) ([]*models.Deployment
 	return deployments, rows.Err()
 }
 
-func (db *DB) GetRunningDeployments(projectID string) ([]*models.Deployment, error) {
+func (db *DB) GetActiveDeployments(projectID string) ([]*models.Deployment, error) {
 	rows, err := db.Query(`
 		SELECT id, project_id, kind, status, ref, sha, image_tag, branch, commit_message,
 		       started_at, finished_at, exit_code, log_path,
 		       github_run_id, github_run_number, github_actor, github_repository, github_workflow
-		FROM deployments WHERE project_id = ? AND status = 'running' ORDER BY started_at DESC
+		FROM deployments WHERE project_id = ? AND status IN ('pending', 'running') ORDER BY started_at DESC
 	`, projectID)
 	if err != nil {
 		return nil, err

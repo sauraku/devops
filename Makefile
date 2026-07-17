@@ -2,7 +2,7 @@ BINARY=devops-control
 BUILD_DIR=.
 UI_DIR=ui
 
-.PHONY: all build ui-build ui-deps clean run
+.PHONY: all build ui-build ui-deps clean run test
 
 all: build
 
@@ -25,6 +25,11 @@ build-fast:
 ## Run the server (requires DEPLOY_CONTROL_TOKEN)
 run: build
 	./$(BINARY)
+
+test: ui-build
+	go test ./...
+	go vet ./...
+	bash -n deploy/*.sh deploy/runner/*.sh scripts/*.sh
 
 ## Development: run UI dev server with Go backend
 dev:

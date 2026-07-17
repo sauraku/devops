@@ -2,7 +2,9 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sauraku/devops-control/internal/models"
@@ -110,6 +112,70 @@ func (db *DB) UpsertProject(p *models.Project) error {
 		p.RegistryHost, p.RegistryUsername, p.RunnerContainer, p.RunnerStatus,
 		p.AppDir, p.CreatedAt.Format(time.RFC3339), p.UpdatedAt.Format(time.RFC3339))
 	return err
+}
+
+// SaveProjectWithCredentials atomically persists project configuration and any
+// newly supplied credentials. Nil credentials leave the existing values alone.
+func (db *DB) SaveProjectWithCredentials(p *models.Project, registryPassword, runnerToken *string) error {
+	var encryptedRegistry, encryptedRunner string
+	var err error
+	if registryPassword != nil {
+		encryptedRegistry, err = encrypt(*registryPassword)
+		if err != nil {
+			return fmt.Errorf("encrypt registry password: %w", err)
+		}
+	}
+	if runnerToken != nil {
+		encryptedRunner, err = encrypt(*runnerToken)
+		if err != nil {
+			return fmt.Errorf("encrypt runner token: %w", err)
+		}
+	}
+
+	now := time.Now().UTC()
+	p.UpdatedAt = now
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`
+		INSERT INTO projects (id, name, repo_url, branch_name, deployment_mode, auto_apply,
+		                      registry_host, registry_username, runner_container, runner_status,
+		                      app_dir, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name=excluded.name, repo_url=excluded.repo_url, branch_name=excluded.branch_name,
+			deployment_mode=excluded.deployment_mode, auto_apply=excluded.auto_apply,
+			registry_host=excluded.registry_host, registry_username=excluded.registry_username,
+			runner_container=excluded.runner_container, runner_status=excluded.runner_status,
+			app_dir=excluded.app_dir, updated_at=excluded.updated_at
+	`, p.ID, p.Name, p.RepoURL, p.BranchName, p.DeploymentMode, boolToInt(p.AutoApply),
+		p.RegistryHost, p.RegistryUsername, p.RunnerContainer, p.RunnerStatus,
+		p.AppDir, p.CreatedAt.Format(time.RFC3339), p.UpdatedAt.Format(time.RFC3339)); err != nil {
+		return err
+	}
+	timestamp := now.Format(time.RFC3339)
+	if registryPassword != nil {
+		if _, err = tx.Exec(`
+			INSERT INTO registry_auth (project_id, registry_password, updated_at) VALUES (?, ?, ?)
+			ON CONFLICT(project_id) DO UPDATE SET registry_password=excluded.registry_password, updated_at=excluded.updated_at
+		`, p.ID, encryptedRegistry, timestamp); err != nil {
+			return err
+		}
+	}
+	if runnerToken != nil {
+		if _, err = tx.Exec(`
+			INSERT INTO runner_auth (project_id, runner_token, updated_at) VALUES (?, ?, ?)
+			ON CONFLICT(project_id) DO UPDATE SET runner_token=excluded.runner_token, updated_at=excluded.updated_at
+		`, p.ID, encryptedRunner, timestamp); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (db *DB) DeleteProject(id string) error {
@@ -225,6 +291,202 @@ func (db *DB) GetRegistryPassword(projectID string) (string, error) {
 		return "", fmt.Errorf("decrypt registry password: %w", err)
 	}
 	return plaintext, nil
+}
+
+func (db *DB) SaveRunnerToken(projectID, token string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	encrypted, err := encrypt(token)
+	if err != nil {
+		return fmt.Errorf("encrypt runner token: %w", err)
+	}
+	_, err = db.Exec(`
+		INSERT INTO runner_auth (project_id, runner_token, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(project_id) DO UPDATE SET runner_token=excluded.runner_token, updated_at=excluded.updated_at
+	`, projectID, encrypted, now)
+	return err
+}
+
+func (db *DB) GetRunnerToken(projectID string) (string, error) {
+	var stored string
+	err := db.QueryRow("SELECT runner_token FROM runner_auth WHERE project_id = ?", projectID).Scan(&stored)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	plaintext, err := decrypt(stored)
+	if err != nil {
+		return "", fmt.Errorf("decrypt runner token: %w", err)
+	}
+	return plaintext, nil
+}
+
+// MigrateLegacyRunnerTokens copies only unmistakable GitHub PAT values from
+// the old shared registry credential field. The registry copy is retained
+// because the same PAT may also authorize GHCR pulls.
+func (db *DB) MigrateLegacyRunnerTokens() error {
+	rows, err := db.Query(`
+		SELECT r.project_id, r.registry_password
+		FROM registry_auth r
+		LEFT JOIN runner_auth a ON a.project_id = r.project_id
+		WHERE a.project_id IS NULL
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type legacyToken struct{ projectID, token string }
+	var tokens []legacyToken
+	for rows.Next() {
+		var projectID, stored string
+		if err := rows.Scan(&projectID, &stored); err != nil {
+			return err
+		}
+		plain, err := decrypt(stored)
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(plain, "ghp_") || strings.HasPrefix(plain, "github_pat_") {
+			tokens = append(tokens, legacyToken{projectID: projectID, token: plain})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, token := range tokens {
+		if err := db.SaveRunnerToken(token.projectID, token.token); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) SaveProjectEnvOverrides(projectID string, overrides map[string]string) error {
+	plain, err := json.Marshal(overrides)
+	if err != nil {
+		return fmt.Errorf("encode project environment: %w", err)
+	}
+	encrypted, err := encrypt(string(plain))
+	if err != nil {
+		return fmt.Errorf("encrypt project environment: %w", err)
+	}
+	_, err = db.Exec(`
+		INSERT INTO project_env (project_id, encrypted_overrides, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(project_id) DO UPDATE SET encrypted_overrides=excluded.encrypted_overrides, updated_at=excluded.updated_at
+	`, projectID, encrypted, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func (db *DB) GetProjectEnvOverrides(projectID string) (map[string]string, error) {
+	var stored string
+	err := db.QueryRow("SELECT encrypted_overrides FROM project_env WHERE project_id = ?", projectID).Scan(&stored)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	plain, err := decrypt(stored)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt project environment: %w", err)
+	}
+	var overrides map[string]string
+	if err := json.Unmarshal([]byte(plain), &overrides); err != nil {
+		return nil, fmt.Errorf("decode project environment: %w", err)
+	}
+	return overrides, nil
+}
+
+// MigrateLegacyProjectEnvOverrides moves the old plaintext env_overrides field
+// out of project_state.metadata and into the encrypted project_env table. The
+// complete migration is one transaction so a failed startup cannot leave a
+// project's only copy of its overrides half-migrated.
+func (db *DB) MigrateLegacyProjectEnvOverrides() error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`
+		SELECT s.project_id, COALESCE(s.metadata, '{}'), e.project_id
+		FROM project_state s
+		LEFT JOIN project_env e ON e.project_id = s.project_id
+	`)
+	if err != nil {
+		return err
+	}
+	type legacyEnvironment struct {
+		projectID    string
+		metadata     string
+		hasEncrypted bool
+	}
+	var candidates []legacyEnvironment
+	for rows.Next() {
+		var candidate legacyEnvironment
+		var encryptedProjectID sql.NullString
+		if err := rows.Scan(&candidate.projectID, &candidate.metadata, &encryptedProjectID); err != nil {
+			rows.Close()
+			return err
+		}
+		candidate.hasEncrypted = encryptedProjectID.Valid
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, candidate := range candidates {
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(candidate.metadata), &metadata); err != nil {
+			return fmt.Errorf("decode project_state metadata for %s: %w", candidate.projectID, err)
+		}
+		raw, exists := metadata["env_overrides"]
+		if !exists {
+			continue
+		}
+		legacy, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("project_state metadata env_overrides for %s is not an object", candidate.projectID)
+		}
+		if !candidate.hasEncrypted {
+			overrides := make(map[string]string, len(legacy))
+			for key, value := range legacy {
+				overrides[key] = fmt.Sprint(value)
+			}
+			plain, err := json.Marshal(overrides)
+			if err != nil {
+				return fmt.Errorf("encode legacy project environment for %s: %w", candidate.projectID, err)
+			}
+			encrypted, err := encrypt(string(plain))
+			if err != nil {
+				return fmt.Errorf("encrypt legacy project environment for %s: %w", candidate.projectID, err)
+			}
+			if _, err := tx.Exec(`
+				INSERT INTO project_env (project_id, encrypted_overrides, updated_at)
+				VALUES (?, ?, ?)
+			`, candidate.projectID, encrypted, now); err != nil {
+				return fmt.Errorf("save migrated project environment for %s: %w", candidate.projectID, err)
+			}
+		}
+		delete(metadata, "env_overrides")
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("encode migrated project_state metadata for %s: %w", candidate.projectID, err)
+		}
+		if _, err := tx.Exec("UPDATE project_state SET metadata = ? WHERE project_id = ?", string(encoded), candidate.projectID); err != nil {
+			return fmt.Errorf("remove plaintext project environment for %s: %w", candidate.projectID, err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 type scanner interface {

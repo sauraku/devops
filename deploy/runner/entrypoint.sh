@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Use the RUNNER_DIR environment variable passed from docker-compose
 RUNNER_DIR="${RUNNER_DIR:-/home/runner/actions-runner}"
@@ -27,40 +27,49 @@ if [ "$RUNNER_DIR" != "/home/runner/actions-runner" ]; then
   fi
 fi
 
-# Check if runner is already configured
+# Check if runner is already configured. An unconfigured runner asks the
+# controller for a short-lived registration token; no GitHub PAT is accepted in
+# this container and no credential is inherited through the environment.
 if [ ! -f "$RUNNER_DIR/.runner" ] && [ ! -f "$RUNNER_DIR/.runner_migrated" ]; then
-  if [ -z "$RUNNER_TOKEN" ] || [ -z "$REPO_URL" ]; then
-    echo "❌ Error: Runner is not configured, and RUNNER_TOKEN or REPO_URL is missing!"
+  if [ -z "${REPO_URL:-}" ]; then
+    echo "❌ Error: Runner is not configured, and REPO_URL is missing!" >&2
     exit 1
   fi
 
-  # Detect if RUNNER_TOKEN is a GitHub Personal Access Token (PAT)
-  if [[ "$RUNNER_TOKEN" == ghp_* || "$RUNNER_TOKEN" == github_pat_* ]]; then
-    echo "🔑 Detected GitHub Personal Access Token (PAT). Fetching a fresh runner registration token..."
-    
-    CLEAN_URL="${REPO_URL%.git}"
-    CLEAN_URL="${CLEAN_URL%/}"
-    OWNER_REPO=$(echo "$CLEAN_URL" | awk -F'[:/]' '{print $(NF-1)"/"$NF}')
-    
-    echo "📦 Repository identified: $OWNER_REPO"
-    
-    API_RESPONSE=$(curl -s -X POST \
-      -H "Accept: application/vnd.github+json" \
-      -H "Authorization: Bearer $RUNNER_TOKEN" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "https://api.github.com/repos/${OWNER_REPO}/actions/runners/registration-token" || true)
-      
-    REG_TOKEN=$(echo "$API_RESPONSE" | grep -o '"token": *"[^"]*"' | head -n1 | grep -o '"[^"]*"$' | tr -d '"' || true)
-    
-    if [ -n "$REG_TOKEN" ]; then
-      echo "✅ Successfully fetched registration token."
-      RUNNER_TOKEN="$REG_TOKEN"
-    else
-      echo "❌ Failed to fetch registration token using PAT." >&2
-      exit 1
-    fi
+  REGISTRATION_TOKEN_FILE="${RUNNER_REGISTRATION_TOKEN_FILE:-/run/devops-runner-registration/token}"
+  cleanup_registration_token() {
+    rm -f -- "$REGISTRATION_TOKEN_FILE" 2>/dev/null || true
+  }
+  trap cleanup_registration_token EXIT
+
+  echo "DEVOPS_RUNNER_REGISTRATION_REQUIRED"
+  for _ in $(seq 1 60); do
+    [ -f "$REGISTRATION_TOKEN_FILE" ] && break
+    sleep 1
+  done
+  if [ ! -f "$REGISTRATION_TOKEN_FILE" ]; then
+    echo "❌ Error: Timed out waiting for runner registration credential." >&2
+    exit 1
   fi
-  
+
+  RUNNER_TOKEN="$(<"$REGISTRATION_TOKEN_FILE")"
+  if [ -z "$RUNNER_TOKEN" ] || [[ "$RUNNER_TOKEN" == *$'\n'* ]] || [[ "$RUNNER_TOKEN" == *$'\r'* ]]; then
+    unset RUNNER_TOKEN
+    echo "❌ Error: Runner registration credential is invalid." >&2
+    exit 1
+  fi
+  if [[ "$RUNNER_TOKEN" == ghp_* || "$RUNNER_TOKEN" == github_pat_* || "$RUNNER_TOKEN" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+    unset RUNNER_TOKEN
+    echo "❌ Error: Refusing a long-lived GitHub credential in the runner container." >&2
+    exit 1
+  fi
+  if ! rm -f -- "$REGISTRATION_TOKEN_FILE" || [ -e "$REGISTRATION_TOKEN_FILE" ]; then
+    unset RUNNER_TOKEN
+    echo "❌ Error: Could not remove runner registration credential before startup." >&2
+    exit 1
+  fi
+  trap - EXIT
+
   echo "⚙️ Configuring GitHub Actions Runner..."
   cd "$RUNNER_DIR"
   labels="${RUNNER_LABELS:-development,production}"
@@ -77,6 +86,7 @@ if [ ! -f "$RUNNER_DIR/.runner" ] && [ ! -f "$RUNNER_DIR/.runner_migrated" ]; th
     echo "----------------------------------------------------------------------"
     exit 1
   fi
+  unset RUNNER_TOKEN
 else
   echo "ℹ️ Runner already configured."
 fi
@@ -84,14 +94,16 @@ fi
 echo "🚀 Starting GitHub Actions Runner..."
 cd "$RUNNER_DIR"
 
+# Registration credentials must not remain available to repository jobs.
+unset RUNNER_TOKEN REGISTRATION_TOKEN_FILE
+
 RUN_LOG=$(mktemp)
 trap 'rm -f "$RUN_LOG"' EXIT
 
-if [ -d "/logs" ]; then
-  ./run.sh 2>&1 | tee "$RUN_LOG" | tee -a /logs/runner.log || true
-else
-  ./run.sh 2>&1 | tee "$RUN_LOG" || true
-fi
+set +e
+./run.sh 2>&1 | tee "$RUN_LOG"
+runner_status=${PIPESTATUS[0]}
+set -e
 
 # Check if the runner failed because registration was deleted from server
 if grep -q "The runner registration has been deleted from the server" "$RUN_LOG" 2>/dev/null; then
@@ -101,4 +113,4 @@ if grep -q "The runner registration has been deleted from the server" "$RUN_LOG"
   exit 1
 fi
 
-
+exit "$runner_status"

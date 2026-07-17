@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 if [ "$#" -ne 1 ]; then
   echo "Usage: $0 <backup-id>" >&2
@@ -9,10 +10,12 @@ fi
 BACKUP_ID="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_DIR="$(cd "${SERVER_DIR}/.." && pwd)"
-STATE_DIR="${SERVER_DIR}/State"
-BACKUP_DIR="${BACKUP_DIR_PATH:-${SERVER_DIR}/Backups}"
-LOG_DIR="${SERVER_DIR}/Logs"
+# shellcheck source=../deploy/lib.sh
+source "${SERVER_DIR}/deploy/lib.sh"
+PROJECT_DIR="${PROJECT_DIR:-$PWD}"
+STATE_DIR="${PROJECT_STATE_DIR:-${BASE_DIR:-${SERVER_DIR}}/State/${PROJECT_ID:-default}}"
+BACKUP_DIR="${BACKUP_DIR_PATH:-${BASE_DIR:-${SERVER_DIR}}/Backups/${PROJECT_ID:-default}}"
+LOG_DIR="${PROJECT_LOG_DIR:-${BASE_DIR:-${SERVER_DIR}}/Logs/${PROJECT_ID:-default}}"
 LOCK_DIR="${STATE_DIR}/deploy-lock"
 MANIFEST_FILE="${BACKUP_MANIFEST_FILE:-${BACKUP_DIR}/manifest.jsonl}"
 AUDIT_LOG="${LOG_DIR}/deploy-control-audit.log"
@@ -30,6 +33,30 @@ case "${TARGET_BRANCH}" in
   refs/heads/*) TARGET_BRANCH="${TARGET_BRANCH#refs/heads/}" ;;
 esac
 
+TRUSTED_PROJECT_ID="${PROJECT_ID:-}"
+TRUSTED_TARGET_BRANCH="${TARGET_BRANCH}"
+TRUSTED_COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
+TRUSTED_COMPOSE_FILE="${COMPOSE_FILE}"
+if [ -z "${TRUSTED_PROJECT_ID}" ]; then
+  echo "Restore failed: PROJECT_ID must be supplied by the control plane." >&2
+  exit 1
+fi
+case "${TRUSTED_PROJECT_ID}" in
+  *[!a-z0-9_.-]*|"") echo "Restore failed: invalid PROJECT_ID." >&2; exit 1 ;;
+esac
+
+branch_slug="$(printf '%s' "${TRUSTED_TARGET_BRANCH}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')"
+if [ -z "${branch_slug}" ]; then
+  branch_slug="rc"
+elif ! printf '%s' "${branch_slug}" | grep -Eq '^[a-z0-9]'; then
+  branch_slug="branch-${branch_slug}"
+fi
+EXPECTED_COMPOSE_PROJECT_NAME="${TRUSTED_PROJECT_ID}-${branch_slug}"
+if [ -n "${TRUSTED_COMPOSE_PROJECT_NAME}" ] && [ "${TRUSTED_COMPOSE_PROJECT_NAME}" != "${EXPECTED_COMPOSE_PROJECT_NAME}" ]; then
+  echo "Restore failed: Compose project does not match the registered project and branch." >&2
+  exit 1
+fi
+
 if [ -n "${ENV_FILE:-}" ]; then
   DEPLOY_ENV_FILE="${ENV_FILE}"
 elif [ -f "${SERVER_DIR}/.env.${TARGET_BRANCH}" ]; then
@@ -43,31 +70,68 @@ if [ ! -f "${DEPLOY_ENV_FILE}" ]; then
   exit 1
 fi
 
-# Save critical host env vars that the project env file may override
-_SAVED_HOME="${HOME}"
-_SAVED_PATH="${PATH}"
-_SAVED_PWD="${PWD}"
-_SAVED_SHLVL="${SHLVL}"
-set -a
-source "${DEPLOY_ENV_FILE}"
-set +a
-# Restore critical host env vars
-HOME="${_SAVED_HOME}"
-PATH="${_SAVED_PATH}"
-PWD="${_SAVED_PWD}"
-SHLVL="${_SAVED_SHLVL}"
+load_dotenv "${DEPLOY_ENV_FILE}"
 
-ENV_NAME="${ENV_NAME:-rc}"
-COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${PROJECT_ID:-project}-${ENV_NAME}}"
+PROJECT_ID="${TRUSTED_PROJECT_ID}"
+TARGET_BRANCH="${TRUSTED_TARGET_BRANCH}"
+ENV_NAME="${branch_slug}"
+COMPOSE_PROJECT_NAME="${EXPECTED_COMPOSE_PROJECT_NAME}"
+COMPOSE_FILE="${TRUSTED_COMPOSE_FILE}"
 POSTGRES_DB="${POSTGRES_DB:-${PROJECT_ID:-project}-db}"
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
-POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-${COMPOSE_PROJECT_NAME:-project}-postgres}"
-BACKEND_CONTAINER="${BACKEND_CONTAINER:-${COMPOSE_PROJECT_NAME:-project}-backend}"
-STOREFRONT_CONTAINER="${STOREFRONT_CONTAINER:-${COMPOSE_PROJECT_NAME:-project}-storefront}"
+# Container names from the project dotenv are untrusted. Service targets are
+# resolved from exact Compose ownership labels immediately before use.
+unset POSTGRES_CONTAINER BACKEND_CONTAINER STOREFRONT_CONTAINER
 BACKUP_FILE="${BACKUP_DIR}/${BACKUP_ID}.dump.gz"
 case "${BACKUP_ID}" in
-  *[!/a-zA-Z0-9_.-]*|"") echo "Restore failed: invalid backup id" >&2; exit 1 ;;
+  *[!a-zA-Z0-9_.-]*|"") echo "Restore failed: invalid backup id" >&2; exit 1 ;;
 esac
+
+verify_owned_container() {
+  local container_id="${1:?container id is required}"
+  local service="${2:?service is required}"
+  local require_running="${3:-true}"
+  local actual expected
+  actual="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Running}}' "${container_id}" 2>/dev/null)" || {
+    echo "Restore failed: unable to inspect Compose service ${COMPOSE_PROJECT_NAME}/${service}." >&2
+    return 1
+  }
+  expected="${COMPOSE_PROJECT_NAME}|${service}"
+  case "${actual}" in
+    "${expected}|true") return 0 ;;
+    "${expected}|false")
+      if [ "${require_running}" = "false" ]; then
+        return 0
+      fi
+      echo "Restore failed: Compose service ${COMPOSE_PROJECT_NAME}/${service} is not running." >&2
+      ;;
+    *) echo "Restore failed: container ownership changed for Compose service ${COMPOSE_PROJECT_NAME}/${service}." >&2 ;;
+  esac
+  return 1
+}
+
+owned_compose_container() {
+  local service="${1:?service is required}"
+  local require_running="${2:-true}"
+  local output container_id
+  local -a container_ids=()
+  output="$(docker ps -aq \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${service}")" || {
+    echo "Restore failed: unable to resolve Compose service ${COMPOSE_PROJECT_NAME}/${service}." >&2
+    return 1
+  }
+  while IFS= read -r container_id; do
+    [ -n "${container_id}" ] && container_ids+=("${container_id}")
+  done <<< "${output}"
+  if [ "${#container_ids[@]}" -ne 1 ]; then
+    echo "Restore failed: expected exactly one container for Compose service ${COMPOSE_PROJECT_NAME}/${service}; found ${#container_ids[@]}." >&2
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  verify_owned_container "${container_id}" "${service}" "${require_running}" || return 1
+  printf '%s\n' "${container_id}"
+}
 
 # ── Download from Firebase Storage if local file is missing ──
 if [ ! -f "${BACKUP_FILE}" ]; then
@@ -83,10 +147,7 @@ if [ ! -f "${BACKUP_FILE}" ]; then
     ACCESS_TOKEN=$(python3 -c "
 import json, time, base64, urllib.request, urllib.parse, subprocess, os, tempfile
 
-creds_path = '${FIREBASE_CREDS}'
-client_email = '${FIREBASE_CLIENT}'
-pk_b64 = '${FIREBASE_PK_B64}'
-token_uri = '${FIREBASE_TOKEN_URI}'
+creds_path, client_email, pk_b64, token_uri = __import__('sys').argv[1:5]
 
 if creds_path and os.path.isfile(creds_path):
     with open(creds_path) as f:
@@ -124,12 +185,12 @@ req = urllib.request.Request(token_uri, data=data)
 with urllib.request.urlopen(req) as resp:
     token_data = json.loads(resp.read())
 print(token_data['access_token'])
-" 2>/dev/null || echo "")
+" "${FIREBASE_CREDS}" "${FIREBASE_CLIENT}" "${FIREBASE_PK_B64}" "${FIREBASE_TOKEN_URI}" 2>/dev/null || echo "")
     
     if [ -n "${ACCESS_TOKEN:-}" ]; then
       # Download DB dump
       REMOTE_DB_PATH="backups/${COMPOSE_PROJECT_NAME}/${BACKUP_ID}.dump.gz"
-      ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${REMOTE_DB_PATH}', safe=''))" 2>/dev/null)
+      ENCODED_PATH=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${REMOTE_DB_PATH}" 2>/dev/null)
       HTTP_CODE=$(curl -s -o "${BACKUP_FILE}" -w "%{http_code}" \
         -H "Authorization: Bearer ${ACCESS_TOKEN}" \
         "https://storage.googleapis.com/storage/v1/b/${FIREBASE_BUCKET}/o/${ENCODED_PATH}?alt=media" 2>&1)
@@ -141,7 +202,7 @@ print(token_data['access_token'])
         FILE_BACKUP_ID="files-uploads-${BACKUP_ID}"
         REMOTE_FILE_PATH="backups/${COMPOSE_PROJECT_NAME}/${FILE_BACKUP_ID}.tar.gz"
         LOCAL_FILE_BACKUP="${BACKUP_DIR}/${FILE_BACKUP_ID}.tar.gz"
-        ENCODED_FILE_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${REMOTE_FILE_PATH}', safe=''))" 2>/dev/null)
+        ENCODED_FILE_PATH=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${REMOTE_FILE_PATH}" 2>/dev/null)
         HTTP_CODE_FB=$(curl -s -o "${LOCAL_FILE_BACKUP}" -w "%{http_code}" \
           -H "Authorization: Bearer ${ACCESS_TOKEN}" \
           "https://storage.googleapis.com/storage/v1/b/${FIREBASE_BUCKET}/o/${ENCODED_FILE_PATH}?alt=media" 2>&1)
@@ -168,6 +229,10 @@ if [ ! -f "${BACKUP_FILE}" ]; then
   echo "Restore failed: backup file '${BACKUP_FILE}' does not exist." >&2
   exit 1
 fi
+
+# Fail closed before acquiring the restore lock. Application containers may be
+# absent and will be created by Compose later; PostgreSQL must already exist.
+POSTGRES_CONTAINER="$(owned_compose_container postgres true)"
 
 # Acquire lock
 if mkdir "${LOCK_DIR}" 2>/dev/null; then
@@ -207,22 +272,52 @@ echo "2. Stopping write-capable application containers..."
 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${DEPLOY_ENV_FILE}" stop backend storefront
 
 echo "3. Restoring database custom dump..."
+POSTGRES_CONTAINER="$(owned_compose_container postgres true)"
 set +e
-gzip -dc "${BACKUP_FILE}" | docker exec -i "${POSTGRES_CONTAINER}" pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" --clean --no-owner --no-privileges
-restore_rc=$?
+gzip -dc "${BACKUP_FILE}" | docker exec -i "${POSTGRES_CONTAINER}" \
+  pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+  --clean --if-exists --exit-on-error --no-owner --no-privileges
+restore_status=("${PIPESTATUS[@]}")
 set -e
 
-if [ "${restore_rc}" -ne 0 ]; then
-  echo "Restore warning: pg_restore exited with code ${restore_rc}. Some objects may have failed to clean or restore." >&2
+if [ "${restore_status[0]}" -ne 0 ] || [ "${restore_status[1]}" -ne 0 ]; then
+  echo "Restore failed (gzip=${restore_status[0]}, pg_restore=${restore_status[1]}). Recovering the pre-restore backup..." >&2
+  PRERESTORE_FILE="${BACKUP_DIR}/${PRERESTORE_ID}.dump.gz"
+  POSTGRES_CONTAINER="$(owned_compose_container postgres true)"
+  if gzip -dc "${PRERESTORE_FILE}" | docker exec -i "${POSTGRES_CONTAINER}" \
+      pg_restore -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+      --clean --if-exists --exit-on-error --no-owner --no-privileges; then
+    echo "Pre-restore database state recovered; restarting application containers." >&2
+    "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${DEPLOY_ENV_FILE}" up -d backend storefront
+  else
+    echo "CRITICAL: automatic recovery failed; backend and storefront remain stopped." >&2
+  fi
+  exit 1
 fi
 
 echo "4. Starting backend with current configuration..."
 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${DEPLOY_ENV_FILE}" up -d backend
 
 echo "5. Running post-restore command inside container..."
-RESTORE_COMMAND="${RESTORE_COMMAND:-}"
-if [ -n "${RESTORE_COMMAND}" ]; then
-  docker exec "${BACKEND_CONTAINER}" ${RESTORE_COMMAND}
+if [ -n "${RESTORE_COMMAND_JSON:-}" ]; then
+  BACKEND_CONTAINER="$(owned_compose_container backend true)"
+  python3 - "${BACKEND_CONTAINER}" "${COMPOSE_PROJECT_NAME}" "${RESTORE_COMMAND_JSON}" <<'PY'
+import json
+import subprocess
+import sys
+
+container, compose_project, raw = sys.argv[1:4]
+command = json.loads(raw)
+if not isinstance(command, list) or not command or not all(isinstance(arg, str) and arg for arg in command):
+    raise SystemExit("invalid restore command")
+info = json.loads(subprocess.check_output(["docker", "inspect", container], text=True))[0]
+labels = info.get("Config", {}).get("Labels", {}) or {}
+if (labels.get("com.docker.compose.project") != compose_project or
+        labels.get("com.docker.compose.service") != "backend" or
+        not info.get("State", {}).get("Running")):
+    raise SystemExit("backend container ownership changed before restore command")
+subprocess.run(["docker", "exec", container, *command], check=True)
+PY
 else
   echo "No RESTORE_COMMAND configured — skipping."
 fi
@@ -232,10 +327,11 @@ FILE_BACKUP_ID="files-uploads-${BACKUP_ID}"
 LOCAL_FILE_BACKUP="${BACKUP_DIR}/${FILE_BACKUP_ID}.tar.gz"
 if [ -f "${LOCAL_FILE_BACKUP}" ] && [ -s "${LOCAL_FILE_BACKUP}" ]; then
   echo "5b. Restoring uploaded files..."
-  docker exec "${BACKEND_CONTAINER}" sh -c "mkdir -p /app/apps/backend/uploads && cd /app/apps/backend && tar xzf /tmp/file-restore.tar.gz -C uploads/" 2>/dev/null || true
-  # Copy to container first, then extract
-  docker cp "${LOCAL_FILE_BACKUP}" "${BACKEND_CONTAINER}:/tmp/file-restore.tar.gz" 2>/dev/null
-  docker exec "${BACKEND_CONTAINER}" sh -c "mkdir -p /app/apps/backend/uploads && cd /app/apps/backend && tar xzf /tmp/file-restore.tar.gz -C uploads/ && rm /tmp/file-restore.tar.gz" 2>/dev/null
+  BACKEND_CONTAINER="$(owned_compose_container backend true)"
+  docker cp "${LOCAL_FILE_BACKUP}" "${BACKEND_CONTAINER}:/tmp/file-restore.tar.gz"
+  BACKEND_CONTAINER="$(owned_compose_container backend true)"
+  docker exec "${BACKEND_CONTAINER}" sh -c \
+    "mkdir -p /app/apps/backend/uploads && cd /app/apps/backend && tar xzf /tmp/file-restore.tar.gz -C uploads/ && rm /tmp/file-restore.tar.gz"
   echo "Files restored to /app/apps/backend/uploads/"
 fi
 
@@ -243,14 +339,20 @@ echo "6. Starting storefront with current configuration..."
 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${DEPLOY_ENV_FILE}" up -d storefront
 
 echo "7. Verifying health check..."
-HEALTH_PORT="${BACKEND_PORT:-9000}"
-HEALTH_ENDPOINT="http://localhost:${HEALTH_PORT}/health"
+HEALTH_PORT="9000"
 attempt=1
 success=0
 while [ "${attempt}" -le 12 ]; do
   echo "Checking health, attempt ${attempt}/12..."
-  HEALTH_HTTP_STATUS="$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_ENDPOINT}" || true)"
-  if [ "${HEALTH_HTTP_STATUS}" = "200" ]; then
+  if BACKEND_CONTAINER="$(owned_compose_container backend true)" && docker exec "${BACKEND_CONTAINER}" node -e '
+const http = require("http");
+const req = http.get({host:"127.0.0.1", port:Number(process.argv[1]), path:"/health", timeout:2000}, res => {
+  res.resume();
+  res.on("end", () => process.exit(res.statusCode === 200 ? 0 : 1));
+});
+req.on("timeout", () => req.destroy());
+req.on("error", () => process.exit(1));
+' "${HEALTH_PORT}"; then
     success=1
     break
   fi

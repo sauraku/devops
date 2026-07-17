@@ -4,6 +4,10 @@ import * as api from '../lib/api';
 import type { Project } from '../types';
 import { FileText, Check, ChevronDown, ChevronUp, Code, Key } from 'lucide-react';
 import { useToast } from './Toast';
+import {
+  isMissingEnvValue,
+  missingRequiredEnvVariables,
+} from '../lib/env';
 
 interface EnvConfigProps {
   project: Project;
@@ -15,6 +19,7 @@ export function EnvConfig({ project }: EnvConfigProps) {
   const [values, setValues] = useState<Record<string, string>>({});
   const [showBulk, setShowBulk] = useState(false);
   const [bulkText, setBulkText] = useState('');
+  const [ignoredBulkKeys, setIgnoredBulkKeys] = useState<string[]>([]);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['env-template', project.id],
@@ -30,10 +35,8 @@ export function EnvConfig({ project }: EnvConfigProps) {
     }
   }, [savedOverrides]);
 
-  const hasMissing = variables.some((v) => {
-    const val = values[v.key] ?? v.default;
-    return !val || val === '' || val === 'change_me';
-  });
+  const missingRequiredVariables = missingRequiredEnvVariables(variables, values);
+  const hasMissing = missingRequiredVariables.length > 0;
 
   const saveMutation = useMutation({
     mutationFn: () => api.saveEnvConfig(project.id, values),
@@ -80,10 +83,7 @@ export function EnvConfig({ project }: EnvConfigProps) {
 
   if (variables.length === 0 && !isLoading) return emptyState;
 
-  const missingCount = variables.filter((v) => {
-    const val = values[v.key] ?? v.default;
-    return !val || val === '' || val === 'change_me';
-  }).length;
+  const missingCount = missingRequiredVariables.length;
 
   return (
     <div className="max-w-3xl space-y-6">
@@ -110,7 +110,9 @@ export function EnvConfig({ project }: EnvConfigProps) {
         <div className="p-6 space-y-5">
           {variables.map((v) => {
             const currentVal = values[v.key] ?? v.default ?? '';
-            const isMissing = !currentVal || currentVal === '' || currentVal === 'change_me';
+            const isControllerManaged = v.controller_managed;
+            const isMissing = v.operator_required && !isControllerManaged && isMissingEnvValue(currentVal);
+            const isOptional = !v.operator_required && !isControllerManaged && isMissingEnvValue(currentVal);
             return (
               <div key={v.key} className="group relative">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
@@ -121,9 +123,17 @@ export function EnvConfig({ project }: EnvConfigProps) {
                   
                   {/* Monday status cell style badges */}
                   <div className="flex items-center gap-1.5 select-none">
-                    {isMissing ? (
+                    {isControllerManaged && isMissingEnvValue(currentVal) ? (
+                      <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-accent/10 text-accent border border-accent/20">
+                        Managed on deploy
+                      </span>
+                    ) : isMissing ? (
                       <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-bad/10 text-bad border border-bad/20 glow-bad">
                         Missing
+                      </span>
+                    ) : isOptional ? (
+                      <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-surface-3 text-muted border border-line">
+                        Optional
                       </span>
                     ) : (
                       <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-good/10 text-good border border-good/20">
@@ -168,17 +178,42 @@ export function EnvConfig({ project }: EnvConfigProps) {
                   onChange={(e) => {
                     setBulkText(e.target.value);
                     const parsed: Record<string, string> = {};
+                    const ignored = new Set<string>();
+                    const declaredKeys = new Set(variables.map((variable) => variable.key));
+                    const controllerManagedKeys = new Set(
+                      variables.filter((variable) => variable.controller_managed).map((variable) => variable.key),
+                    );
                     for (const line of e.target.value.split('\n')) {
-                      const eq = line.indexOf('=');
-                      if (eq > 0) parsed[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+                      const trimmed = line.trim();
+                      if (!trimmed || trimmed.startsWith('#')) continue;
+                      const eq = trimmed.indexOf('=');
+                      if (eq <= 0) continue;
+                      const key = trimmed.slice(0, eq).trim();
+                      const value = trimmed.slice(eq + 1).trim();
+                      if (!declaredKeys.has(key)) {
+                        if (key) ignored.add(key);
+                        continue;
+                      }
+                      // Do not turn an omitted controller-managed value into a
+                      // blank override. Existing generated values stay sealed.
+                      if (controllerManagedKeys.has(key) && value === '') continue;
+                      parsed[key] = value;
                     }
+                    setIgnoredBulkKeys([...ignored].sort());
                     setValues((prev) => ({ ...prev, ...parsed }));
                   }}
                   placeholder="PORT=8080&#10;DATABASE_URL=postgres://user:pass@host/db&#10;JWT_SECRET=super_secret"
                   className="w-full px-4 py-3 rounded-xl bg-surface-2/85 border border-line text-xs font-mono text-ink focus:outline-none focus:border-accent/40 focus:bg-surface-3 transition-colors"
                   rows={6}
                 />
-                <p className="text-[10px] text-muted">Paste environment configuration directly, one line per variable.</p>
+                <p className="text-[10px] text-muted">
+                  Paste environment configuration directly, one line per variable. Local-only keys are ignored; blank controller-managed values are generated or derived during deployment.
+                </p>
+                {ignoredBulkKeys.length > 0 && (
+                  <p className="text-[10px] text-warn">
+                    Ignored {ignoredBulkKeys.length} key{ignoredBulkKeys.length === 1 ? '' : 's'} not declared by this project's template: {ignoredBulkKeys.join(', ')}
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -206,6 +241,7 @@ export function EnvConfig({ project }: EnvConfigProps) {
           <ol className="text-xs text-ink-soft space-y-1.5 list-decimal list-inside leading-relaxed">
             <li>Variables defined in <code className="text-accent bg-surface-2 px-1 rounded">.env.template</code> serve as a template.</li>
             <li>Secrets are encrypted on the server-side and masked in UI displays.</li>
+            <li>Controller-managed credentials are sealed automatically on the first deployment.</li>
             <li>Saved configurations are merged and injected as container environments during runs.</li>
           </ol>
         </div>

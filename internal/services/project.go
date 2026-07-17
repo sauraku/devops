@@ -4,14 +4,20 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,21 +26,28 @@ import (
 	"github.com/sauraku/devops-control/internal/models"
 )
 
-var serviceNameRE = regexp.MustCompile(`^[a-z0-9_.-]+$`)
+var (
+	serviceNameRE     = regexp.MustCompile(`^[a-z0-9_.-]+$`)
+	legacyGitHubPATRE = regexp.MustCompile(`^[A-Fa-f0-9]{40}$`)
+)
 
 type ProjectService struct {
-	db     *db.DB
-	docker *docker.Client
-	audit  *AuditService
-	cfg    *models.Config
+	db               *db.DB
+	docker           *docker.Client
+	audit            *AuditService
+	cfg              *models.Config
+	githubAPIBaseURL string
+	githubHTTPClient *http.Client
 }
 
 func NewProjectService(database *db.DB, dockerClient *docker.Client, audit *AuditService, cfg *models.Config) *ProjectService {
 	return &ProjectService{
-		db:     database,
-		docker: dockerClient,
-		audit:  audit,
-		cfg:    cfg,
+		db:               database,
+		docker:           dockerClient,
+		audit:            audit,
+		cfg:              cfg,
+		githubAPIBaseURL: "https://api.github.com",
+		githubHTTPClient: &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
@@ -78,25 +91,28 @@ func isAlphanumericStart(s string) bool {
 }
 
 func (s *ProjectService) CreateOrUpdate(req *models.ProjectRequest) (*models.Project, error) {
-	if req.ID == nil || *req.ID == "" {
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
 		return nil, fmt.Errorf("project id is required")
 	}
-	projectID := s.SlugID(*req.ID)
+	projectID := s.SlugID(strings.TrimSpace(*req.ID))
 	if projectID == "" {
 		return nil, fmt.Errorf("project id must contain at least one letter or number")
 	}
 
-	existing, _ := s.db.GetProject(projectID)
+	existing, existingErr := s.db.GetProject(projectID)
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return nil, fmt.Errorf("load project: %w", existingErr)
+	}
 	p := &models.Project{
-		ID:               projectID,
-		Name:             projectID,
-		RepoURL:          "",
-		BranchName:       envDefault("ENV_NAME", "dev"),
-		DeploymentMode:   models.DeploymentModeComposeImage,
-		AutoApply:        true,
-		RegistryHost:     "ghcr.io",
-		RunnerContainer:  fmt.Sprintf("devops-runner-%s", projectID),
-		RunnerStatus:     "unknown",
+		ID:              projectID,
+		Name:            projectID,
+		RepoURL:         "",
+		BranchName:      envDefault("ENV_NAME", "dev"),
+		DeploymentMode:  models.DeploymentModeComposeImage,
+		AutoApply:       true,
+		RegistryHost:    "ghcr.io",
+		RunnerContainer: fmt.Sprintf("devops-runner-%s", projectID),
+		RunnerStatus:    "unknown",
 	}
 	if existing != nil {
 		p = existing
@@ -104,12 +120,18 @@ func (s *ProjectService) CreateOrUpdate(req *models.ProjectRequest) (*models.Pro
 
 	if req.Name != nil {
 		p.Name = strings.TrimSpace(*req.Name)
+		if p.Name == "" {
+			return nil, fmt.Errorf("project name cannot be empty")
+		}
 	}
 	if req.RepoURL != nil {
 		p.RepoURL = strings.TrimSpace(*req.RepoURL)
 	}
 	if req.BranchName != nil {
 		p.BranchName = normalizeRef(strings.TrimSpace(*req.BranchName))
+		if p.BranchName == "" {
+			return nil, fmt.Errorf("branch name cannot be empty")
+		}
 	}
 	if req.DeploymentMode != nil {
 		mode := models.DeploymentMode(strings.TrimSpace(*req.DeploymentMode))
@@ -133,68 +155,127 @@ func (s *ProjectService) CreateOrUpdate(req *models.ProjectRequest) (*models.Pro
 	if p.AppDir == "" {
 		p.AppDir = filepath.Join(s.cfg.BaseDir, "Projects", p.ID)
 	}
-	// Resolve and clean the path to prevent traversal via ../..
-	p.AppDir = filepath.Clean(p.AppDir)
-	projectsRoot := filepath.Clean(filepath.Join(s.cfg.BaseDir, "Projects")) + string(filepath.Separator)
-	if !strings.HasPrefix(p.AppDir+string(filepath.Separator), projectsRoot) {
-		return nil, fmt.Errorf("app_dir must be within %s", filepath.Join(s.cfg.BaseDir, "Projects"))
+	// Resolve and clean the path to prevent traversal via ../.. or symlinks.
+	validatedAppDir, err := validateProjectAppDir(s.cfg.BaseDir, p.AppDir)
+	if err != nil {
+		return nil, err
 	}
-
-	// Auto-copy .env.template from common source locations
-	s.ensureEnvTemplate(p)
+	p.AppDir = validatedAppDir
 
 	if err := s.validateRepoURL(p.RepoURL); err != nil {
 		return nil, err
 	}
-	if err := s.db.UpsertProject(p); err != nil {
-		return nil, fmt.Errorf("save project: %w", err)
+	if !regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?$`).MatchString(p.RegistryHost) {
+		return nil, fmt.Errorf("registry host must be a hostname with no scheme or path")
 	}
 
+	var registryPassword *string
 	if req.RegistryPassword != nil && *req.RegistryPassword != "" {
 		if p.RegistryUsername == "" {
 			return nil, fmt.Errorf("registry username is required when providing a password")
 		}
-		_ = s.db.SaveRegistryPassword(p.ID, *req.RegistryPassword)
-		// Best-effort registry login — failure is non-fatal, can be retried from Settings
-		ok, msg := s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, *req.RegistryPassword)
+		if err := validateSingleLineSecret(*req.RegistryPassword); err != nil {
+			return nil, fmt.Errorf("invalid registry password: %w", err)
+		}
+		password := *req.RegistryPassword
+		registryPassword = &password
+	}
+
+	var runnerTokenToSave *string
+	runnerToken := ""
+	if req.RunnerToken != nil && strings.TrimSpace(*req.RunnerToken) != "" {
+		runnerToken = strings.TrimSpace(*req.RunnerToken)
+		if err := validateSingleLineSecret(runnerToken); err != nil {
+			return nil, fmt.Errorf("invalid runner token: %w", err)
+		}
+		runnerTokenToSave = &runnerToken
+	} else if existing != nil {
+		var err error
+		runnerToken, err = s.db.GetRunnerToken(projectID)
+		if err != nil {
+			return nil, fmt.Errorf("load runner token: %w", err)
+		}
+	}
+	if runnerToken == "" && s.cfg.GithubToken != "" {
+		runnerToken = s.cfg.GithubToken
+	}
+	if req.ListenerActive != nil && *req.ListenerActive && runnerToken == "" {
+		return nil, fmt.Errorf("no runner token configured; configure a token before enabling the listener")
+	}
+	if registryPassword != nil {
+		ok, msg := s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, *registryPassword)
 		if !ok {
-			s.audit.Log("registry_login_warn", "warning", p.ID,
-				fmt.Sprintf("registry login failed, password saved: %s", msg), "")
+			return nil, fmt.Errorf("registry login failed: %s", msg)
 		}
 	}
 
-	runnerToken := ""
-	// Prioritize explicitly provided project-specific runner token, fall back to global GITHUB_TOKEN (PAT)
-	if req.RunnerToken != nil && strings.TrimSpace(*req.RunnerToken) != "" {
-		runnerToken = strings.TrimSpace(*req.RunnerToken)
-	} else if s.cfg.GithubToken != "" {
-		runnerToken = s.cfg.GithubToken
+	if err := s.db.SaveProjectWithCredentials(p, registryPassword, runnerTokenToSave); err != nil {
+		return nil, fmt.Errorf("save project: %w", err)
 	}
-	listenerActive := false
+	s.ensureEnvTemplate(p)
+
 	if req.ListenerActive != nil {
-		listenerActive = *req.ListenerActive
-	}
-
-	if runnerToken != "" && listenerActive {
-		p.RunnerStatus = "starting"
-		safeGo("startRunner", func() {
-			if err := s.startRunner(p, runnerToken); err != nil {
-				s.audit.Log("runner_start", "error", p.ID, err.Error(), "")
-				_ = s.db.SaveRunnerStatus(p.ID, "error")
-			} else {
-				_ = s.db.SaveRunnerStatus(p.ID, "active")
+		if *req.ListenerActive {
+			p.RunnerStatus = "starting"
+			_ = s.db.SaveRunnerStatus(p.ID, p.RunnerStatus)
+			safeGo("startRunner", func() {
+				if err := s.startRunner(p, runnerToken); err != nil {
+					s.audit.Log("runner_start", "error", p.ID, err.Error(), "")
+					_ = s.db.SaveRunnerStatus(p.ID, "error")
+				} else {
+					_ = s.db.SaveRunnerStatus(p.ID, "active")
+				}
+			})
+		} else {
+			if err := s.stopRunner(p); err != nil {
+				return nil, err
 			}
-		})
-	} else if !listenerActive {
-		s.stopRunner(p)
-		p.RunnerStatus = "stopped"
-	}
-
-	if err := s.db.UpsertProject(p); err != nil {
-		return nil, fmt.Errorf("update project: %w", err)
+			p.RunnerStatus = "stopped"
+			_ = s.db.SaveRunnerStatus(p.ID, p.RunnerStatus)
+		}
 	}
 	s.audit.Log("project_upsert", "ok", p.ID, fmt.Sprintf("repo=%s branch=%s", p.RepoURL, p.BranchName), "")
 	return p, nil
+}
+
+func validateSingleLineSecret(value string) error {
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return fmt.Errorf("value must be a single line")
+	}
+	return nil
+}
+
+func resolveExistingProjectPath(path string) string {
+	clean := filepath.Clean(path)
+	ancestor := clean
+	for {
+		if resolved, err := filepath.EvalSymlinks(ancestor); err == nil {
+			if relative, err := filepath.Rel(ancestor, clean); err == nil {
+				return filepath.Clean(filepath.Join(resolved, relative))
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return clean
+		}
+		ancestor = parent
+	}
+}
+
+func validateProjectAppDir(baseDir, appDir string) (string, error) {
+	clean := filepath.Clean(appDir)
+	projectsDir := filepath.Join(baseDir, "Projects")
+	projectsRoot := filepath.Clean(projectsDir) + string(filepath.Separator)
+	if clean == filepath.Clean(projectsDir) || !strings.HasPrefix(clean+string(filepath.Separator), projectsRoot) {
+		return "", fmt.Errorf("app_dir must be within %s", projectsDir)
+	}
+	resolved := resolveExistingProjectPath(clean)
+	resolvedRoot := resolveExistingProjectPath(projectsDir)
+	if !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+		return "", fmt.Errorf("app_dir resolves outside %s", projectsDir)
+	}
+	return clean, nil
 }
 
 func (s *ProjectService) Delete(projectID string) error {
@@ -202,10 +283,39 @@ func (s *ProjectService) Delete(projectID string) error {
 	if err != nil {
 		return fmt.Errorf("project not found: %s", projectID)
 	}
-	s.stopRunner(p)
+	deleteID := fmt.Sprintf("delete-%s-%d", projectID, time.Now().UnixMilli())
+	lock := &models.DeployLock{
+		ProjectID: projectID, OperationID: deleteID, Operation: "delete",
+		StartedAt: time.Now().UTC().Format(time.RFC3339), Branch: p.BranchName,
+	}
+	if err := s.db.CreateLock(lock); err != nil {
+		return fmt.Errorf("cannot delete project while another operation is active: %w", err)
+	}
+	defer s.db.ReleaseLock(projectID)
 
-	projectDir := filepath.Join(s.cfg.BaseDir, "Projects", projectID)
+	projectDir := p.AppDir
+	if projectDir == "" {
+		projectDir = filepath.Join(s.cfg.BaseDir, "Projects", projectID)
+	}
+	projectDir, err = validateProjectAppDir(s.cfg.BaseDir, projectDir)
+	if err != nil {
+		return fmt.Errorf("refusing to delete project with unsafe app_dir: %w", err)
+	}
 	composeFile := filepath.Join(projectDir, "docker-compose.yml")
+	registeredBranch := branchSlug(p.BranchName)
+	composeProjects := map[string]string{
+		fmt.Sprintf("%s-%s", p.ID, registeredBranch): filepath.Join(projectDir, ".env."+registeredBranch),
+	}
+	historicalProjects, err := s.docker.ListComposeProjects(p.ID+"-", projectDir)
+	if err != nil {
+		return fmt.Errorf("discover owned Compose projects: %w", err)
+	}
+	for _, composeProject := range historicalProjects {
+		suffix := strings.TrimPrefix(composeProject, p.ID+"-")
+		if suffix != "" {
+			composeProjects[composeProject] = filepath.Join(projectDir, ".env."+suffix)
+		}
+	}
 	if _, err := os.Stat(composeFile); err == nil {
 		envFiles, _ := filepath.Glob(filepath.Join(projectDir, ".env.*"))
 		for _, ef := range envFiles {
@@ -214,29 +324,60 @@ func (s *ProjectService) Delete(projectID string) error {
 			}
 			suffix := strings.TrimPrefix(filepath.Base(ef), ".env.")
 			if suffix != "" {
-				composeProject := fmt.Sprintf("%s-%s", p.ID, suffix)
-				_ = s.docker.ComposeDown(composeFile, composeProject, nil)
+				composeProjects[fmt.Sprintf("%s-%s", p.ID, branchSlug(suffix))] = ef
 			}
 		}
 	}
-
-	// Force-remove any remaining app containers for this project
-	containers, _ := s.docker.ListContainers(fmt.Sprintf("name=%s-", p.ID))
-	for _, c := range containers {
-		s.docker.RemoveContainer(c)
+	if err := s.stopRunner(p); err != nil {
+		return err
+	}
+	for composeProject, envFile := range composeProjects {
+		if _, err := os.Stat(composeFile); err == nil {
+			if _, envErr := os.Stat(envFile); envErr != nil {
+				containers, listErr := s.docker.ListComposeContainers(composeProject)
+				if listErr != nil {
+					return fmt.Errorf("inspect Compose project %s: %w", composeProject, listErr)
+				}
+				if len(containers) > 0 {
+					return fmt.Errorf("refusing to stop Compose project %s without its environment file %s", composeProject, envFile)
+				}
+				continue
+			}
+			if err := s.docker.ComposeDownWithEnvFile(composeFile, composeProject, envFile, nil); err != nil {
+				return fmt.Errorf("stop Compose project %s: %w", composeProject, err)
+			}
+		}
+		remaining, err := s.docker.ListComposeContainers(composeProject)
+		if err != nil {
+			return fmt.Errorf("verify Compose project %s removal: %w", composeProject, err)
+		}
+		if len(remaining) > 0 {
+			return fmt.Errorf("refusing to delete project data while owned containers remain for %s: %s", composeProject, strings.Join(remaining, ", "))
+		}
 	}
 
-	s.audit.Log("project_delete", "ok", projectID, "Project deleted and cleaned up.", "")
-
 	// Clean up data dirs
-	os.RemoveAll(filepath.Join(s.cfg.BaseDir, "State", projectID))
-	os.RemoveAll(filepath.Join(s.cfg.BaseDir, "Releases", projectID))
-	os.RemoveAll(filepath.Join(s.cfg.BaseDir, "Logs", projectID))
-	os.RemoveAll(filepath.Join(s.cfg.BaseDir, "Projects", projectID))
+	for _, path := range []string{
+		filepath.Join(s.cfg.BaseDir, "State", projectID),
+		filepath.Join(s.cfg.BaseDir, "Releases", projectID),
+		filepath.Join(s.cfg.BaseDir, "Logs", projectID),
+		projectDir,
+	} {
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove project data %s: %w", path, err)
+		}
+	}
 	// Clean up legacy project dir at project root level
-	os.RemoveAll(filepath.Join(s.cfg.ProjectRoot, "Projects", projectID))
+	legacyDir := filepath.Join(s.cfg.ProjectRoot, "Projects", projectID)
+	if err := os.RemoveAll(legacyDir); err != nil {
+		return fmt.Errorf("remove legacy project data %s: %w", legacyDir, err)
+	}
 
-	return s.db.DeleteProject(projectID)
+	if err := s.db.DeleteProject(projectID); err != nil {
+		return err
+	}
+	s.audit.Log("project_delete", "ok", projectID, "Project deleted and cleaned up.", "")
+	return nil
 }
 
 func (s *ProjectService) Status(projectID string) (*models.ProjectStatus, error) {
@@ -248,6 +389,12 @@ func (s *ProjectService) Status(projectID string) (*models.ProjectStatus, error)
 	lock, _ := s.db.GetLock(projectID)
 
 	runnerSummary := s.docker.ContainerSummary(p.RunnerContainer)
+	if runnerSummary.Exists {
+		projectName := fmt.Sprintf("devops-runner-%s", p.ID)
+		if err := s.docker.VerifyComposeOwnership(p.RunnerContainer, projectName, "github-runner"); err != nil {
+			runnerSummary = &models.ContainerState{Container: p.RunnerContainer, State: "unavailable"}
+		}
+	}
 
 	// Sync runner_status with actual Docker state
 	if runnerSummary.Running {
@@ -266,27 +413,33 @@ func (s *ProjectService) Status(projectID string) (*models.ProjectStatus, error)
 	health := make(map[string]*models.ServiceHealth)
 
 	for _, svc := range services {
-		containerName := s.FindContainerName(p.ID, svc, p.BranchName)
-		summary := s.docker.ContainerSummary(containerName)
+		containerName, ownershipErr := s.OwnedContainerName(p, svc)
+		var summary *models.ContainerState
+		if ownershipErr != nil {
+			containerName = DeploymentContainerName(svc, p.BranchName, p.ID)
+			summary = &models.ContainerState{Container: containerName, State: "unavailable"}
+		} else {
+			summary = s.docker.ContainerSummary(containerName)
+		}
 		containers["current"][svc] = summary.State
-		health[svc] = s.CheckServiceHealth(svc, containerName, summary)
+		health[svc] = s.CheckServiceHealth(p, svc, containerName, summary)
 	}
 
 	deployments, _ := s.db.ListDeployments(projectID, 10)
 	backups, _ := s.db.ListBackups(projectID, 10)
 
 	return &models.ProjectStatus{
-		Project:     p,
-		State:       state,
-		Lock:        lock,
-		Runner:      map[string]string{"container": p.RunnerContainer, "state": runnerSummary.State},
-		Containers:  containers,
-		Health:      health,
-		Deployments: deployments,
-		Backups:     backups,
+		Project:      p,
+		State:        state,
+		Lock:         lock,
+		Runner:       map[string]string{"container": p.RunnerContainer, "state": runnerSummary.State},
+		Containers:   containers,
+		Health:       health,
+		Deployments:  deployments,
+		Backups:      backups,
 		Capabilities: s.capabilities(p),
-		LogDir:      s.LogDir(p),
-		ServerTime:  time.Now().UTC().Format(time.RFC3339),
+		LogDir:       s.LogDir(p),
+		ServerTime:   time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
 
@@ -302,20 +455,26 @@ func (s *ProjectService) capabilities(p *models.Project) map[string]bool {
 		"resume":          isLocal,
 		"backup_create":   true,
 		"restore_dry_run": true,
+		"terminal":        s.cfg.EnableTerminal,
 	}
 }
 
-func (s *ProjectService) validateRepoURL(url string) error {
-	if url == "" {
+func (s *ProjectService) validateRepoURL(rawURL string) error {
+	if rawURL == "" {
 		return nil
 	}
-	if !strings.HasPrefix(url, "https://github.com/") {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() != "github.com" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("only GitHub HTTPS URLs are supported")
+	}
+	parts := strings.Split(strings.Trim(strings.TrimSuffix(parsed.Path, ".git"), "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("repository URL must identify one GitHub owner and repository")
 	}
 	if len(s.cfg.AllowedRepoPrefixes) > 0 {
 		allowed := false
 		for _, prefix := range s.cfg.AllowedRepoPrefixes {
-			if strings.HasPrefix(url, prefix) {
+			if strings.HasPrefix(rawURL, prefix) && (strings.HasSuffix(prefix, "/") || len(rawURL) == len(prefix) || rawURL[len(prefix)] == '/') {
 				allowed = true
 				break
 			}
@@ -327,36 +486,190 @@ func (s *ProjectService) validateRepoURL(url string) error {
 	return nil
 }
 
-func (s *ProjectService) startRunner(p *models.Project, runnerToken string) error {
-	sshDir := os.Getenv("SSH_DIR")
-	if sshDir == "" {
-		homeDir, _ := os.UserHomeDir()
-		sshDir = filepath.Join(homeDir, ".ssh")
+const (
+	runnerRegistrationRequestMarker = "DEVOPS_RUNNER_REGISTRATION_REQUIRED"
+	runnerRegistrationTokenPath     = "/run/devops-runner-registration/token"
+	runnerRegistrationStagingPath   = "/run/devops-runner-registration/.token.tmp"
+)
+
+func isGitHubPersonalAccessToken(token string) bool {
+	return strings.HasPrefix(token, "ghp_") ||
+		strings.HasPrefix(token, "github_pat_") ||
+		legacyGitHubPATRE.MatchString(token)
+}
+
+// runnerRegistrationToken exchanges a long-lived GitHub PAT in the controller.
+// Registration tokens supplied directly by an operator remain supported.
+func (s *ProjectService) runnerRegistrationToken(ctx context.Context, repoURL, credential string) (string, error) {
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return "", fmt.Errorf("runner credential is empty")
 	}
+	if err := validateSingleLineSecret(credential); err != nil {
+		return "", fmt.Errorf("invalid runner credential: %w", err)
+	}
+	if !isGitHubPersonalAccessToken(credential) {
+		return credential, nil
+	}
+
+	if err := s.validateRepoURL(repoURL); err != nil {
+		return "", fmt.Errorf("cannot request runner registration token: %w", err)
+	}
+	repository := repoOwnerRepo(repoURL)
+	owner, repo, ok := strings.Cut(repository, "/")
+	if !ok || owner == "" || repo == "" {
+		return "", fmt.Errorf("cannot request runner registration token: repository URL is invalid")
+	}
+	baseURL := strings.TrimRight(s.githubAPIBaseURL, "/")
+	if baseURL == "" {
+		baseURL = "https://api.github.com"
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/actions/runners/registration-token",
+		baseURL, url.PathEscape(owner), url.PathEscape(repo))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("create GitHub runner registration request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+credential)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	client := s.githubHTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request GitHub runner registration token: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		return "", fmt.Errorf("request GitHub runner registration token: GitHub returned %s", resp.Status)
+	}
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode GitHub runner registration token response: %w", err)
+	}
+	result.Token = strings.TrimSpace(result.Token)
+	if result.Token == "" {
+		return "", fmt.Errorf("GitHub runner registration token response did not contain a token")
+	}
+	if err := validateSingleLineSecret(result.Token); err != nil {
+		return "", fmt.Errorf("GitHub returned an invalid runner registration token")
+	}
+	if isGitHubPersonalAccessToken(result.Token) {
+		return "", fmt.Errorf("GitHub returned an unexpected long-lived credential")
+	}
+	return result.Token, nil
+}
+
+// waitForRunnerRegistrationRequest distinguishes an unconfigured runner from
+// one whose persisted registration is already usable. No credential enters the
+// container until the unconfigured entrypoint emits the request marker.
+func (s *ProjectService) waitForRunnerRegistrationRequest(containerName string, timeout time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		logs := s.docker.ContainerLogs(containerName, 50)
+		if strings.Contains(logs, runnerRegistrationRequestMarker) {
+			return true, nil
+		}
+		if strings.Contains(logs, "Runner already configured.") || strings.Contains(strings.ToLower(logs), "listening for jobs") {
+			return false, nil
+		}
+		state := s.docker.ContainerSummary(containerName)
+		if !state.Exists {
+			return false, fmt.Errorf("runner container disappeared before registration")
+		}
+		if state.State != "running" && state.State != "created" && state.State != "restarting" {
+			return false, fmt.Errorf("runner stopped before requesting registration (state=%s)", state.State)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false, fmt.Errorf("runner did not request a registration credential")
+}
+
+// copyRunnerRegistrationToken writes the short-lived token beneath the
+// controller's protected runtime directory, copies it into the runner's tmpfs,
+// and removes the host copy immediately. The token is never a command argument
+// or environment variable.
+func (s *ProjectService) copyRunnerRegistrationToken(ctx context.Context, containerName, token string) error {
+	secretDir, err := os.MkdirTemp(s.cfg.RunDir, ".runner-registration-")
+	if err != nil {
+		return fmt.Errorf("create runner registration secret directory: %w", err)
+	}
+	defer os.RemoveAll(secretDir)
+	if err := os.Chmod(secretDir, 0o700); err != nil {
+		return fmt.Errorf("secure runner registration secret directory: %w", err)
+	}
+	secretPath := filepath.Join(secretDir, "token")
+	if err := os.WriteFile(secretPath, []byte(token), 0o600); err != nil {
+		return fmt.Errorf("write runner registration secret: %w", err)
+	}
+	// docker cp retains the file mode and creates the file as root. The runner
+	// needs only read access; the runner-owned tmpfs directory permits removal.
+	if err := os.Chmod(secretPath, 0o604); err != nil {
+		return fmt.Errorf("prepare runner registration secret permissions: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "docker", "cp", secretPath, containerName+":"+runnerRegistrationStagingPath)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("copy runner registration secret: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	// Publish atomically so the entrypoint cannot observe a partially copied
+	// credential. The runner owns the tmpfs directory and can rename the file.
+	publish := exec.CommandContext(ctx, "docker", "exec", containerName, "mv", "--", runnerRegistrationStagingPath, runnerRegistrationTokenPath)
+	publish.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	if output, err := publish.CombinedOutput(); err != nil {
+		return fmt.Errorf("publish runner registration secret: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (s *ProjectService) startRunner(p *models.Project, runnerToken string) error {
+	registrationToken, err := s.runnerRegistrationToken(context.Background(), p.RepoURL, runnerToken)
+	if err != nil {
+		return err
+	}
+
 	// Generate scoped runner token to avoid leaking the master deploy token
 	mac := hmac.New(sha256.New, []byte(s.cfg.Token))
 	mac.Write([]byte("runner:" + p.ID))
 	scopedToken := hex.EncodeToString(mac.Sum(nil))
 	env := map[string]string{
 		"REPO_URL":              p.RepoURL,
-		"RUNNER_TOKEN":          runnerToken,
 		"RUNNER_NAME":           fmt.Sprintf("runner-%s-%s", p.ID, branchSlug(p.BranchName)),
 		"RUNNER_CONTAINER_NAME": p.RunnerContainer,
 		"RUNNER_STATE_VOLUME":   fmt.Sprintf("%s-state", p.RunnerContainer),
 		"RUNNER_LABELS":         runnerLabels(p),
-		"DEPLOY_BRANCH":         p.BranchName,
-		"DEPLOY_BRANCH_SLUG":    branchSlug(p.BranchName),
-		"REPO_HOST_DIR":         s.cfg.BaseDir,
-		"BASE_DIR":              s.cfg.BaseDir,
-		"PROJECT_ROOT":          s.cfg.ProjectRoot,
-		"SSH_DIR":               sshDir,
 		"DEPLOY_CONTROL_TOKEN":  scopedToken,
+		"DEPLOY_CONTROL_URL":    s.cfg.RunnerControlURL,
+		"RUNNER_NETWORK":        s.cfg.RunnerNetwork,
+		"RUNNER_IMAGE":          s.cfg.RunnerImage,
 	}
 
-	s.docker.RemoveContainer(p.RunnerContainer)
+	if err := s.stopRunner(p); err != nil {
+		return err
+	}
 	composeFile := filepath.Join(s.cfg.ProjectRoot, "deploy", "runner", "docker-compose.runner.yml")
 	if err := s.docker.ComposeUp(composeFile, fmt.Sprintf("devops-runner-%s", p.ID), env, "github-runner"); err != nil {
 		return err
+	}
+	needsRegistration, err := s.waitForRunnerRegistrationRequest(p.RunnerContainer, 90*time.Second)
+	if err != nil {
+		s.docker.RemoveContainer(p.RunnerContainer)
+		return err
+	}
+	if needsRegistration {
+		copyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = s.copyRunnerRegistrationToken(copyCtx, p.RunnerContainer, registrationToken)
+		cancel()
+		if err != nil {
+			s.docker.RemoveContainer(p.RunnerContainer)
+			return err
+		}
 	}
 
 	ready, state, logs := s.docker.WaitForRunnerReady(p.RunnerContainer, 90*time.Second)
@@ -367,13 +680,26 @@ func (s *ProjectService) startRunner(p *models.Project, runnerToken string) erro
 	return nil
 }
 
-func (s *ProjectService) stopRunner(p *models.Project) {
-	s.docker.RemoveContainer(p.RunnerContainer)
-	_ = s.docker.ComposeDown(
+func (s *ProjectService) stopRunner(p *models.Project) error {
+	projectName := fmt.Sprintf("devops-runner-%s", p.ID)
+	if summary := s.docker.ContainerSummary(p.RunnerContainer); !summary.Exists {
+		return nil
+	} else if err := s.docker.VerifyComposeOwnership(p.RunnerContainer, projectName, "github-runner"); err != nil {
+		return fmt.Errorf("refusing to remove unowned runner container: %w", err)
+	}
+	if err := s.docker.ComposeDown(
 		filepath.Join(s.cfg.ProjectRoot, "deploy", "runner", "docker-compose.runner.yml"),
-		fmt.Sprintf("devops-runner-%s", p.ID),
-		nil,
-	)
+		projectName,
+		map[string]string{
+			"RUNNER_IMAGE":          s.cfg.RunnerImage,
+			"DEPLOY_CONTROL_URL":    s.cfg.RunnerControlURL,
+			"RUNNER_NETWORK":        s.cfg.RunnerNetwork,
+			"RUNNER_CONTAINER_NAME": p.RunnerContainer,
+		},
+	); err != nil {
+		return fmt.Errorf("stop runner: %w", err)
+	}
+	return nil
 }
 
 // StopAllRunners stops all runner containers (called on server shutdown).
@@ -385,7 +711,9 @@ func (s *ProjectService) StopAllRunners() {
 	}
 	for _, p := range projects {
 		if p.RunnerContainer != "" {
-			s.docker.RemoveContainer(p.RunnerContainer)
+			if err := s.stopRunner(p); err != nil {
+				log.Printf("StopAllRunners: %v", err)
+			}
 		}
 	}
 }
@@ -405,7 +733,10 @@ func (s *ProjectService) ReconcileContainers() {
 	for _, p := range projects {
 		services := s.composeServices(p)
 		for _, svc := range services {
-			containerName := s.FindContainerName(p.ID, svc, p.BranchName)
+			containerName, err := s.OwnedContainerName(p, svc)
+			if err != nil {
+				continue
+			}
 			summary := s.docker.ContainerSummary(containerName)
 			if !summary.Exists {
 				log.Printf("Reconcile: container %s does not exist (project %s, service %s) — skipping", containerName, p.ID, svc)
@@ -432,13 +763,13 @@ func (s *ProjectService) SeedGithubToken(projectID, token string) {
 		return
 	}
 
-	existing, _ := s.db.GetRegistryPassword(projectID)
+	existing, _ := s.db.GetRunnerToken(projectID)
 	if existing != "" {
 		log.Printf("SeedGithubToken: project %s already has a stored token, skipping", projectID)
 		return
 	}
 
-	if err := s.db.SaveRegistryPassword(projectID, token); err != nil {
+	if err := s.db.SaveRunnerToken(projectID, token); err != nil {
 		log.Printf("SeedGithubToken: failed to save token for %s: %v", projectID, err)
 		return
 	}
@@ -466,9 +797,11 @@ func (s *ProjectService) GetRegistryPassword(projectID string) (string, error) {
 
 // EnvVar describes a single variable from .env.template
 type EnvVar struct {
-	Key      string `json:"key"`
-	Default  string `json:"default"`
-	IsSecret bool   `json:"is_secret"`
+	Key               string `json:"key"`
+	Default           string `json:"default"`
+	IsSecret          bool   `json:"is_secret"`
+	OperatorRequired  bool   `json:"operator_required"`
+	ControllerManaged bool   `json:"controller_managed"`
 }
 
 // ensureEnvTemplate attempts to place .env.template in the project directory.
@@ -482,8 +815,11 @@ func (s *ProjectService) ensureEnvTemplate(p *models.Project) {
 	}
 
 	// Try extracting from config image (works in both dev and production)
-	configImage := fmt.Sprintf("%s/%s-deploy-config:%s",
-		p.RegistryHost, repoOwnerRepo(p.RepoURL), p.BranchName)
+	repository := repoOwnerRepo(p.RepoURL)
+	if repository == "" {
+		return
+	}
+	configImage := fmt.Sprintf("%s/%s-deploy-config:%s", p.RegistryHost, repository, p.BranchName)
 	if out, err := s.extractFromConfigImage(configImage, p.AppDir); err == nil {
 		log.Printf("ensureEnvTemplate: extracted template from %s", configImage)
 		return
@@ -491,11 +827,17 @@ func (s *ProjectService) ensureEnvTemplate(p *models.Project) {
 		log.Printf("ensureEnvTemplate: config image %s: %v (output: %s)", configImage, err, out)
 	}
 
-	// Fallback: local checkout (dev only)
-	home, _ := os.UserHomeDir()
-	src := filepath.Join(home, "Documents", p.ID, ".env.template")
-	if data, err := os.ReadFile(src); err == nil {
-		os.WriteFile(templatePath, data, 0o644)
+	// Fallback: a sibling checkout is supported for local development.
+	sibling := filepath.Join(filepath.Dir(s.cfg.ProjectRoot), p.ID)
+	localFiles := map[string]string{
+		filepath.Join(sibling, ".env.template"):           templatePath,
+		filepath.Join(sibling, "docker-compose.prod.yml"): filepath.Join(p.AppDir, "docker-compose.yml"),
+		filepath.Join(sibling, "devops.json"):             filepath.Join(p.AppDir, "devops.json"),
+	}
+	for source, destination := range localFiles {
+		if data, err := os.ReadFile(source); err == nil {
+			_ = os.WriteFile(destination, data, 0o600)
+		}
 	}
 }
 
@@ -523,12 +865,23 @@ func (s *ProjectService) extractFromConfigImage(image, destDir string) (string, 
 		filepath.Join(destDir, ".env.template"))
 	cpOut, cpErr := cpCmd.CombinedOutput()
 
-	// Also extract compose file if missing
+	// Also extract the remaining project contract files. The configuration image
+	// is the source of truth for a registry-backed project; without devops.json
+	// the portal cannot apply its declared environment metadata.
 	composePath := filepath.Join(destDir, "docker-compose.yml")
 	if _, err := os.Stat(composePath); os.IsNotExist(err) {
-		exec.CommandContext(ctx, "docker", "cp",
+		composeOut, composeErr := exec.CommandContext(ctx, "docker", "cp",
 			fmt.Sprintf("%s:/app/docker-compose.yml", containerID),
-			composePath).Run()
+			composePath).CombinedOutput()
+		if composeErr != nil {
+			return string(composeOut), composeErr
+		}
+	}
+	devopsOut, devopsErr := exec.CommandContext(ctx, "docker", "cp",
+		fmt.Sprintf("%s:/app/devops.json", containerID),
+		filepath.Join(destDir, "devops.json")).CombinedOutput()
+	if devopsErr != nil {
+		return string(devopsOut), devopsErr
 	}
 
 	return string(cpOut), cpErr
@@ -561,6 +914,7 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 		}
 	}
 
+	contract := projectEnvironmentContract(s.loadDevopsConfig(filepath.Join(p.AppDir, "devops.json")))
 	secretKeys := map[string]bool{"password": true, "secret": true, "token": true, "key": true, "pass": true}
 	var vars []EnvVar
 	for _, line := range strings.Split(string(data), "\n") {
@@ -573,6 +927,9 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
+		if !envKeyRE.MatchString(key) {
+			continue
+		}
 		def := ""
 		if len(parts) == 2 {
 			def = strings.TrimSpace(parts[1])
@@ -585,17 +942,32 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 				break
 			}
 		}
+		if contract.nonSecret[key] {
+			isSecret = false
+		}
 		if isSecret && def != "" {
 			def = "********"
 		}
-		vars = append(vars, EnvVar{Key: key, Default: def, IsSecret: isSecret})
+		operatorRequired := true // legacy projects retain strict blank-template gating
+		if contract.present {
+			operatorRequired = contract.operatorRequired[key] && !contract.controllerManaged[key]
+		}
+		vars = append(vars, EnvVar{
+			Key:               key,
+			Default:           def,
+			IsSecret:          isSecret,
+			OperatorRequired:  operatorRequired,
+			ControllerManaged: contract.controllerManaged[key],
+		})
 	}
 
-	// Load saved overrides from metadata JSON field
-	overrides := s.loadEnvOverridesFromState(projectID)
+	overrides := s.loadEnvOverrides(projectID)
 	// Mask secret override values
 	for k, v := range overrides {
 		if v == "" {
+			continue
+		}
+		if contract.nonSecret[k] {
 			continue
 		}
 		lower := strings.ToLower(k)
@@ -609,66 +981,66 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 	return vars, overrides, nil
 }
 
-// SaveEnvConfig saves env var overrides into project state metadata field
+var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// SaveEnvConfig validates against the project's declared template and stores
+// the complete override map encrypted at rest.
 func (s *ProjectService) SaveEnvConfig(projectID string, overrides map[string]string) error {
-	state, _ := s.db.GetProjectState(projectID)
-	if state == nil {
-		state = map[string]any{}
+	p, err := s.db.GetProject(projectID)
+	if err != nil {
+		return fmt.Errorf("project not found: %s", projectID)
 	}
-	// Merge with existing metadata
-	var metadata map[string]any
-	rawMeta, _ := state["metadata"].(string)
-	if rawMeta != "" {
-		json.Unmarshal([]byte(rawMeta), &metadata)
+	data, err := os.ReadFile(filepath.Join(p.AppDir, ".env.template"))
+	if err != nil {
+		return fmt.Errorf("read environment template: %w", err)
 	}
-	if metadata == nil {
-		metadata = map[string]any{}
+	allowed := make(map[string]bool)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key := strings.TrimSpace(strings.SplitN(line, "=", 2)[0])
+		if envKeyRE.MatchString(key) {
+			allowed[key] = true
+		}
 	}
-	existing := s.loadEnvOverridesFromState(projectID)
-	envMap := make(map[string]any, len(overrides))
+	existing := s.loadEnvOverrides(projectID)
+	envMap := make(map[string]string, len(overrides))
 	for k, v := range overrides {
+		if !allowed[k] {
+			return fmt.Errorf("environment key %q is not declared in .env.template", k)
+		}
 		if v == "********" {
 			if oldVal, ok := existing[k]; ok {
 				envMap[k] = oldVal
 			}
 			continue
 		}
+		if strings.ContainsAny(v, "\r\n\x00") {
+			return fmt.Errorf("environment value for %s must be a single line", k)
+		}
 		envMap[k] = v
 	}
-	metadata["env_overrides"] = envMap
-	metaBytes, _ := json.Marshal(metadata)
-	state["metadata"] = string(metaBytes)
-	return s.db.UpsertProjectState(projectID, state)
+	return s.db.SaveProjectEnvOverrides(projectID, envMap)
 }
 
-// loadEnvOverridesFromState reads env_overrides from the metadata JSON field
-func (s *ProjectService) loadEnvOverridesFromState(projectID string) map[string]string {
-	state, _ := s.db.GetProjectState(projectID)
-	if state == nil {
+func (s *ProjectService) loadEnvOverrides(projectID string) map[string]string {
+	overrides, err := s.db.GetProjectEnvOverrides(projectID)
+	if err == nil && overrides != nil {
+		return overrides
+	}
+	if err != nil {
+		log.Printf("load project environment %s: %v", projectID, err)
 		return nil
 	}
-	raw, _ := state["metadata"].(string)
-	if raw == "" {
-		return nil
-	}
-	var metadata map[string]any
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return nil
-	}
-	env, _ := metadata["env_overrides"].(map[string]any)
-	if env == nil {
-		return nil
-	}
-	out := make(map[string]string, len(env))
-	for k, v := range env {
-		out[k] = fmt.Sprintf("%v", v)
-	}
-	return out
+
+	return nil
 }
 
 // LoadEnvOverrides returns saved env var overrides for deploy injection
 func (s *ProjectService) LoadEnvOverrides(projectID string) map[string]string {
-	return s.loadEnvOverridesFromState(projectID)
+	return s.loadEnvOverrides(projectID)
 }
 
 func (s *ProjectService) RunnerAction(projectID, action string) (string, error) {
@@ -684,7 +1056,7 @@ func (s *ProjectService) RunnerAction(projectID, action string) (string, error) 
 	var msg string
 	switch action {
 	case "start":
-		token, _ := s.db.GetRegistryPassword(projectID)
+		token, _ := s.db.GetRunnerToken(projectID)
 		if token == "" {
 			token = s.cfg.GithubToken
 		}
@@ -703,11 +1075,15 @@ func (s *ProjectService) RunnerAction(projectID, action string) (string, error) 
 		_ = s.db.UpsertProject(p)
 		msg = "Runner start initiated."
 	case "stop":
-		s.stopRunner(p)
+		if err := s.stopRunner(p); err != nil {
+			return "", err
+		}
 		msg = "Runner container stopped."
 	case "restart":
-		s.stopRunner(p)
-		token, _ := s.db.GetRegistryPassword(projectID)
+		if err := s.stopRunner(p); err != nil {
+			return "", err
+		}
+		token, _ := s.db.GetRunnerToken(projectID)
 		if token == "" {
 			token = s.cfg.GithubToken
 		}
@@ -749,15 +1125,23 @@ func (s *ProjectService) ContainerAction(projectID, service, action string) erro
 	}
 
 	containerName := s.FindContainerName(p.ID, service, p.BranchName)
+	projectName := fmt.Sprintf("%s-%s", p.ID, branchSlug(p.BranchName))
+	if err := s.docker.VerifyComposeOwnership(containerName, projectName, service); err != nil {
+		return err
+	}
 
 	if action == "recreate" {
 		s.audit.Log("container_recreate", "running", projectID, fmt.Sprintf("Recreating container for service %s", service), "")
 		composeFile, envFile, projectName := s.getProjectPaths(p)
 		slug := branchSlug(p.BranchName)
 
-		overrides := s.loadEnvOverridesFromState(projectID)
+		overrides := s.loadEnvOverrides(projectID)
 		if err := updateEnvFileWithOverrides(envFile, overrides, projectID, slug); err != nil {
 			s.audit.Log("container_recreate", "failed", projectID, fmt.Sprintf("Failed to sync env overrides: %s", err.Error()), "")
+			return err
+		}
+		if err := s.docker.ValidateComposeConfig(composeFile, projectName, envFile, []string{p.AppDir, s.LogDir(p)}); err != nil {
+			s.audit.Log("container_recreate", "failed", projectID, err.Error(), "")
 			return err
 		}
 
@@ -801,60 +1185,29 @@ func (s *ProjectService) ContainerAction(projectID, service, action string) erro
 	return nil
 }
 
-// FindContainerName resolves a project service container name.
-// First tries the branch-derived name; if not found, scans Docker for any
-// container matching {projectID}-*-{service} (handles COMPOSE_PROJECT_NAME
-// differing from the branch name).
+// FindContainerName resolves a project service through exact Compose labels.
+// The deterministic fallback is only used to report unavailable state.
 func (s *ProjectService) FindContainerName(projectID, service, branch string) string {
-	derived := DeploymentContainerName(service, branch, projectID)
-	summary := s.docker.ContainerSummary(derived)
-	if summary.Exists {
-		return derived
+	projectName := fmt.Sprintf("%s-%s", projectID, branchSlug(branch))
+	if name, err := s.docker.FindComposeContainer(projectName, service); err == nil && name != "" {
+		return name
 	}
-	// Support alternative convention: {projectID}-{service}-{branchSlug}
-	altFormat := fmt.Sprintf("%s-%s-%s", projectID, service, branchSlug(branch))
-	summaryAlt := s.docker.ContainerSummary(altFormat)
-	if summaryAlt.Exists {
-		return altFormat
+	return DeploymentContainerName(service, branch, projectID)
+}
+
+func (s *ProjectService) OwnedContainerName(p *models.Project, service string) (string, error) {
+	if !serviceNameRE.MatchString(service) {
+		return "", fmt.Errorf("invalid service name format")
 	}
-	prefix := projectID + "-"
-	names, err := s.docker.ListContainers("name=^/" + prefix)
+	projectName := fmt.Sprintf("%s-%s", p.ID, branchSlug(p.BranchName))
+	name, err := s.docker.FindComposeContainer(projectName, service)
 	if err != nil {
-		return derived
+		return "", err
 	}
-
-	escapedProj := regexp.QuoteMeta(projectID)
-	escapedSvc := regexp.QuoteMeta(service)
-	pattern1 := regexp.MustCompile(fmt.Sprintf(`^%s-(.+)-%s(-[0-9]+)?$`, escapedProj, escapedSvc))
-	pattern2 := regexp.MustCompile(fmt.Sprintf(`^%s-%s-(.+)(-[0-9]+)?$`, escapedProj, escapedSvc))
-
-	// Get all project IDs to prevent crosstalk via longest prefix match
-	var otherProjectIDs []string
-	if projects, err := s.db.ListProjects(); err == nil {
-		for _, proj := range projects {
-			if proj.ID != projectID {
-				otherProjectIDs = append(otherProjectIDs, proj.ID)
-			}
-		}
+	if name == "" {
+		return "", fmt.Errorf("service %s has no container owned by Compose project %s", service, projectName)
 	}
-
-	for _, name := range names {
-		if pattern1.MatchString(name) || pattern2.MatchString(name) {
-			// Prevent crosstalk: ensure no other project ID has a longer prefix match
-			hasLongerMatch := false
-			for _, otherID := range otherProjectIDs {
-				otherPrefix := otherID + "-"
-				if strings.HasPrefix(name, otherPrefix) && len(otherPrefix) > len(prefix) {
-					hasLongerMatch = true
-					break
-				}
-			}
-			if !hasLongerMatch {
-				return name
-			}
-		}
-	}
-	return derived
+	return name, nil
 }
 
 func DeploymentContainerName(service, branch, projectID string) string {
@@ -896,7 +1249,7 @@ func normalizeRef(ref string) string {
 	return ref
 }
 
-func (s *ProjectService) CheckServiceHealth(service, containerName string, summary *models.ContainerState) *models.ServiceHealth {
+func (s *ProjectService) CheckServiceHealth(p *models.Project, service, containerName string, summary *models.ContainerState) *models.ServiceHealth {
 	h := &models.ServiceHealth{
 		Service:        service,
 		Container:      containerName,
@@ -924,7 +1277,7 @@ func (s *ProjectService) CheckServiceHealth(service, containerName string, summa
 	}
 
 	// If the project has a devops.json, look up health config for this service
-	composeFile := filepath.Join(s.cfg.BaseDir, "Projects", containerName[:strings.Index(containerName, "-")], "devops.json")
+	composeFile := filepath.Join(p.AppDir, "devops.json")
 	if devopsCfg := s.loadDevopsConfig(composeFile); devopsCfg != nil && devopsCfg.Services != nil {
 		if svcCfg, ok := devopsCfg.Services[service].(map[string]interface{}); ok {
 			if healthCfg, ok := svcCfg["health"].(map[string]interface{}); ok {
@@ -935,7 +1288,7 @@ func (s *ProjectService) CheckServiceHealth(service, containerName string, summa
 					port = pInt
 				}
 				path, _ := healthCfg["path"].(string)
-				if port > 0 {
+				if port > 0 && port <= 65535 && strings.HasPrefix(path, "/") && !strings.ContainsAny(path, "\r\n\x00") {
 					execStatus, execDetail := s.docker.ExecHTTPHealth(containerName, port, path)
 					h.Status = execStatus
 					h.Detail = execDetail
@@ -951,12 +1304,57 @@ func (s *ProjectService) CheckServiceHealth(service, containerName string, summa
 }
 
 type DevopsConfig struct {
-	Version     string                 `json:"version"`
-	ProjectName string                 `json:"project_name"`
-	ComposeFile string                 `json:"compose_file"`
-	EnvTemplate string                 `json:"env_template"`
-	Services    map[string]interface{} `json:"services"`
-	Logs        *DevopsLogsConfig      `json:"logs"`
+	Version     string                   `json:"version"`
+	ProjectName string                   `json:"project_name"`
+	ComposeFile string                   `json:"compose_file"`
+	EnvTemplate string                   `json:"env_template"`
+	Services    map[string]interface{}   `json:"services"`
+	Environment *DevopsEnvironmentConfig `json:"environment"`
+	Logs        *DevopsLogsConfig        `json:"logs"`
+}
+
+// DevopsEnvironmentConfig separates operator input from values deploy-control
+// generates or derives. Its keys must also be declared in .env.template.
+type DevopsEnvironmentConfig struct {
+	OperatorRequired  []string `json:"operator_required"`
+	ControllerManaged []string `json:"controller_managed"`
+	GeneratedSecrets  []string `json:"generated_secrets"`
+	NonSecret         []string `json:"non_secret"`
+}
+
+type environmentContract struct {
+	present           bool
+	operatorRequired  map[string]bool
+	controllerManaged map[string]bool
+	nonSecret         map[string]bool
+}
+
+func projectEnvironmentContract(cfg *DevopsConfig) environmentContract {
+	contract := environmentContract{
+		operatorRequired:  make(map[string]bool),
+		controllerManaged: make(map[string]bool),
+		nonSecret:         make(map[string]bool),
+	}
+	if cfg == nil || cfg.Environment == nil {
+		return contract
+	}
+	contract.present = true
+	for _, key := range cfg.Environment.OperatorRequired {
+		if envKeyRE.MatchString(key) {
+			contract.operatorRequired[key] = true
+		}
+	}
+	for _, key := range append(cfg.Environment.ControllerManaged, cfg.Environment.GeneratedSecrets...) {
+		if envKeyRE.MatchString(key) {
+			contract.controllerManaged[key] = true
+		}
+	}
+	for _, key := range cfg.Environment.NonSecret {
+		if envKeyRE.MatchString(key) {
+			contract.nonSecret[key] = true
+		}
+	}
+	return contract
 }
 
 type DevopsLogsConfig struct {
@@ -966,24 +1364,29 @@ type DevopsLogsConfig struct {
 
 func (s *ProjectService) LogDir(p *models.Project) string {
 	defaultDir := filepath.Join(s.cfg.BaseDir, "Logs", p.ID)
-	devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
+	devopsPath := filepath.Join(p.AppDir, "devops.json")
 	cfg := s.loadDevopsConfig(devopsPath)
 	if cfg != nil && cfg.Logs != nil && cfg.Logs.Directory != "" {
-		return cfg.Logs.Directory
+		candidate := filepath.Clean(filepath.Join(defaultDir, cfg.Logs.Directory))
+		if candidate == defaultDir || strings.HasPrefix(candidate, defaultDir+string(filepath.Separator)) {
+			return candidate
+		}
+		log.Printf("Ignoring unsafe logs.directory %q for project %s", cfg.Logs.Directory, p.ID)
 	}
 	return defaultDir
 }
 
 func (s *ProjectService) ContainerLogFiles(p *models.Project) map[string]string {
-	devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
+	devopsPath := filepath.Join(p.AppDir, "devops.json")
 	cfg := s.loadDevopsConfig(devopsPath)
 	if cfg == nil || cfg.Logs == nil || cfg.Logs.ContainerInternal == nil {
 		return nil
 	}
 	result := make(map[string]string)
 	for svc, path := range cfg.Logs.ContainerInternal {
-		if path != "" {
-			result[svc] = path
+		clean := filepath.Clean(path)
+		if serviceNameRE.MatchString(svc) && strings.HasPrefix(clean, "/logs/") {
+			result[svc] = clean
 		}
 	}
 	return result
@@ -1003,20 +1406,29 @@ func (s *ProjectService) loadDevopsConfig(path string) *DevopsConfig {
 
 // composeServices returns service names for a project by reading docker-compose.yml
 func (s *ProjectService) composeServices(p *models.Project) []string {
-	composeFile := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "docker-compose.yml")
-	svcNames, err := s.docker.ComposeServiceNames(composeFile)
-	if err != nil || len(svcNames) == 0 {
-		// Fallback: read from devops.json services section
-		devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
-		if cfg := s.loadDevopsConfig(devopsPath); cfg != nil && cfg.Services != nil {
-			for name := range cfg.Services {
-				svcNames = append(svcNames, name)
+	// devops.json is the project's monitoring contract. Compose files can also
+	// contain one-shot migration or initialization services that should not be
+	// reported as continuously unhealthy after they complete successfully.
+	devopsPath := filepath.Join(p.AppDir, "devops.json")
+	if cfg := s.loadDevopsConfig(devopsPath); cfg != nil && len(cfg.Services) > 0 {
+		services := make([]string, 0, len(cfg.Services))
+		for name := range cfg.Services {
+			if serviceNameRE.MatchString(name) {
+				services = append(services, name)
 			}
 		}
+		if len(services) > 0 {
+			sort.Strings(services)
+			return services
+		}
 	}
-	if len(svcNames) == 0 {
+
+	composeFile := filepath.Join(p.AppDir, "docker-compose.yml")
+	svcNames, err := s.docker.ComposeServiceNames(composeFile)
+	if err != nil || len(svcNames) == 0 {
 		return []string{"postgres", "redis", "backend", "storefront"}
 	}
+	sort.Strings(svcNames)
 	return svcNames
 }
 

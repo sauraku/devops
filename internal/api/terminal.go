@@ -1,21 +1,19 @@
 package api
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
-	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 var terminalUpgrader = websocket.Upgrader{
@@ -116,10 +114,15 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 		authMethods = append(authMethods, ssh.Password(string(passBytes)))
 	}
 
+	hostKeyCallback, err := h.knownHostKeyCallback()
+	if err != nil {
+		writeTerminalMessage(conn, "ERROR: SSH known_hosts is not configured: "+err.Error())
+		return
+	}
 	sshConfig := &ssh.ClientConfig{
 		User:            auth.User,
 		Auth:            authMethods,
-		HostKeyCallback: verifyOrTrustHostKey(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
 
@@ -190,6 +193,8 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	done := make(chan struct{})
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
 
 	go func() {
 		defer close(done)
@@ -202,6 +207,7 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			n, err := stdoutPipe.Read(buf)
 			if n > 0 {
+				lastActivity.Store(time.Now().UnixNano())
 				terminalWriteMu.Lock()
 				if werr := conn.WriteMessage(websocket.TextMessage, buf[:n]); werr != nil {
 					terminalWriteMu.Unlock()
@@ -222,6 +228,7 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 				cancel()
 				return
 			}
+			lastActivity.Store(time.Now().UnixNano())
 			if len(msg) > 0 && msg[0] == '{' {
 				var resize struct {
 					Cols int `json:"cols"`
@@ -236,14 +243,13 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	lastActivity := time.Now()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if time.Since(lastActivity) > terminalIdleTimeout {
+			if time.Since(time.Unix(0, lastActivity.Load())) > terminalIdleTimeout {
 				writeTerminalMessage(conn, "\r\n\x1b[1;31mSession timed out after 60 seconds of inactivity.\x1b[0m\r\n")
 				cancel()
 				return
@@ -256,32 +262,14 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func verifyOrTrustHostKey() ssh.HostKeyCallback {
-	knownHostsPath := filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts")
-	knownHostsData, _ := os.ReadFile(knownHostsPath)
-
-	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		keyFingerprint := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))[:16]
-
-		if len(knownHostsData) > 0 {
-			for len(knownHostsData) > 0 {
-				_, hosts, knownKey, _, rest, err := ssh.ParseKnownHosts(knownHostsData)
-				if err != nil {
-					break
-				}
-				knownHostsData = rest
-				for _, h := range hosts {
-					if h == hostname || h == "127.0.0.1" || h == "localhost" || h == "*" {
-						if key.Type() == knownKey.Type() && bytes.Equal(key.Marshal(), knownKey.Marshal()) {
-							return nil
-						}
-						return fmt.Errorf("host key mismatch for %s: expected %s, got %s. Remove the old key from %s if this is expected (e.g. server reinstalled)", hostname, knownKey.Type(), key.Type(), knownHostsPath)
-					}
-				}
-			}
+func (h *Handler) knownHostKeyCallback() (ssh.HostKeyCallback, error) {
+	knownHostsPath := h.cfg.SSHKnownHosts
+	if knownHostsPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
 		}
-
-		log.Printf("Terminal: trusting new host key for %s (%s fingerprint: %s)", hostname, key.Type(), keyFingerprint)
-		return nil
+		knownHostsPath = filepath.Join(home, ".ssh", "known_hosts")
 	}
+	return knownhosts.New(knownHostsPath)
 }

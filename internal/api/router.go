@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -23,6 +24,19 @@ type Router struct {
 	h    *Handler
 	auth *Authenticator
 	cfg  *models.Config
+}
+
+type authContextKey string
+
+const projectTokenAuthKey authContextKey = "project-token-auth"
+
+func withProjectTokenAuth(req *http.Request) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), projectTokenAuthKey, true))
+}
+
+func isProjectTokenAuth(req *http.Request) bool {
+	value, _ := req.Context().Value(projectTokenAuthKey).(bool)
+	return value
 }
 
 func NewRouter(handler *Handler, auth *Authenticator, cfg *models.Config) *Router {
@@ -90,10 +104,12 @@ func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("/api/projects", r.auth.RequireAuth(r.handleProjects))
 
 	// API - project-specific routes
-	r.mux.HandleFunc("/api/projects/", r.auth.RequireAuth(r.handleProjectRoute))
+	r.mux.HandleFunc("/api/projects/", r.handleProjectRoute)
 
 	// Terminal — WebSocket SSH session
-	r.mux.HandleFunc("/api/terminal", r.auth.RequireAuth(r.h.TerminalHandler))
+	if r.cfg.EnableTerminal {
+		r.mux.HandleFunc("/api/terminal", r.auth.RequireAuth(r.h.TerminalHandler))
+	}
 
 	// Root - serve UI or login
 	r.mux.HandleFunc("/", r.auth.RequireAuth(r.serveRoot))
@@ -113,11 +129,8 @@ func (r *Router) serveRoot(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	content := string(html)
-	content = strings.ReplaceAll(content, "__CSRF_TOKEN__", r.auth.CSRFSecret())
-	content = strings.ReplaceAll(content, "__AUTH_TOKEN__", r.auth.Token())
-	// Also inject as window variable for reliable access before module load
-	content = strings.ReplaceAll(content, "</head>",
-		fmt.Sprintf("<script>window.__AUTH_TOKEN__=%q;</script></head>", r.auth.Token()))
+	content = strings.ReplaceAll(content, "__CSRF_TOKEN__", r.auth.CSRFToken(req))
+	content = strings.ReplaceAll(content, "__AUTH_TOKEN__", "")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(content))
 }
@@ -187,13 +200,24 @@ func (r *Router) handleProjectRoute(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Mutations require CSRF/bearer token
-	isMutation := req.Method == http.MethodPost || req.Method == http.MethodDelete
-	if isMutation {
-		if !r.auth.VerifyBearerToken(req) && !r.auth.VerifyCSRF(req) {
-			writeError(w, http.StatusForbidden, "missing or invalid CSRF token")
-			return
-		}
+	allowed, mutation := projectActionPolicy(action, req.Method)
+	if !allowed {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	masterAuth := r.auth.IsAuthed(req)
+	projectAuth := projectTokenActionAllowed(action) && r.auth.VerifyProjectToken(req, projectID)
+	if !masterAuth && !projectAuth {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if mutation && !r.auth.VerifyBearerToken(req) && !projectAuth && !r.auth.VerifyCSRF(req) {
+		writeError(w, http.StatusForbidden, "missing or invalid CSRF token")
+		return
+	}
+	if projectAuth && !masterAuth {
+		req = withProjectTokenAuth(req)
 	}
 
 	r.routeProjectAction(w, req, projectID, action)
@@ -205,37 +229,6 @@ func (r *Router) routeProjectAction(w http.ResponseWriter, req *http.Request, pr
 			r.h.ProjectStatus(w, req, projectID)
 			return
 		}
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-
-	// Validate HTTP method per action
-	mutationActions := map[string]bool{
-		"deploy":     true,
-		"pause":      true,
-		"resume":     true,
-		"restore":    true,
-		"rollback":   true,
-		"abort":      true,
-		"runner":     true,
-		"delete":     true,
-		"env-config": true,
-	}
-	readActions := map[string]bool{
-		"config":               true,
-		"backups":              true,
-		"backups/verify":       true,
-		"restore/dry-run":      true,
-		"logs":                 true,
-		"container-log-files":  true,
-		"env-template":         true,
-		"deployments":          true,
-	}
-	if strings.HasPrefix(action, "logs/") || strings.HasPrefix(action, "deployments/") || strings.HasPrefix(action, "containers/") || strings.HasPrefix(action, "container-log-files/") {
-		readActions[action] = true
-	}
-
-	if mutationActions[action] && req.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -306,16 +299,74 @@ func (r *Router) routeProjectAction(w http.ResponseWriter, req *http.Request, pr
 			r.h.ProjectLogContent(w, req, projectID, logName)
 			return
 		}
-		if strings.HasPrefix(action, "deployments/") {
-			deployID := strings.TrimPrefix(action, "deployments/")
-			// Stream via websocket if upgrade requested
-			if strings.Contains(req.Header.Get("Upgrade"), "websocket") {
-				r.h.WebSocketHandler(w, req, projectID)
-				return
+		if deployID, subAction, ok := deploymentSubAction(action); ok {
+			switch subAction {
+			case "status":
+				r.h.ProjectDeploymentStatus(w, req, projectID, deployID)
+			case "approve":
+				r.h.ProjectApproveDeployment(w, req, projectID, deployID)
+			case "":
+				// Stream via websocket if upgrade requested
+				if strings.Contains(req.Header.Get("Upgrade"), "websocket") {
+					r.h.WebSocketHandler(w, req, projectID)
+					return
+				}
+				r.h.ProjectDeploymentLog(w, req, projectID, deployID)
 			}
-			r.h.ProjectDeploymentLog(w, req, projectID, deployID)
 			return
 		}
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func projectActionPolicy(action, requestMethod string) (allowed bool, mutation bool) {
+	switch action {
+	case "", "status", "logs", "container-log-files", "env-template", "deployments":
+		return requestMethod == http.MethodGet, false
+	case "config", "deploy", "pause", "resume", "backups/verify", "restore/dry-run", "restore", "rollback", "abort", "runner", "delete", "env-config":
+		return requestMethod == http.MethodPost, true
+	case "backups":
+		return requestMethod == http.MethodGet || requestMethod == http.MethodPost, requestMethod == http.MethodPost
+	}
+	if _, subAction, ok := deploymentSubAction(action); ok {
+		switch subAction {
+		case "", "status":
+			return requestMethod == http.MethodGet, false
+		case "approve":
+			return requestMethod == http.MethodPost, true
+		default:
+			return false, false
+		}
+	}
+	if strings.HasPrefix(action, "containers/") {
+		if strings.HasSuffix(action, "/logs") {
+			return requestMethod == http.MethodGet, false
+		}
+		return requestMethod == http.MethodPost, true
+	}
+	if strings.HasPrefix(action, "logs/") || strings.HasPrefix(action, "container-log-files/") {
+		return requestMethod == http.MethodGet, false
+	}
+	return true, false
+}
+
+var deploymentIDRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+func deploymentSubAction(action string) (deployID, subAction string, ok bool) {
+	parts := strings.Split(action, "/")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] != "deployments" || !deploymentIDRE.MatchString(parts[1]) {
+		return "", "", false
+	}
+	if len(parts) == 3 {
+		subAction = parts[2]
+	}
+	return parts[1], subAction, true
+}
+
+func projectTokenActionAllowed(action string) bool {
+	if action == "deploy" {
+		return true
+	}
+	_, subAction, ok := deploymentSubAction(action)
+	return ok && subAction == "status"
 }

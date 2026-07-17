@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sauraku/devops-control/internal/db"
@@ -27,6 +28,55 @@ type BackupService struct {
 	cfg    *models.Config
 }
 
+type composeServiceTarget struct {
+	service string
+	envKey  string
+}
+
+var (
+	backupComposeTargets = []composeServiceTarget{
+		{service: "postgres", envKey: "POSTGRES_CONTAINER"},
+	}
+	restoreComposeTargets = []composeServiceTarget{
+		{service: "postgres", envKey: "POSTGRES_CONTAINER"},
+	}
+)
+
+func restoreCommandJSON(appDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(appDir, "devops.json"))
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read devops.json: %w", err)
+	}
+	var config struct {
+		Services map[string]struct {
+			Restore *struct {
+				Command json.RawMessage `json:"command"`
+			} `json:"restore"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return "", fmt.Errorf("parse devops.json: %w", err)
+	}
+	backend, ok := config.Services["backend"]
+	if !ok || backend.Restore == nil || len(backend.Restore.Command) == 0 {
+		return "", nil
+	}
+	var command []string
+	if err := json.Unmarshal(backend.Restore.Command, &command); err != nil || len(command) == 0 {
+		return "", fmt.Errorf("services.backend.restore.command must be a non-empty JSON string array")
+	}
+	for _, arg := range command {
+		if arg == "" || strings.ContainsRune(arg, '\x00') {
+			return "", fmt.Errorf("services.backend.restore.command contains an invalid argument")
+		}
+	}
+	encoded, _ := json.Marshal(command)
+	return string(encoded), nil
+}
+
 func NewBackupService(database *db.DB, dockerClient *docker.Client, audit *AuditService, cfg *models.Config) *BackupService {
 	return &BackupService{
 		db:     database,
@@ -36,10 +86,54 @@ func NewBackupService(database *db.DB, dockerClient *docker.Client, audit *Audit
 	}
 }
 
+func (s *BackupService) ownedComposeTargetEnv(projectID, branch string, targets []composeServiceTarget) (map[string]string, error) {
+	composeProject := fmt.Sprintf("%s-%s", projectID, branchSlug(branch))
+	env := map[string]string{"COMPOSE_PROJECT_NAME": composeProject}
+	for _, target := range targets {
+		containerID, err := s.ownedComposeContainerID(composeProject, target.service)
+		if err != nil {
+			return nil, err
+		}
+		env[target.envKey] = containerID
+	}
+	return env, nil
+}
+
+func (s *BackupService) ownedComposeContainerID(composeProject, service string) (string, error) {
+	containerName, err := s.docker.FindComposeContainer(composeProject, service)
+	if err != nil {
+		return "", fmt.Errorf("resolve Compose service %s/%s: %w", composeProject, service, err)
+	}
+	if containerName == "" {
+		return "", fmt.Errorf("Compose service %s/%s has no owned container", composeProject, service)
+	}
+	info, err := s.docker.InspectContainer(containerName)
+	if err != nil {
+		return "", fmt.Errorf("inspect Compose service %s/%s: %w", composeProject, service, err)
+	}
+	containerID, _ := info["Id"].(string)
+	if containerID == "" {
+		return "", fmt.Errorf("inspect Compose service %s/%s: container id is missing", composeProject, service)
+	}
+	if err := s.docker.VerifyComposeOwnership(containerID, composeProject, service); err != nil {
+		return "", fmt.Errorf("verify Compose service %s/%s: %w", composeProject, service, err)
+	}
+	return containerID, nil
+}
+
 func (s *BackupService) Create(projectID, branch, reason string) (*models.Deployment, error) {
 	p, err := s.db.GetProject(projectID)
 	if err != nil {
 		return nil, fmt.Errorf("project not found: %s", projectID)
+	}
+	branch = normalizeRef(branch)
+	if branch == "" {
+		branch = p.BranchName
+	}
+	branchEnv := branchSlug(branch)
+	targetEnv, err := s.ownedComposeTargetEnv(projectID, branch, backupComposeTargets)
+	if err != nil {
+		return nil, err
 	}
 
 	deployID := fmt.Sprintf("backup-%s-%d", projectID, time.Now().UnixMilli())
@@ -58,8 +152,14 @@ func (s *BackupService) Create(projectID, branch, reason string) (*models.Deploy
 		"BACKUP_REASON":        reason,
 		"BACKUP_DIR_PATH":      backupDir,
 		"BACKUP_MANIFEST_FILE": manifestFile,
-		"ENV_FILE":             filepath.Join(s.cfg.BaseDir, "Projects", projectID, ".env."+branch),
+		"ENV_FILE":             filepath.Join(s.cfg.BaseDir, "Projects", projectID, ".env."+branchEnv),
 		"BASE_DIR":             s.cfg.BaseDir,
+		"PROJECT_ID":           projectID,
+		"PROJECT_DIR":          p.AppDir,
+		"PROJECT_STATE_DIR":    filepath.Join(s.cfg.DataDir, projectID),
+	}
+	for key, value := range targetEnv {
+		env[key] = value
 	}
 
 	deployment := &models.Deployment{
@@ -104,6 +204,7 @@ func (s *BackupService) runBackup(d *models.Deployment, p *models.Project, env m
 	args := []string{script}
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = appDir
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
 	for k, v := range env {
@@ -207,9 +308,9 @@ func (s *BackupService) Verify(projectID, backupID string) (*models.BackupVerify
 	}
 
 	backupDir := filepath.Join(s.cfg.BaseDir, "Backups", projectID)
-	filePath := backup.FilePath
-	if !filepath.IsAbs(filePath) {
-		filePath = filepath.Join(backupDir, filePath)
+	filePath, err := safeBackupPath(backupDir, backup.FilePath)
+	if err != nil {
+		return &models.BackupVerifyResult{OK: false, Message: err.Error(), Backup: backup}, nil
 	}
 
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
@@ -247,11 +348,35 @@ func (s *BackupService) Verify(projectID, backupID string) (*models.BackupVerify
 			if err := restoreCmd.Run(); err != nil {
 				return &models.BackupVerifyResult{OK: false, Message: "pg_restore --list failed", Backup: backup}, nil
 			}
-			gzipCmd.Wait()
+			if err := gzipCmd.Wait(); err != nil {
+				return &models.BackupVerifyResult{OK: false, Message: "backup decompression failed", Backup: backup}, nil
+			}
 		}
 	}
 
 	return &models.BackupVerifyResult{OK: true, Message: "backup verified", Backup: backup}, nil
+}
+
+func safeBackupPath(backupDir, storedPath string) (string, error) {
+	if storedPath == "" || strings.Contains(storedPath, "://") {
+		return "", fmt.Errorf("backup is not available in local storage")
+	}
+	path := storedPath
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(backupDir, path)
+	}
+	path = filepath.Clean(path)
+	root := filepath.Clean(backupDir)
+	if path != root && !strings.HasPrefix(path, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("backup path escapes the project backup directory")
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		if resolved != root && !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
+			return "", fmt.Errorf("backup path resolves outside the project backup directory")
+		}
+		path = resolved
+	}
+	return path, nil
 }
 
 func (s *BackupService) DryRunRestore(projectID, backupID string) (*models.BackupVerifyResult, error) {
@@ -261,9 +386,11 @@ func (s *BackupService) DryRunRestore(projectID, backupID string) (*models.Backu
 	}
 
 	backupDir := filepath.Join(s.cfg.BaseDir, "Backups", projectID)
-	filePath := result.Backup.FilePath
-	if !filepath.IsAbs(filePath) {
-		filePath = filepath.Join(backupDir, filePath)
+	filePath, pathErr := safeBackupPath(backupDir, result.Backup.FilePath)
+	if pathErr != nil {
+		result.OK = false
+		result.Message = pathErr.Error()
+		return result, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -281,10 +408,11 @@ func (s *BackupService) DryRunRestore(projectID, backupID string) (*models.Backu
 		return result, nil
 	}
 	listErr := listCmd.Run()
-	cmd.Wait()
+	gzipErr := cmd.Wait()
 
-	if listErr != nil {
-		result.Message = fmt.Sprintf("pg_restore --list failed: %v", listErr)
+	if listErr != nil || gzipErr != nil {
+		result.OK = false
+		result.Message = fmt.Sprintf("backup inspection failed: pg_restore=%v gzip=%v", listErr, gzipErr)
 		return result, nil
 	}
 
@@ -319,8 +447,14 @@ func (s *BackupService) DryRunRestore(projectID, backupID string) (*models.Backu
 
 	currentRows := make(map[string]int64)
 	if p, err := s.db.GetProject(projectID); err == nil {
-		pgContainer := DeploymentContainerName("postgres", p.BranchName, p.ID)
 		dbName, dbUser := s.getBackupConfig(p)
+		composeProject := fmt.Sprintf("%s-%s", p.ID, branchSlug(p.BranchName))
+		pgContainer, ownershipErr := s.ownedComposeContainerID(composeProject, "postgres")
+		if ownershipErr != nil {
+			result.OK = false
+			result.Message = ownershipErr.Error()
+			return result, nil
+		}
 		queryCmd := exec.CommandContext(ctx, "docker", "exec", pgContainer,
 			"psql", "-U", dbUser, "-d", dbName, "-t", "-c",
 			"SELECT schemaname || '.' || relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname")
@@ -379,6 +513,10 @@ func (s *BackupService) Restore(projectID, backupID string) (*models.Deployment,
 	if err != nil {
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
+	targetEnv, err := s.ownedComposeTargetEnv(projectID, p.BranchName, restoreComposeTargets)
+	if err != nil {
+		return nil, err
+	}
 
 	deployID := fmt.Sprintf("restore-%s-%d", projectID, time.Now().UnixMilli())
 	logDir := filepath.Join(s.cfg.BaseDir, "Logs", projectID)
@@ -393,8 +531,21 @@ func (s *BackupService) Restore(projectID, backupID string) (*models.Deployment,
 		"BACKUP_ID":            backupID,
 		"BACKUP_DIR_PATH":      backupDir,
 		"BACKUP_MANIFEST_FILE": manifestFile,
-		"ENV_FILE":             filepath.Join(s.cfg.BaseDir, "Projects", projectID, ".env."+p.BranchName),
+		"ENV_FILE":             filepath.Join(s.cfg.BaseDir, "Projects", projectID, ".env."+branchSlug(p.BranchName)),
 		"COMPOSE_FILE":         filepath.Join(s.cfg.BaseDir, "Projects", projectID, "docker-compose.yml"),
+		"BASE_DIR":             s.cfg.BaseDir,
+		"PROJECT_ID":           projectID,
+		"PROJECT_DIR":          p.AppDir,
+		"PROJECT_STATE_DIR":    filepath.Join(s.cfg.DataDir, projectID),
+		"TARGET_BRANCH":        p.BranchName,
+	}
+	for key, value := range targetEnv {
+		env[key] = value
+	}
+	if commandJSON, err := restoreCommandJSON(p.AppDir); err != nil {
+		return nil, err
+	} else if commandJSON != "" {
+		env["RESTORE_COMMAND_JSON"] = commandJSON
 	}
 
 	deployment := &models.Deployment{
@@ -436,6 +587,7 @@ func (s *BackupService) runRestore(d *models.Deployment, p *models.Project, env 
 	args := []string{script, backupID}
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = p.AppDir
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
 	for k, v := range env {
@@ -485,6 +637,13 @@ func (s *BackupService) Rollback(projectID, commit string) (*models.Deployment, 
 	if p.DeploymentMode != models.DeploymentModeLocalRepo {
 		return nil, fmt.Errorf("rollback is only available for local_repo projects")
 	}
+	if password, err := s.db.GetRegistryPassword(projectID); err != nil {
+		return nil, fmt.Errorf("load registry credentials: %w", err)
+	} else if password != "" {
+		if ok, message := s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, password); !ok {
+			return nil, fmt.Errorf("registry login failed: %s", message)
+		}
+	}
 
 	deployID := fmt.Sprintf("rollback-%s-%d", projectID, time.Now().UnixMilli())
 	logDir := filepath.Join(s.cfg.BaseDir, "Logs", projectID)
@@ -492,8 +651,12 @@ func (s *BackupService) Rollback(projectID, commit string) (*models.Deployment, 
 	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", deployID))
 
 	env := map[string]string{
-		"DEPLOY_ID": deployID,
-		"BASE_DIR":  s.cfg.BaseDir,
+		"DEPLOY_ID":       deployID,
+		"BASE_DIR":        s.cfg.BaseDir,
+		"PROJECT_ID":      projectID,
+		"REPO_URL":        p.RepoURL,
+		"REGISTRY_HOST":   p.RegistryHost,
+		"PROJECT_LOG_DIR": filepath.Join(s.cfg.BaseDir, "Logs", projectID),
 	}
 
 	deployment := &models.Deployment{
@@ -537,6 +700,7 @@ func (s *BackupService) runRollback(d *models.Deployment, p *models.Project, env
 	args := []string{script, commit}
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = p.AppDir
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
 	for k, v := range env {
@@ -613,11 +777,18 @@ func (s *BackupService) StartScheduler() {
 
 func parseHM(s string) (int, int, error) {
 	var h, m int
-	_, err := fmt.Sscanf(s, "%d:%d", &h, &m)
+	n, err := fmt.Sscanf(s, "%d:%d", &h, &m)
+	if err == nil && (n != 2 || h < 0 || h > 23 || m < 0 || m > 59) {
+		err = fmt.Errorf("time must be HH:MM in UTC")
+	}
 	return h, m, err
 }
 
 func (s *BackupService) CleanupOldBackups(projectID string) {
+	if s.cfg.BackupRetention < 1 {
+		log.Printf("Backup cleanup disabled: BACKUP_RETENTION must be at least 1")
+		return
+	}
 	backups, err := s.db.ListBackups(projectID, 0)
 	if err != nil || len(backups) <= s.cfg.BackupRetention {
 		return
@@ -628,9 +799,12 @@ func (s *BackupService) CleanupOldBackups(projectID string) {
 	for _, b := range backups[s.cfg.BackupRetention:] {
 		log.Printf("Backup cleanup: removing old backup %s (%s)", b.ID, b.Timestamp)
 		if b.FilePath != "" && !strings.Contains(b.FilePath, "://") {
-			os.Remove(b.FilePath)
-			absPath := filepath.Join(s.cfg.BaseDir, "Backups", projectID, b.FilePath)
-			os.Remove(absPath)
+			if backupPath, err := safeBackupPath(filepath.Join(s.cfg.BaseDir, "Backups", projectID), b.FilePath); err == nil {
+				_ = os.Remove(backupPath)
+			} else {
+				log.Printf("Backup cleanup: refusing unsafe path for %s: %v", b.ID, err)
+				continue
+			}
 		}
 		_ = s.db.DeleteBackup(b.ID, projectID)
 	}
@@ -652,7 +826,7 @@ func (s *BackupService) getBackupConfig(p *models.Project) (dbName, dbUser strin
 	dbName = fmt.Sprintf("%s-db", p.ID)
 	dbUser = "postgres"
 
-	devopsPath := filepath.Join(s.cfg.BaseDir, "Projects", p.ID, "devops.json")
+	devopsPath := filepath.Join(p.AppDir, "devops.json")
 	data, err := os.ReadFile(devopsPath)
 	if err != nil {
 		return

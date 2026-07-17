@@ -18,7 +18,7 @@ export interface Deployment {
   id: string;
   project_id: string;
   kind: string;
-  status: 'running' | 'success' | 'failed' | 'aborted' | 'pending';
+  status: 'pending' | 'pending_approval' | 'running' | 'success' | 'failed' | 'aborted';
   ref: string;
   sha: string;
   image_tag: string;
@@ -33,6 +33,20 @@ export interface Deployment {
   github_actor: string;
   github_repository: string;
   github_workflow: string;
+}
+
+export interface DeploymentOperation {
+  id: string;
+  project_id: string;
+  kind: string;
+  status: Deployment['status'];
+  phase: 'pending' | 'manual_approval' | 'running' | 'terminal';
+  terminal: boolean;
+  successful: boolean;
+  manual_approval_required: boolean;
+  started_at: string;
+  finished_at?: string;
+  exit_code?: number;
 }
 
 export interface ServiceHealth {

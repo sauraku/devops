@@ -7,6 +7,26 @@ import (
 	"github.com/sauraku/devops-control/internal/models"
 )
 
+func (db *DB) ListLocks() ([]*models.DeployLock, error) {
+	rows, err := db.Query(`
+		SELECT project_id, operation_id, operation, started_at, sha, image_tag, branch
+		FROM deploy_locks ORDER BY started_at
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var locks []*models.DeployLock
+	for rows.Next() {
+		var l models.DeployLock
+		if err := rows.Scan(&l.ProjectID, &l.OperationID, &l.Operation, &l.StartedAt, &l.SHA, &l.ImageTag, &l.Branch); err != nil {
+			return nil, err
+		}
+		locks = append(locks, &l)
+	}
+	return locks, rows.Err()
+}
+
 func (db *DB) GetLock(projectID string) (*models.DeployLock, error) {
 	row := db.QueryRow(`
 		SELECT project_id, operation_id, operation, started_at, sha, image_tag, branch

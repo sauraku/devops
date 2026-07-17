@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_DIR="$(cd "${SERVER_DIR}/.." && pwd)"
-STATE_DIR="${SERVER_DIR}/State"
-BACKUP_DIR="${BACKUP_DIR_PATH:-${SERVER_DIR}/Backups}"
-LOG_DIR="${SERVER_DIR}/Logs"
+# shellcheck source=../deploy/lib.sh
+source "${SERVER_DIR}/deploy/lib.sh"
+PROJECT_DIR="${PROJECT_DIR:-$PWD}"
+STATE_DIR="${PROJECT_STATE_DIR:-${BASE_DIR:-${SERVER_DIR}}/State/${PROJECT_ID:-default}}"
+BACKUP_DIR="${BACKUP_DIR_PATH:-${BASE_DIR:-${SERVER_DIR}}/Backups/${PROJECT_ID:-default}}"
+LOG_DIR="${PROJECT_LOG_DIR:-${BASE_DIR:-${SERVER_DIR}}/Logs/${PROJECT_ID:-default}}"
 LOCK_DIR="${STATE_DIR}/deploy-lock"
 MANIFEST_FILE="${BACKUP_MANIFEST_FILE:-${BACKUP_DIR}/manifest.jsonl}"
 
@@ -22,6 +25,29 @@ case "${TARGET_BRANCH}" in
   refs/heads/*) TARGET_BRANCH="${TARGET_BRANCH#refs/heads/}" ;;
 esac
 
+TRUSTED_PROJECT_ID="${PROJECT_ID:-}"
+TRUSTED_TARGET_BRANCH="${TARGET_BRANCH}"
+TRUSTED_COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
+if [ -z "${TRUSTED_PROJECT_ID}" ]; then
+  echo "Backup failed: PROJECT_ID must be supplied by the control plane." >&2
+  exit 1
+fi
+case "${TRUSTED_PROJECT_ID}" in
+  *[!a-z0-9_.-]*|"") echo "Backup failed: invalid PROJECT_ID." >&2; exit 1 ;;
+esac
+
+branch_slug="$(printf '%s' "${TRUSTED_TARGET_BRANCH}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')"
+if [ -z "${branch_slug}" ]; then
+  branch_slug="rc"
+elif ! printf '%s' "${branch_slug}" | grep -Eq '^[a-z0-9]'; then
+  branch_slug="branch-${branch_slug}"
+fi
+EXPECTED_COMPOSE_PROJECT_NAME="${TRUSTED_PROJECT_ID}-${branch_slug}"
+if [ -n "${TRUSTED_COMPOSE_PROJECT_NAME}" ] && [ "${TRUSTED_COMPOSE_PROJECT_NAME}" != "${EXPECTED_COMPOSE_PROJECT_NAME}" ]; then
+  echo "Backup failed: Compose project does not match the registered project and branch." >&2
+  exit 1
+fi
+
 if [ -n "${ENV_FILE:-}" ]; then
   DEPLOY_ENV_FILE="${ENV_FILE}"
 elif [ -f "${SERVER_DIR}/.env.${TARGET_BRANCH}" ]; then
@@ -35,26 +61,17 @@ if [ ! -f "${DEPLOY_ENV_FILE}" ]; then
   exit 1
 fi
 
-# Save critical host env vars that the project env file may override
-_SAVED_HOME="${HOME}"
-_SAVED_PATH="${PATH}"
-_SAVED_PWD="${PWD}"
-_SAVED_SHLVL="${SHLVL}"
-set -a
-# shellcheck source=/dev/null
-source "${DEPLOY_ENV_FILE}"
-set +a
-# Restore critical host env vars
-HOME="${_SAVED_HOME}"
-PATH="${_SAVED_PATH}"
-PWD="${_SAVED_PWD}"
-SHLVL="${_SAVED_SHLVL}"
+load_dotenv "${DEPLOY_ENV_FILE}"
 
-ENV_NAME="${ENV_NAME:-${TARGET_BRANCH:-rc}}"
-COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${PROJECT_ID:-project}-${ENV_NAME}}"
+PROJECT_ID="${TRUSTED_PROJECT_ID}"
+TARGET_BRANCH="${TRUSTED_TARGET_BRANCH}"
+ENV_NAME="${branch_slug}"
+COMPOSE_PROJECT_NAME="${EXPECTED_COMPOSE_PROJECT_NAME}"
 POSTGRES_DB="${POSTGRES_DB:-${PROJECT_ID:-project}-db}"
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
-POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-${COMPOSE_PROJECT_NAME:-project}-postgres}"
+# Container names from the project dotenv are untrusted. Service targets are
+# resolved from exact Compose ownership labels immediately before use.
+unset POSTGRES_CONTAINER
 BACKUP_KIND="${BACKUP_KIND:-manual}"
 BACKUP_REASON="${BACKUP_REASON:-${BACKUP_KIND}}"
 BACKUP_SKIP_LOCK="${BACKUP_SKIP_LOCK:-false}"
@@ -62,6 +79,52 @@ BACKUP_ID="${BACKUP_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-${ENV_NAME}-${BACKUP_KIND}}
 BACKUP_FILE="${BACKUP_DIR}/${BACKUP_ID}.dump.gz"
 TMP_FILE="${BACKUP_FILE}.tmp"
 VERIFY_LOG="${BACKUP_DIR}/${BACKUP_ID}.pg_restore.list"
+
+verify_owned_container() {
+  local container_id="${1:?container id is required}"
+  local service="${2:?service is required}"
+  local require_running="${3:-true}"
+  local actual expected
+  actual="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Running}}' "${container_id}" 2>/dev/null)" || {
+    echo "Backup failed: unable to inspect Compose service ${COMPOSE_PROJECT_NAME}/${service}." >&2
+    return 1
+  }
+  expected="${COMPOSE_PROJECT_NAME}|${service}"
+  case "${actual}" in
+    "${expected}|true") return 0 ;;
+    "${expected}|false")
+      if [ "${require_running}" = "false" ]; then
+        return 0
+      fi
+      echo "Backup failed: Compose service ${COMPOSE_PROJECT_NAME}/${service} is not running." >&2
+      ;;
+    *) echo "Backup failed: container ownership changed for Compose service ${COMPOSE_PROJECT_NAME}/${service}." >&2 ;;
+  esac
+  return 1
+}
+
+owned_compose_container() {
+  local service="${1:?service is required}"
+  local require_running="${2:-true}"
+  local output container_id
+  local -a container_ids=()
+  output="$(docker ps -aq \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${service}")" || {
+    echo "Backup failed: unable to resolve Compose service ${COMPOSE_PROJECT_NAME}/${service}." >&2
+    return 1
+  }
+  while IFS= read -r container_id; do
+    [ -n "${container_id}" ] && container_ids+=("${container_id}")
+  done <<< "${output}"
+  if [ "${#container_ids[@]}" -ne 1 ]; then
+    echo "Backup failed: expected exactly one container for Compose service ${COMPOSE_PROJECT_NAME}/${service}; found ${#container_ids[@]}." >&2
+    return 1
+  fi
+  container_id="${container_ids[0]}"
+  verify_owned_container "${container_id}" "${service}" "${require_running}" || return 1
+  printf '%s\n' "${container_id}"
+}
 
 acquired_lock=0
 cleanup() {
@@ -92,15 +155,13 @@ if [ "${BACKUP_SKIP_LOCK}" != "true" ]; then
   fi
 fi
 
-cd "${REPO_DIR}"
-git config --global --add safe.directory "*" >/dev/null 2>&1 || true
+cd "${PROJECT_DIR}"
 COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-running="$(docker inspect -f '{{.State.Running}}' "${POSTGRES_CONTAINER}" 2>/dev/null || true)"
-if [ "${running}" != "true" ]; then
+if ! POSTGRES_CONTAINER="$(owned_compose_container postgres true)"; then
   cat >&2 <<EOF
-Backup failed: PostgreSQL container '${POSTGRES_CONTAINER}' is not running.
+Backup failed: PostgreSQL service for Compose project '${COMPOSE_PROJECT_NAME}' is unavailable.
 For production predeploy backup this is fail-closed by design. If this is an intentional
 first production deploy with no existing database, set ALLOW_INITIAL_DEPLOY_WITHOUT_DB_BACKUP=true
 on the deploy invocation after confirming there is no data to preserve.
@@ -109,8 +170,10 @@ EOF
 fi
 
 echo "Creating ${BACKUP_KIND} backup '${BACKUP_ID}' for ${ENV_NAME}/${POSTGRES_DB}..."
+POSTGRES_CONTAINER="$(owned_compose_container postgres true)"
 set +e
-docker exec "${POSTGRES_CONTAINER}" sh -c 'pg_dump --format=custom --no-owner --no-privileges -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB}"' | gzip -c > "${TMP_FILE}"
+docker exec "${POSTGRES_CONTAINER}" pg_dump --format=custom --no-owner --no-privileges \
+  -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" | gzip -c > "${TMP_FILE}"
 pipe_status=("${PIPESTATUS[@]}")
 dump_rc=${pipe_status[0]}
 gzip_rc=${pipe_status[1]}
@@ -141,6 +204,7 @@ if command -v pg_restore >/dev/null 2>&1; then
     verification_detail="host pg_restore --list failed"
   fi
 else
+  POSTGRES_CONTAINER="$(owned_compose_container postgres true)"
   if gzip -dc "${BACKUP_FILE}" | docker exec -i "${POSTGRES_CONTAINER}" pg_restore --list > "${VERIFY_LOG}" 2>&1; then
     verification_status="passed"
     verification_detail="container pg_restore --list passed"
@@ -205,10 +269,7 @@ if [ -n "${FIREBASE_BUCKET}" ]; then
   ACCESS_TOKEN=$(python3 -c "
 import json, time, base64, urllib.request, urllib.parse, subprocess, os, tempfile
 
-creds_path = '${FIREBASE_CREDS}'
-client_email = '${FIREBASE_CLIENT}'
-pk_b64 = '${FIREBASE_PK_B64}'
-token_uri = '${FIREBASE_TOKEN_URI}'
+creds_path, client_email, pk_b64, token_uri = __import__('sys').argv[1:5]
 
 if creds_path and os.path.isfile(creds_path):
     with open(creds_path) as f:
@@ -246,11 +307,11 @@ req = urllib.request.Request(token_uri, data=data)
 with urllib.request.urlopen(req) as resp:
     token_data = json.loads(resp.read())
 print(token_data['access_token'])
-" 2>/dev/null || echo "")
+" "${FIREBASE_CREDS}" "${FIREBASE_CLIENT}" "${FIREBASE_PK_B64}" "${FIREBASE_TOKEN_URI}" 2>/dev/null || echo "")
 
   if [ -n "${ACCESS_TOKEN:-}" ]; then
     REMOTE_PATH="backups/${COMPOSE_PROJECT_NAME}/${BACKUP_ID}.dump.gz"
-    ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${REMOTE_PATH}', safe=''))" 2>/dev/null)
+    ENCODED_PATH=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${REMOTE_PATH}" 2>/dev/null)
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
       -X POST \
       -H "Authorization: Bearer ${ACCESS_TOKEN}" \

@@ -24,7 +24,8 @@ export function Settings({ project }: SettingsProps) {
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
   const webhookUrl = `${window.location.origin}/api/projects/${encodeURIComponent(project.id)}/deploy`;
-  const runnerLabel = `self-hosted,linux,x64,project-${project.id},branch-${project.branch_name}`;
+  const environmentLabel = project.branch_name === 'main' ? 'production' : 'development';
+  const runnerLabel = `self-hosted,project-${project.id},${environmentLabel}`;
 
   const workflowYaml = `name: Deploy
 on:
@@ -33,15 +34,21 @@ on:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, x64, project-${project.id}]
+    runs-on: [self-hosted, project-${project.id}, ${environmentLabel}]
     steps:
       - name: Trigger Deploy
         run: |
-          curl -X POST \\
-            -H "Authorization: Bearer \${{ secrets.DEPLOY_CONTROL_TOKEN }}" \\
+          payload=$(jq -n \\
+            --arg ref "\${{ github.ref }}" \\
+            --arg sha "\${{ github.sha }}" \\
+            --arg branch "\${{ github.ref_name }}" \\
+            '{ref:$ref,sha:$sha,branch:$branch,image_tag:("sha-"+$sha),confirmation:"deploy"}')
+          curl --fail-with-body --silent --show-error \\
+            --unix-socket /run/devops-control/devops-control.sock \\
             -H "Content-Type: application/json" \\
-            -d '{"ref": "\${{ github.ref }}", "sha": "\${{ github.sha }}", "branch": "${project.branch_name}", "commit_message": "\${{ github.event.head_commit.message }}"}' \\
-            \${{ secrets.DEPLOY_CONTROL_URL }}/api/projects/${project.id}/deploy`;
+            -H "X-Deploy-Control-Token: \${DEPLOY_CONTROL_TOKEN:?missing scoped token}" \\
+            --data "$payload" \\
+            http://localhost/api/projects/${project.id}/deploy`;
 
   const mutation = useMutation({
     mutationFn: () =>

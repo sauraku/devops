@@ -2,59 +2,71 @@ package api
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
+const sessionLifetime = 12 * time.Hour
+
 type Authenticator struct {
-	token           string
-	tokenDigest     string
-	jwtSecret       []byte
-	cookieSecret    []byte
-	csrfSecret      string
-	cookieSecure    bool
+	token        string
+	cookieSecret []byte
+	cookieSecure bool
 }
 
-func NewAuthenticator(token, jwtSecret, cookieSecret string, cookieSecure bool) *Authenticator {
-	digest := sha256.Sum256([]byte(token))
-	csrfHmac := hmac.New(sha256.New, []byte(token))
-	csrfHmac.Write([]byte("deploy-control-csrf"))
-	csrfSecret := hex.EncodeToString(csrfHmac.Sum(nil))
-
+func NewAuthenticator(token, cookieSecret string, cookieSecure bool) *Authenticator {
 	return &Authenticator{
 		token:        token,
-		tokenDigest:  hex.EncodeToString(digest[:]),
-		jwtSecret:    []byte(jwtSecret),
 		cookieSecret: []byte(cookieSecret),
-		csrfSecret:   csrfSecret,
 		cookieSecure: cookieSecure,
 	}
 }
 
 func (a *Authenticator) VerifyBearerToken(r *http.Request) bool {
 	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") && hmac.Equal([]byte(auth[7:]), []byte(a.token)) {
+	if strings.HasPrefix(auth, "Bearer ") && secureEqual(auth[7:], a.token) {
 		return true
 	}
 	headerToken := r.Header.Get("X-Deploy-Control-Token")
-	if headerToken != "" && hmac.Equal([]byte(headerToken), []byte(a.token)) {
-		return true
-	}
-	return false
+	return headerToken != "" && secureEqual(headerToken, a.token)
+}
+
+func (a *Authenticator) ProjectToken(projectID string) string {
+	mac := hmac.New(sha256.New, []byte(a.token))
+	_, _ = mac.Write([]byte("runner:" + projectID))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (a *Authenticator) VerifyProjectToken(r *http.Request, projectID string) bool {
+	token := strings.TrimSpace(r.Header.Get("X-Deploy-Control-Token"))
+	return token != "" && secureEqual(token, a.ProjectToken(projectID))
 }
 
 func (a *Authenticator) VerifyCookie(r *http.Request) bool {
-	cookie, err := r.Cookie("deploy_control")
-	if err != nil {
-		return false
+	_, ok := a.sessionID(r)
+	return ok
+}
+
+func (a *Authenticator) CSRFToken(r *http.Request) string {
+	sessionID, ok := a.sessionID(r)
+	if !ok {
+		return ""
 	}
-	return hmac.Equal([]byte(cookie.Value), []byte(a.tokenDigest))
+	mac := hmac.New(sha256.New, a.cookieSecret)
+	_, _ = mac.Write([]byte("csrf:" + sessionID))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (a *Authenticator) VerifyCSRF(r *http.Request) bool {
-	return hmac.Equal([]byte(r.Header.Get("X-CSRF-Token")), []byte(a.csrfSecret))
+	want := a.CSRFToken(r)
+	got := strings.TrimSpace(r.Header.Get("X-CSRF-Token"))
+	return want != "" && got != "" && secureEqual(got, want)
 }
 
 func (a *Authenticator) IsAuthed(r *http.Request) bool {
@@ -76,6 +88,15 @@ func (a *Authenticator) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		if r.Method == http.MethodGet {
+			sendLoginPage(w)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
 	token := strings.TrimSpace(r.FormValue("token"))
 	if token == "" {
 		var body map[string]string
@@ -84,25 +105,32 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !hmac.Equal([]byte(token), []byte(a.token)) {
+	if !secureEqual(token, a.token) {
 		sendLoginPage(w)
 		return
 	}
 
-	// Clear any old Secure cookie first, then set compatible one
-	http.SetCookie(w, &http.Cookie{
-		Name:   "deploy_control",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
-	})
+	sessionIDBytes := make([]byte, 32)
+	if _, err := rand.Read(sessionIDBytes); err != nil {
+		internalError(w, fmt.Errorf("generate session: %w", err))
+		return
+	}
+	sessionID := hex.EncodeToString(sessionIDBytes)
+	expires := time.Now().Add(sessionLifetime)
+	payload := sessionID + "." + strconv.FormatInt(expires.Unix(), 10)
+	mac := hmac.New(sha256.New, a.cookieSecret)
+	_, _ = mac.Write([]byte(payload))
+	value := payload + "." + hex.EncodeToString(mac.Sum(nil))
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     "deploy_control",
-		Value:    a.tokenDigest,
+		Value:    value,
 		Path:     "/",
+		Expires:  expires,
+		MaxAge:   int(sessionLifetime.Seconds()),
 		HttpOnly: true,
 		Secure:   a.cookieSecure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -115,17 +143,35 @@ func (a *Authenticator) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   a.cookieSecure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (a *Authenticator) CSRFSecret() string {
-	return a.csrfSecret
+func (a *Authenticator) sessionID(r *http.Request) (string, bool) {
+	cookie, err := r.Cookie("deploy_control")
+	if err != nil {
+		return "", false
+	}
+	parts := strings.Split(cookie.Value, ".")
+	if len(parts) != 3 || len(parts[0]) != 64 {
+		return "", false
+	}
+	expires, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || time.Now().Unix() >= expires {
+		return "", false
+	}
+	payload := parts[0] + "." + parts[1]
+	mac := hmac.New(sha256.New, a.cookieSecret)
+	_, _ = mac.Write([]byte(payload))
+	if !secureEqual(parts[2], hex.EncodeToString(mac.Sum(nil))) {
+		return "", false
+	}
+	return parts[0], true
 }
 
-func (a *Authenticator) Token() string {
-	return a.token
+func secureEqual(a, b string) bool {
+	return hmac.Equal([]byte(a), []byte(b))
 }
 
 func sendLoginPage(w http.ResponseWriter) {
@@ -135,7 +181,7 @@ func sendLoginPage(w http.ResponseWriter) {
 <style>
 body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#08090b;color:#f4f7fb;}
 .login-panel{background:#11161d;padding:2rem;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.36);text-align:center;}
-input{display:block;width:100%;margin:1rem 0;padding:.5rem;background:#1b222d;border:1px solid rgba(212,221,236,.12);color:#f4f7fb;border-radius:4px;}
+input{display:block;width:100%;box-sizing:border-box;margin:1rem 0;padding:.5rem;background:#1b222d;border:1px solid rgba(212,221,236,.12);color:#f4f7fb;border-radius:4px;}
 button{background:#2dd4bf;color:#08090b;border:none;padding:.5rem 2rem;border-radius:4px;cursor:pointer;font-weight:600;}
 </style></head>
 <body><main class="login-panel"><h1>Deploy Control</h1>
@@ -146,5 +192,5 @@ button{background:#2dd4bf;color:#08090b;border:none;padding:.5rem 2rem;border-ra
 </form></main></body></html>`
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(html))
+	_, _ = w.Write([]byte(html))
 }

@@ -20,6 +20,7 @@ FROM docker:24-cli
 RUN apk add --no-cache bash curl gzip python3 openssl py3-jwt py3-cryptography
 COPY --from=go-builder /devops-control /usr/local/bin/devops-control
 COPY deploy/project.sh /usr/local/bin/deploy/project.sh
+COPY deploy/lib.sh /usr/local/bin/deploy/lib.sh
 COPY deploy/runner/docker-compose.runner.yml /usr/local/bin/deploy/runner/docker-compose.runner.yml
 COPY deploy/runner/Dockerfile.runner /usr/local/bin/deploy/runner/Dockerfile.runner
 COPY deploy/runner/entrypoint.sh /usr/local/bin/deploy/runner/entrypoint.sh

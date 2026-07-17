@@ -4,6 +4,7 @@ import type { Project } from '../types';
 import * as api from '../lib/api';
 import { useAnimatedNumber } from '../hooks/useAnimatedNumber';
 import { useToast } from './Toast';
+import { missingRequiredEnvVariables } from '../lib/env';
 import { 
   Play, 
   StopCircle, 
@@ -56,10 +57,7 @@ export function Dashboard({ project }: DashboardProps) {
   });
   const envVars = envData?.variables ?? [];
   const envOverrides = envData?.overrides ?? {};
-  const missingEnvVars = envVars.filter((v) => {
-    const val = envOverrides[v.key] ?? v.default;
-    return !val || val === '' || val === 'change_me';
-  });
+  const missingEnvVars = missingRequiredEnvVariables(envVars, envOverrides);
   const envNotConfigured = envVars.length > 0 && missingEnvVars.length > 0;
 
   const deployMutation = useMutation({
@@ -76,6 +74,15 @@ export function Dashboard({ project }: DashboardProps) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project-status', project.id] });
       toast('Deploy aborted', 'warn');
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const approvalMutation = useMutation({
+    mutationFn: (deployId: string) => api.approveDeployment(project.id, deployId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['project-status', project.id] });
+      toast('Deployment approved and queued', 'success');
     },
     onError: (err: Error) => toast(err.message, 'error'),
   });
@@ -901,7 +908,8 @@ export function Dashboard({ project }: DashboardProps) {
                     const getStatusClass = (statusStr: string) => {
                       if (statusStr === 'success') return 'bg-good text-accent-on font-bold';
                       if (statusStr === 'failed') return 'bg-bad text-accent-on font-bold';
-                      if (statusStr === 'running') return 'bg-warn text-accent-on font-bold';
+                      if (statusStr === 'running' || statusStr === 'pending') return 'bg-warn text-accent-on font-bold';
+                      if (statusStr === 'pending_approval') return 'bg-accent text-accent-on font-bold';
                       return 'bg-muted text-accent-on font-bold';
                     };
 
@@ -924,12 +932,27 @@ export function Dashboard({ project }: DashboardProps) {
                           {d.branch}
                         </td>
                         <td className="p-0 border-r border-line h-11 w-36">
-                          <div className={`w-full h-full flex items-center justify-center text-[10px] uppercase tracking-wider select-none ${getStatusClass(d.status)}`}>
-                            {d.status === 'success' ? 'DONE' : d.status === 'failed' ? 'STUCK' : d.status === 'running' ? 'WORKING' : d.status.toUpperCase()}
-                          </div>
+                          {d.status === 'pending_approval' ? (
+                            <button
+                              type="button"
+                              disabled={approvalMutation.isPending}
+                              onClick={() => {
+                                if (window.confirm(`Approve deployment ${d.id} for ${d.branch}?`)) {
+                                  approvalMutation.mutate(d.id);
+                                }
+                              }}
+                              className={`w-full h-full flex items-center justify-center text-[10px] uppercase tracking-wider ${getStatusClass(d.status)} disabled:opacity-50`}
+                            >
+                              {approvalMutation.isPending && approvalMutation.variables === d.id ? 'QUEUING...' : 'APPROVE'}
+                            </button>
+                          ) : (
+                            <div className={`w-full h-full flex items-center justify-center text-[10px] uppercase tracking-wider select-none ${getStatusClass(d.status)}`}>
+                              {d.status === 'success' ? 'DONE' : d.status === 'failed' ? 'STUCK' : d.status === 'running' ? 'WORKING' : d.status === 'pending' ? 'QUEUED' : d.status.toUpperCase()}
+                            </div>
+                          )}
                         </td>
                         <td className="py-3 px-4 text-muted text-[10px]">
-                          {d.finished_at ? new Date(d.finished_at).toLocaleTimeString() : 'RUNNING...'}
+                          {d.finished_at ? new Date(d.finished_at).toLocaleTimeString() : d.status === 'pending_approval' ? 'AWAITING APPROVAL' : d.status === 'pending' ? 'QUEUED...' : 'RUNNING...'}
                         </td>
                       </tr>
                     );

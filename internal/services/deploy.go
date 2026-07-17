@@ -2,13 +2,14 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,94 +41,177 @@ func NewDeployService(database *db.DB, dockerClient *docker.Client, audit *Audit
 	}
 }
 
+// ReconcileLocks preserves operations that are still running after a control
+// process restart. Dead owners are failed and released; live owners retain the
+// lock until their process exits, then require explicit outcome verification.
+func (s *DeployService) ReconcileLocks() {
+	locks, err := s.db.ListLocks()
+	if err != nil {
+		log.Printf("reconcile locks: %v", err)
+		return
+	}
+	for _, lock := range locks {
+		pid := readLockPID(filepath.Join(s.cfg.DataDir, lock.ProjectID, "deploy-lock", "info"))
+		if pid > 1 && processAlive(pid) {
+			log.Printf("Preserving live %s lock for project %s (pid=%d)", lock.Operation, lock.ProjectID, pid)
+			lockCopy := *lock
+			safeGo("reconcileLock", func() {
+				for processAlive(pid) {
+					time.Sleep(2 * time.Second)
+				}
+				s.failInterruptedOperation(&lockCopy)
+			})
+			continue
+		}
+		s.failInterruptedOperation(lock)
+	}
+}
+
+func (s *DeployService) failInterruptedOperation(lock *models.DeployLock) {
+	now := time.Now().UTC()
+	exitCode := -1
+	_ = s.db.UpdateDeploymentStatus(lock.OperationID, models.DeploymentStatusFailed, &exitCode, &now)
+	_ = s.db.ReleaseLock(lock.ProjectID)
+	_ = os.RemoveAll(filepath.Join(s.cfg.DataDir, lock.ProjectID, "deploy-lock"))
+	s.audit.Log("operation_interrupted", "failed", lock.ProjectID,
+		fmt.Sprintf("operation=%s id=%s controller ownership was interrupted; verify external effects", lock.Operation, lock.OperationID), "")
+}
+
+func readLockPID(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "pid=") {
+			pid, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "pid=")))
+			return pid
+		}
+	}
+	return 0
+}
+
+func processAlive(pid int) bool {
+	if pid <= 1 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
 func (s *DeployService) Deploy(projectID string, req *models.DeployRequest) (*models.Deployment, error) {
-	if !regexp.MustCompile(`^[a-z0-9_.-]+$`).MatchString(projectID) {
-		return nil, fmt.Errorf("invalid project id format: %s", projectID)
+	p, normalized, err := s.prepareRequest(projectID, req)
+	if err != nil {
+		return nil, err
+	}
+	deployment, err := s.createDeployment(p, normalized, models.DeploymentStatusPending)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.startDeployment(deployment, p, models.DeploymentStatusPending); err != nil {
+		now := time.Now().UTC()
+		exitCode := -1
+		_ = s.db.UpdateDeploymentStatus(deployment.ID, models.DeploymentStatusFailed, &exitCode, &now)
+		return nil, err
+	}
+	return deployment, nil
+}
+
+func (s *DeployService) RequestApproval(projectID string, req *models.DeployRequest) (*models.Deployment, error) {
+	p, normalized, err := s.prepareRequest(projectID, req)
+	if err != nil {
+		return nil, err
+	}
+	deployment, err := s.createDeployment(p, normalized, models.DeploymentStatusPendingApproval)
+	if err != nil {
+		return nil, err
+	}
+	s.audit.Log("deploy_pending_approval", "pending", projectID,
+		fmt.Sprintf("deploy=%s ref=%s sha=%s", deployment.ID, deployment.Ref, deployment.SHA), "")
+	return deployment, nil
+}
+
+func (s *DeployService) Approve(projectID, deployID string) (*models.Deployment, error) {
+	deployment, err := s.GetDeployment(projectID, deployID)
+	if err != nil {
+		return nil, err
+	}
+	if deployment.Kind != models.DeploymentKindDeploy {
+		return nil, fmt.Errorf("operation is not a deployment")
+	}
+	if deployment.Status != models.DeploymentStatusPendingApproval {
+		return nil, fmt.Errorf("deployment is not pending manual approval")
 	}
 	p, err := s.db.GetProject(projectID)
 	if err != nil {
 		return nil, fmt.Errorf("project not found: %s", projectID)
 	}
+	request := &models.DeployRequest{
+		Ref:             deployment.Ref,
+		SHA:             deployment.SHA,
+		Branch:          deployment.Branch,
+		ImageTag:        deployment.ImageTag,
+		CommitMessage:   deployment.CommitMessage,
+		GitHubRunID:     deployment.GitHubRunID,
+		GitHubRunNumber: deployment.GitHubRunNumber,
+		GitHubActor:     deployment.GitHubActor,
+		GitHubRepo:      deployment.GitHubRepo,
+		GitHubWorkflow:  deployment.GitHubWorkflow,
+	}
+	if _, err := ValidateDeployRequest(p, request, deployment.GitHubRunID != ""); err != nil {
+		return nil, fmt.Errorf("deployment no longer matches project configuration: %w", err)
+	}
+	if err := s.startDeployment(deployment, p, models.DeploymentStatusPendingApproval); err != nil {
+		return nil, err
+	}
+	deployment.Status = models.DeploymentStatusPending
+	s.audit.Log("deploy_approved", "pending", projectID, fmt.Sprintf("deploy=%s", deployment.ID), "")
+	return deployment, nil
+}
 
-	state, err := s.db.GetProjectState(projectID)
+func (s *DeployService) GetDeployment(projectID, deployID string) (*models.Deployment, error) {
+	deployment, err := s.db.GetDeployment(deployID)
 	if err != nil {
-		return nil, fmt.Errorf("get project state: %w", err)
+		return nil, err
 	}
-	if paused, _ := state["paused"].(bool); paused {
-		return nil, fmt.Errorf("deployments are paused for project %s", projectID)
+	if deployment.ProjectID != projectID {
+		return nil, fmt.Errorf("deployment does not belong to project")
 	}
+	return deployment, nil
+}
 
-	// Best-effort registry login before deploy
-	if pass, err := s.db.GetRegistryPassword(projectID); err == nil && pass != "" {
-		s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, pass)
+func (s *DeployService) prepareRequest(projectID string, req *models.DeployRequest) (*models.Project, *models.DeployRequest, error) {
+	if !regexp.MustCompile(`^[a-z0-9_.-]+$`).MatchString(projectID) {
+		return nil, nil, fmt.Errorf("invalid project id format: %s", projectID)
 	}
+	p, err := s.db.GetProject(projectID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("project not found: %s", projectID)
+	}
+	normalized, err := ValidateDeployRequest(p, req, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p, normalized, nil
+}
 
-	existingLock, _ := s.db.GetLock(projectID)
-	if existingLock != nil {
-		return nil, fmt.Errorf("a %s operation is already in progress (operation: %s)", existingLock.Operation, existingLock.OperationID)
+func (s *DeployService) createDeployment(p *models.Project, req *models.DeployRequest, status models.DeploymentStatus) (*models.Deployment, error) {
+	deployID := fmt.Sprintf("deploy-%s-%d", p.ID, time.Now().UnixNano())
+	logDir := filepath.Join(s.cfg.BaseDir, "Logs", p.ID)
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return nil, fmt.Errorf("create deployment log directory: %w", err)
 	}
-
-	branch := normalizeRef(req.Branch)
-	if branch == "" {
-		branch = p.BranchName
-	}
-	ref := req.Ref
-	sha := req.SHA
-	imageTag := req.ImageTag
-	if imageTag == "" && sha != "" {
-		imageTag = fmt.Sprintf("sha-%s", sha)
-	}
-	if imageTag == "" && ref != "" {
-		imageTag = normalizeRef(ref)
-	}
-	if imageTag == "" {
-		return nil, fmt.Errorf("image_tag, ref, or sha is required for deployment")
-	}
-
-	tagRe := regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
-	if !tagRe.MatchString(imageTag) {
-		return nil, fmt.Errorf("image tag must match Docker tag syntax")
-	}
-
-	deployID := fmt.Sprintf("deploy-%s-%d", projectID, time.Now().UnixMilli())
-	logDir := filepath.Join(s.cfg.BaseDir, "Logs", projectID)
-	os.MkdirAll(logDir, 0o750)
 	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", deployID))
-
-	env := map[string]string{
-		"DEPLOY_ID":           deployID,
-		"DEPLOY_REF":          ref,
-		"DEPLOY_SHA":          sha,
-		"DEPLOY_BRANCH":       branch,
-		"IMAGE_TAG":           imageTag,
-		"PROJECT_ID":          projectID,
-		"REPO_URL":            p.RepoURL,
-		"BASE_DIR":            s.cfg.BaseDir,
-		"GITHUB_RUN_ID":       req.GitHubRunID,
-		"GITHUB_RUN_NUMBER":   req.GitHubRunNumber,
-		"GITHUB_ACTOR":        req.GitHubActor,
-		"GITHUB_REPOSITORY":   req.GitHubRepo,
-		"GITHUB_WORKFLOW":     req.GitHubWorkflow,
-		"COMMIT_MESSAGE":      req.CommitMessage,
-	}
-
-	// Inject user-configured env overrides from .env.template
-	overrides := loadEnvOverrides(s.db, projectID)
-	for k, v := range overrides {
-		if _, exists := env[k]; !exists {
-			env[k] = v
-		}
-	}
 
 	deployment := &models.Deployment{
 		ID:              deployID,
-		ProjectID:       projectID,
+		ProjectID:       p.ID,
 		Kind:            models.DeploymentKindDeploy,
-		Status:          models.DeploymentStatusRunning,
-		Ref:             ref,
-		SHA:             sha,
-		ImageTag:        imageTag,
-		Branch:          branch,
+		Status:          status,
+		Ref:             req.Ref,
+		SHA:             req.SHA,
+		ImageTag:        req.ImageTag,
+		Branch:          req.Branch,
 		CommitMessage:   req.CommitMessage,
 		StartedAt:       time.Now().UTC(),
 		LogPath:         logPath,
@@ -141,27 +225,171 @@ func (s *DeployService) Deploy(projectID string, req *models.DeployRequest) (*mo
 	if err := s.db.CreateDeployment(deployment); err != nil {
 		return nil, fmt.Errorf("create deployment: %w", err)
 	}
+	return deployment, nil
+}
 
+func (s *DeployService) startDeployment(deployment *models.Deployment, p *models.Project, expectedStatus models.DeploymentStatus) error {
+	state, err := s.db.GetProjectState(p.ID)
+	if err != nil {
+		return fmt.Errorf("get project state: %w", err)
+	}
+	if paused, _ := state["paused"].(bool); paused {
+		return fmt.Errorf("deployments are paused for project %s", p.ID)
+	}
+
+	pass, err := s.db.GetRegistryPassword(p.ID)
+	if err != nil {
+		return fmt.Errorf("load registry credentials: %w", err)
+	}
+	if pass != "" {
+		if ok, message := s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, pass); !ok {
+			return fmt.Errorf("registry login failed: %s", message)
+		}
+	}
+
+	env, err := s.deploymentEnv(deployment, p)
+	if err != nil {
+		return err
+	}
 	lock := &models.DeployLock{
-		ProjectID:   projectID,
-		OperationID: deployID,
+		ProjectID:   p.ID,
+		OperationID: deployment.ID,
 		Operation:   "deploy",
 		StartedAt:   deployment.StartedAt.Format(time.RFC3339),
-		SHA:         sha,
-		ImageTag:    imageTag,
-		Branch:      branch,
+		SHA:         deployment.SHA,
+		ImageTag:    deployment.ImageTag,
+		Branch:      deployment.Branch,
 	}
 	if err := s.db.CreateLock(lock); err != nil {
-		// Lock acquisition failed — clean up deployment record
-		_ = s.db.UpdateDeploymentStatus(deployID, models.DeploymentStatusFailed, nil, nil)
-		return nil, fmt.Errorf("acquire lock: %w", err)
+		return fmt.Errorf("acquire lock: %w", err)
+	}
+	if expectedStatus == models.DeploymentStatusPendingApproval {
+		transitioned, err := s.db.TransitionDeploymentStatus(deployment.ID, expectedStatus, models.DeploymentStatusPending)
+		if err != nil || !transitioned {
+			_ = s.db.ReleaseLock(p.ID)
+			if err != nil {
+				return fmt.Errorf("queue approved deployment: %w", err)
+			}
+			return fmt.Errorf("deployment is no longer pending manual approval")
+		}
 	}
 
-	s.audit.Log("deploy_started", "running", projectID, fmt.Sprintf("deploy=%s ref=%s sha=%s", deployID, ref, sha), "")
-
+	s.audit.Log("deploy_started", "pending", p.ID,
+		fmt.Sprintf("deploy=%s ref=%s sha=%s", deployment.ID, deployment.Ref, deployment.SHA), "")
 	safeGo("runDeploy", func() { s.runDeploy(deployment, p, env) })
+	return nil
+}
 
-	return deployment, nil
+func (s *DeployService) deploymentEnv(deployment *models.Deployment, p *models.Project) (map[string]string, error) {
+	env := map[string]string{
+		"DEPLOY_ID":         deployment.ID,
+		"DEPLOY_REF":        deployment.Ref,
+		"DEPLOY_SHA":        deployment.SHA,
+		"DEPLOY_BRANCH":     deployment.Branch,
+		"IMAGE_TAG":         deployment.ImageTag,
+		"PROJECT_ID":        p.ID,
+		"REPO_URL":          p.RepoURL,
+		"REGISTRY_HOST":     p.RegistryHost,
+		"BASE_DIR":          s.cfg.BaseDir,
+		"PROJECT_LOG_DIR":   filepath.Join(s.cfg.BaseDir, "Logs", p.ID),
+		"GITHUB_RUN_ID":     deployment.GitHubRunID,
+		"GITHUB_RUN_NUMBER": deployment.GitHubRunNumber,
+		"GITHUB_ACTOR":      deployment.GitHubActor,
+		"GITHUB_REPOSITORY": deployment.GitHubRepo,
+		"GITHUB_WORKFLOW":   deployment.GitHubWorkflow,
+		"COMMIT_MESSAGE":    deployment.CommitMessage,
+	}
+	overrides, err := s.db.GetProjectEnvOverrides(p.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load project environment: %w", err)
+	}
+	for key, value := range overrides {
+		if _, exists := env[key]; !exists {
+			env[key] = value
+		}
+	}
+	return env, nil
+}
+
+var (
+	dockerTagRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+	commitSHARe = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
+	digitsRE    = regexp.MustCompile(`^[1-9][0-9]*$`)
+)
+
+// ValidateDeployRequest binds a deployment to the branch configured for its
+// project. Scoped runner credentials additionally require complete GitHub
+// callback provenance, so they cannot be reused as general deployment tokens.
+// The returned request is a normalized copy; the caller's request is unchanged.
+func ValidateDeployRequest(p *models.Project, req *models.DeployRequest, requireGitHubProvenance bool) (*models.DeployRequest, error) {
+	if p == nil || req == nil {
+		return nil, fmt.Errorf("project and deployment request are required")
+	}
+
+	normalized := *req
+	configuredBranch := normalizeRef(p.BranchName)
+	if configuredBranch == "" {
+		return nil, fmt.Errorf("project %s has no deployment branch configured", p.ID)
+	}
+	normalized.Branch = normalizeRef(normalized.Branch)
+	if normalized.Branch == "" {
+		normalized.Branch = configuredBranch
+	}
+	if normalized.Branch != configuredBranch {
+		return nil, fmt.Errorf("deployment branch %q does not match configured branch %q", normalized.Branch, configuredBranch)
+	}
+	if normalized.Ref != "" && normalizeRef(normalized.Ref) != configuredBranch {
+		return nil, fmt.Errorf("deployment ref %q does not match configured branch %q", normalized.Ref, configuredBranch)
+	}
+
+	hasGitHubMetadata := normalized.GitHubRunID != "" ||
+		normalized.GitHubRunNumber != "" ||
+		normalized.GitHubActor != "" ||
+		normalized.GitHubRepo != "" ||
+		normalized.GitHubWorkflow != ""
+	if requireGitHubProvenance || hasGitHubMetadata {
+		if err := validateGitHubDeployRequest(p, &normalized, configuredBranch); err != nil {
+			return nil, err
+		}
+	}
+
+	if normalized.ImageTag == "" && normalized.SHA != "" {
+		normalized.ImageTag = "sha-" + normalized.SHA
+	}
+	if normalized.ImageTag == "" && normalized.Ref != "" {
+		normalized.ImageTag = normalizeRef(normalized.Ref)
+	}
+	if normalized.ImageTag == "" {
+		return nil, fmt.Errorf("image_tag, ref, or sha is required for deployment")
+	}
+	if !dockerTagRE.MatchString(normalized.ImageTag) {
+		return nil, fmt.Errorf("image tag must match Docker tag syntax")
+	}
+
+	return &normalized, nil
+}
+
+func validateGitHubDeployRequest(p *models.Project, req *models.DeployRequest, configuredBranch string) error {
+	expectedRepo := repoOwnerRepo(p.RepoURL)
+	if expectedRepo == "" || !strings.EqualFold(strings.TrimSpace(req.GitHubRepo), expectedRepo) {
+		return fmt.Errorf("GitHub repository %q does not match configured repository %q", req.GitHubRepo, expectedRepo)
+	}
+	if req.Ref != "refs/heads/"+configuredBranch {
+		return fmt.Errorf("GitHub ref %q does not match configured branch %q", req.Ref, configuredBranch)
+	}
+	if !commitSHARe.MatchString(req.SHA) {
+		return fmt.Errorf("GitHub deployment SHA must be a full 40-character hexadecimal commit SHA")
+	}
+	if req.ImageTag != "sha-"+req.SHA {
+		return fmt.Errorf("GitHub image tag must exactly match sha-<commit SHA>")
+	}
+	if !digitsRE.MatchString(req.GitHubRunID) || !digitsRE.MatchString(req.GitHubRunNumber) {
+		return fmt.Errorf("GitHub run ID and run number must be positive integers")
+	}
+	if strings.TrimSpace(req.GitHubActor) == "" || strings.TrimSpace(req.GitHubWorkflow) == "" {
+		return fmt.Errorf("GitHub actor and workflow are required")
+	}
+	return nil
 }
 
 func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env map[string]string) {
@@ -196,7 +424,19 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 	err = cmd.Start()
 	if err == nil {
 		s.running.Store(d.ID, deployHandle{cancel: cancel, pid: cmd.Process.Pid})
-		err = cmd.Wait()
+		transitioned, transitionErr := s.db.TransitionDeploymentStatus(d.ID, models.DeploymentStatusPending, models.DeploymentStatusRunning)
+		if transitionErr != nil || !transitioned {
+			cancel()
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+			if transitionErr != nil {
+				err = fmt.Errorf("mark deployment running: %w", transitionErr)
+			} else {
+				err = fmt.Errorf("deployment was cancelled before execution")
+			}
+		} else {
+			err = cmd.Wait()
+		}
 	} else {
 		cancel()
 	}
@@ -217,8 +457,14 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 		status = models.DeploymentStatusFailed
 	}
 
-	_ = s.db.UpdateDeploymentStatus(d.ID, status, &exitCode, &finishedAt)
+	completed, updateErr := s.db.CompleteActiveDeployment(d.ID, status, exitCode, finishedAt)
+	if updateErr != nil {
+		log.Printf("runDeploy: update deployment %s completion: %v", d.ID, updateErr)
+	}
 	_ = s.db.ReleaseLock(p.ID)
+	if !completed {
+		return
+	}
 
 	stateFile, err := s.db.GetProjectState(p.ID)
 	if err != nil || stateFile == nil {
@@ -236,7 +482,7 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 }
 
 func (s *DeployService) Abort(projectID string) error {
-	deployments, err := s.db.GetRunningDeployments(projectID)
+	deployments, err := s.db.GetActiveDeployments(projectID)
 	if err != nil {
 		return err
 	}
@@ -251,13 +497,16 @@ func (s *DeployService) Abort(projectID string) error {
 				syscall.Kill(-handle.pid, syscall.SIGKILL)
 			}
 		}
+		if pid := readLockPID(filepath.Join(s.cfg.DataDir, projectID, "deploy-lock", "info")); pid > 1 && processAlive(pid) {
+			_ = syscall.Kill(-pid, syscall.SIGTERM)
+		}
 		now := time.Now().UTC()
 		ec := -9
 		_ = s.db.UpdateDeploymentStatus(d.ID, models.DeploymentStatusAborted, &ec, &now)
 	}
 	_ = s.db.ReleaseLock(projectID)
 
-	// Also clean up the file-based lock used by deploy scripts
+	// Clean up the file lock after the owning process has been signalled.
 	lockDir := filepath.Join(s.cfg.DataDir, projectID, "deploy-lock")
 	os.RemoveAll(lockDir)
 
@@ -274,8 +523,8 @@ func (s *DeployService) Abort(projectID string) error {
 	return nil
 }
 
-func (s *DeployService) GetLog(deployID string) (string, error) {
-	deployment, err := s.db.GetDeployment(deployID)
+func (s *DeployService) GetLog(projectID, deployID string) (string, error) {
+	deployment, err := s.GetDeployment(projectID, deployID)
 	if err != nil {
 		return "", err
 	}
@@ -291,31 +540,6 @@ func (s *DeployService) GetLog(deployID string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
-}
-
-// loadEnvOverrides reads user-configured env vars from project state
-func loadEnvOverrides(database *db.DB, projectID string) map[string]string {
-	state, err := database.GetProjectState(projectID)
-	if err != nil || state == nil {
-		return nil
-	}
-	raw, _ := state["metadata"].(string)
-	if raw == "" {
-		return nil
-	}
-	var metadata map[string]any
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return nil
-	}
-	env, _ := metadata["env_overrides"].(map[string]any)
-	if env == nil {
-		return nil
-	}
-	out := make(map[string]string, len(env))
-	for k, v := range env {
-		out[k] = fmt.Sprintf("%v", v)
-	}
-	return out
 }
 
 // SafeGo is the exported wrapper for safeGo so main can call it.

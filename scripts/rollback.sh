@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 if [ "$#" -ne 1 ]; then
   echo "Usage: $0 <commit-sha>" >&2
@@ -54,12 +55,31 @@ resolved_branch="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print
 resolved_image_tag="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("image_tag",""))' "${release_json}")"
 rollback_project_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("project_id",""))' "${release_json}")"
 
+if [ -z "${PROJECT_ID}" ] || [ "${rollback_project_id}" != "${PROJECT_ID}" ]; then
+  echo "Rollback refused: release does not belong to project '${PROJECT_ID}'." >&2
+  exit 1
+fi
+
 AUDIT_LOG="${BASE_DIR:-${SERVER_DIR}}/Logs/${rollback_project_id}/deploy-control-audit.log"
 mkdir -p "$(dirname "${AUDIT_LOG}")"
-{
-  printf '{"timestamp":"%s","action":"rollback_requested","commit_sha":"%s","ref":"%s","project_id":"%s","actor":"%s"}\n' \
-    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "${resolved_sha}" "${resolved_branch}" "${rollback_project_id}" "${DEPLOY_ACTOR:-unknown}"
-} >> "${AUDIT_LOG}"
+python3 - "${AUDIT_LOG}" "${resolved_sha}" "${resolved_branch}" "${rollback_project_id}" "${DEPLOY_ACTOR:-unknown}" <<'PY'
+import datetime
+import json
+import sys
 
-IMAGE_TAG="${resolved_image_tag:-sha-${resolved_sha}}" \
+path, commit, ref, project, actor = sys.argv[1:6]
+entry = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "action": "rollback_requested",
+    "commit_sha": commit,
+    "ref": ref,
+    "project_id": project,
+    "actor": actor,
+}
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(entry, sort_keys=True) + "\n")
+PY
+
+DEPLOY_PROCESS_PID="$$" DEPLOY_SHA="${resolved_sha}" DEPLOY_REF="${resolved_branch}" \
+  IMAGE_TAG="${resolved_image_tag:-sha-${resolved_sha}}" \
   "${SERVER_DIR}/deploy/project.sh" "${rollback_project_id}" "${resolved_branch}" "${resolved_image_tag:-sha-${resolved_sha}}"

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { lazy, Suspense, useState, useCallback, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Sidebar } from '../components/Sidebar';
 import { Dashboard } from '../components/Dashboard';
@@ -10,10 +10,13 @@ import { EnvConfig } from '../components/EnvConfig';
 import { ProjectModal } from '../components/ProjectModal';
 import { AestheticsCustomizer } from '../components/AestheticsCustomizer';
 import * as api from '../lib/api';
+import { missingRequiredEnvVariables } from '../lib/env';
 import type { Project } from '../types';
 import { LayoutDashboard, Container, FileText, Archive, Settings2, Flame, AlertTriangle, Box, Plus, RefreshCw, Terminal as TerminalIcon } from 'lucide-react';
 
-import { Terminal } from '../components/Terminal';
+const Terminal = lazy(() =>
+  import('../components/Terminal').then((module) => ({ default: module.Terminal })),
+);
 
 type Tab = 'dashboard' | 'containers' | 'env' | 'backups' | 'settings' | 'terminal' | 'danger';
 
@@ -23,13 +26,14 @@ const tabDefs: { id: Tab; label: string; icon: React.ComponentType<{ size?: numb
   { id: 'env', label: 'Environment', icon: FileText },
   { id: 'backups', label: 'Backups', icon: Archive },
   { id: 'settings', label: 'Settings', icon: Settings2 },
-  { id: 'terminal', label: 'Terminal', icon: TerminalIcon },
   { id: 'danger', label: 'Danger Zone', icon: Flame },
 ];
 
+const terminalTab = { id: 'terminal' as const, label: 'Terminal', icon: TerminalIcon };
+
 function tabFromHash(): Tab {
   const hash = window.location.hash.replace('#', '') as Tab;
-  return tabDefs.map(t => t.id).includes(hash) ? hash : 'dashboard';
+  return [...tabDefs, terminalTab].map(t => t.id).includes(hash) ? hash : 'dashboard';
 }
 
 export function ProjectPage() {
@@ -79,6 +83,16 @@ export function ProjectPage() {
   });
 
   const containerHealth = healthStatus?.containers?.current ?? {};
+	const availableTabs = healthStatus?.capabilities?.terminal
+		? [...tabDefs.slice(0, -1), terminalTab, tabDefs[tabDefs.length - 1]]
+		: tabDefs;
+
+	useEffect(() => {
+		if (activeTab === 'terminal' && healthStatus && !healthStatus.capabilities?.terminal) {
+			setActiveTab('dashboard');
+			window.location.hash = 'dashboard';
+		}
+	}, [activeTab, healthStatus]);
   const totalContainers = Object.keys(containerHealth).length;
   const unhealthyCount = Object.entries(containerHealth).filter(([_, s]) => s !== 'running').length;
 
@@ -90,10 +104,7 @@ export function ProjectPage() {
   });
   const envVars = envTemplateData?.variables ?? [];
   const envOverrides = envTemplateData?.overrides ?? {};
-  const missingEnvVars = envVars.filter((v) => {
-    const val = envOverrides[v.key] ?? v.default;
-    return !val || val === '' || val === 'change_me';
-  });
+  const missingEnvVars = missingRequiredEnvVariables(envVars, envOverrides);
   const envMissingCount = envVars.length > 0 ? missingEnvVars.length : 0;
   const healthStatusIndicator = totalContainers === 0 ? 'neutral'
     : unhealthyCount === 0 ? 'good'
@@ -192,7 +203,7 @@ export function ProjectPage() {
 
               {/* Industrial Card-Index Tab Bar */}
               <div role="tablist" className="flex items-end overflow-x-auto pt-2">
-                {tabDefs.map((tab) => {
+                {availableTabs.map((tab) => {
                   const Icon = tab.icon;
                   const active = activeTab === tab.id;
                   return (
@@ -238,7 +249,11 @@ export function ProjectPage() {
                 {activeTab === 'env' && <EnvConfig project={selectedProject} />}
                 {activeTab === 'backups' && <Backups project={selectedProject} />}
                 {activeTab === 'settings' && <Settings project={selectedProject} />}
-                {activeTab === 'terminal' && <Terminal />}
+                {activeTab === 'terminal' && healthStatus?.capabilities?.terminal && (
+                  <Suspense fallback={<div className="text-xs font-mono text-muted">Loading terminal…</div>}>
+                    <Terminal />
+                  </Suspense>
+                )}
                 {activeTab === 'danger' && <DangerZone project={selectedProject} />}
               </div>
             </div>

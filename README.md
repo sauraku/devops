@@ -1,161 +1,138 @@
 # DevOps Control Plane
 
-Go + React self-hosted DevOps dashboard. Single binary with embedded UI. Deploy Docker Compose projects, manage GitHub Actions runners, backup/restore databases.
+A self-hosted Go and React control plane for Docker Compose projects. The Go binary embeds the UI, stores state in SQLite, serializes operations per project, and owns deploy, backup, restore, runner, and container lifecycle actions.
 
-## Quick Start (Local)
-
-```bash
-./local.sh
-# Token: apple
-# BASE_DIR: ./data (accept default)
-# Opens http://localhost:8787
-```
-
-## Production Deploy
+## Local development
 
 ```bash
-GITHUB_TOKEN=<pat> bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)
+./deploy/local.sh start
 ```
 
-Opens `http://<server-ip>:8787`. Token is saved at `~/.devops-control/.env.prod`.
+The script installs the locked UI dependencies, builds the UI and Go binary, builds the isolated runner image, and starts the portal at `http://127.0.0.1:8787`. Secrets are generated once in the gitignored `.env.local` with mode `0600`. Lifecycle mutations are serialized, the existing portal stays available until replacement builds succeed, and only the exact PID recorded for this checkout may be stopped. An unknown process on the configured port is never evicted.
 
-## Production Teardown
+`./deploy/local.sh status` performs a read-only health check. `./deploy/local.sh stop` stops only the process whose PID and command match this checkout. Neither command rebuilds artifacts or rewrites local configuration.
+
+Run the full static and unit-test suite with:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/teardown.sh)
+make test
 ```
 
-## Adding a Project — Handshake Contract
+## Production bootstrap
 
-To make your project deployable via devops-control, you need:
-
-### Required
-
-1. **Config image** — a Docker image published to GHCR at:
-   ```
-   ghcr.io/<owner>/<repo>-deploy-config:<branch>
-   ```
-   The image must contain these files at `/app/`:
-   - `docker-compose.yml` — Compose file defining your services
-   - `.env.template` — Environment variable template (see rules below)
-
-2. **Application images** — your service images published to GHCR:
-   ```
-   ghcr.io/<owner>/<repo>-<service>:<branch>
-   ```
-   Referenced in your `docker-compose.yml` as `${IMAGE_TAG:-latest}`.
-
-3. **`.env.template` rules:**
-   - Use `change_me` placeholders for secrets (e.g. `POSTGRES_PASSWORD=change_me`)
-   - Do NOT hardcode `DATABASE_URL` — the deploy script generates it from `POSTGRES_PASSWORD`
-   - The template is parsed by devops-control UI for env var configuration
-   - User overrides persist across redeploys
-
-### Optional
-
-4. **`devops.json`** — placed in the project root (local) or config image. Describes services, ports, backup config:
-   ```json
-   {
-     "version": "1",
-     "project_name": "My Project",
-     "compose_file": "docker-compose.prod.yml",
-     "env_template": ".env.template",
-     "services": {
-       "postgres": {
-         "backup": {
-           "database": "myapp",
-           "user": "postgres"
-         }
-       },
-       "backend": {
-         "health": { "port": 9000, "path": "/health" },
-         "restore": {
-           "command": "npx prisma migrate deploy"
-         }
-       },
-       "frontend": {
-         "health": { "port": 3000, "path": "/" }
-       }
-     },
-     "ports": {
-       "main": { "postgres": 5434, "backend": 9001, "frontend": 3001 },
-       "default": { "postgres": 5435, "backend": 9002, "frontend": 3002 }
-     },
-     "env_defaults": {
-       "main": {
-         "NEXT_PUBLIC_API_URL": "https://api.example.com",
-         "COOKIE_SECURE": "true"
-       }
-     },
-     "backup": {
-       "file_paths": ["uploads"],
-       "retention_days": 30,
-       "schedule": "daily"
-     }
-   }
-   ```
-   See full schema at `internal/models/config.go`.
-
-5. **`scripts/backup-db.sh`** — database backup script (called by devops on schedule)
-   - Receives env vars: `COMPOSE_PROJECT_NAME`, `POSTGRES_DB`, `BACKUP_DIR`
-   - Should dump DB to `$BACKUP_DIR`
-
-6. **`scripts/restore-db.sh`** — database restore script (called from UI)
-   - Receives env vars: `COMPOSE_PROJECT_NAME`, `POSTGRES_DB`, `RESTORE_FILE`
-   - Should restore DB from `$RESTORE_FILE`
-
-7. **GitHub Actions self-hosted runner workflow** — for CI/CD auto-deploy:
-   ```yaml
-   - name: Trigger devops deploy
-     run: |
-       curl -s -X POST "http://{server}:8787/api/projects/{project}/deploy" \
-         -H "Content-Type: application/json" \
-         -H "Authorization: Bearer ${{ secrets.DEPLOY_CONTROL_TOKEN }}" \
-         -d '{"ref":"${{ github.ref_name }}","branch":"${{ github.ref_name }}","confirmation":"deploy"}'
-   ```
-   Requires `DEPLOY_CONTROL_TOKEN` secret set in GitHub repo.
-
-## How Devops Finds Your Template
-
-1. **Config image** — `ghcr.io/<owner>/<repo>-deploy-config:<branch>` is pulled and `docker cp` extracts `.env.template` + `docker-compose.yml`
-2. **Local checkout** — falls back to `~/Documents/<project-id>/.env.template` (dev only)
-3. Config image is the recommended approach for production
-
-## Architecture
-
-```
-Go binary → embeds React UI
-├── HTTP API (project CRUD, deploy, backup, runner management)
-├── WebSocket (live log streaming)
-├── Docker SDK (compose, container management)
-└── SQLite (projects, deployments, backups, state)
+```bash
+GITHUB_TOKEN=<github-pat> \
+  bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)
 ```
 
-- **Backend**: Go, SQLite, Docker SDK
-- **Frontend**: React 19, TypeScript, Tailwind v4, TanStack Query, Vite
-- **Deploy**: Docker multi-stage build → GHCR → deploy script pulls and runs
-- **Auth**: Single token → cookie + CSRF
+Bootstrap pulls both `ghcr.io/sauraku/devops:main` and `ghcr.io/sauraku/devops-runner:main`, resolves the pulled artifacts to registry digests, and pins the running controller and future runners to those exact digests. Set `IMAGE` and `RUNNER_IMAGE` to explicit digest references when a release process selects them upstream. The portal is published on `127.0.0.1:8787`; expose it through a TLS reverse proxy instead of publishing it directly to the network. Secrets live in `/opt/devops-control/.env.prod` or the fallback `~/.devops-control/.env.prod`.
 
-## Project Structure
+## Project contract
 
+Each project publishes a config image at:
+
+```text
+ghcr.io/<owner>/<repo>-deploy-config:<image-tag>
 ```
-├── cmd/devops-control/main.go   # Entry point
-├── internal/
-│   ├── api/                     # HTTP handlers, router, auth, WebSocket
-│   │   └── ui/dist/             # Built React app (embedded via go:embed)
-│   ├── db/                      # SQLite schema, queries, crypto
-│   ├── docker/                  # Docker client
-│   ├── models/                  # Data structures
-│   └── services/                # Business logic (project, deploy, backup, audit)
-├── ui/                          # React frontend source
-├── scripts/                     # Backup/restore helper scripts
-├── docker/Dockerfile            # Multi-stage build
-├── deploy/runner/               # Runner image + compose + entrypoint
-├── deploy/bootstrap.sh          # Production bootstrap
-├── deploy/project.sh            # Project deploy (called by Go)
-├── deploy/teardown.sh           # Production cleanup
-├── deploy/local.sh              # Local dev
-├── AGENTS.md                    # Agent reference
-├── docs/DESIGN.md               # Design tokens
-└── README.md                    # This file
+
+The image must contain these files under `/app`:
+
+- `docker-compose.yml`
+- `.env.template`
+- `devops.json`
+
+The config image tag must match the requested application image tag. Runner callbacks supply the immutable `sha-<commit>` tag and are provenance-checked. A manual portal deploy intentionally redeploys the latest built image for the project's configured branch, using the matching mutable branch tag for both application and config images. The deploy is rejected if the config image cannot be pulled or any required file cannot be extracted. Existing cached configuration and application images are never used as a fallback after a pull failure.
+
+The rendered Compose model is checked before it reaches the host Docker daemon. Services may not use privileged mode, host namespaces, added capabilities, devices, non-loopback published ports, or bind mounts outside the project workspace and project log directory.
+
+Environment overrides must be declared in `.env.template`. They are validated as single-line dotenv values and encrypted in SQLite. Existing generated secrets are preserved across deploys. A project may use `devops.json` `environment.operator_required`, `environment.generated_secrets`, `environment.controller_managed`, and `environment.non_secret` to distinguish required operator input, generated credentials, derived values, and operational flags; without this contract, the portal retains its strict legacy blank-template checks. Dotenv files are parsed as data and are never sourced as shell code.
+
+Example `devops.json` restore configuration:
+
+```json
+{
+  "version": "1",
+  "services": {
+    "postgres": {
+      "backup": { "database": "myapp", "user": "postgres" }
+    },
+    "backend": {
+      "health": { "port": 9000, "path": "/health" },
+      "restore": { "command": ["npx", "prisma", "migrate", "deploy"] }
+    }
+  },
+  "logs": {
+    "directory": ".",
+    "container_internal": { "backend": "/logs/backend.log" }
+  }
+}
+```
+
+Restore commands are JSON argument arrays, not shell command strings. Restore creates and verifies a pre-restore backup, stops writers, uses `pg_restore --clean --if-exists --exit-on-error`, and automatically attempts recovery if the requested restore fails.
+
+## GitHub runner deployment path
+
+The per-project runner is intentionally unprivileged. It has no Docker socket, Docker CLI, sudo, SSH keys, project checkout mount, or control-plane data mount. It reaches the controller on the dedicated `devops-control-runners` network (or through the Docker host gateway for native local development) and receives a project-scoped token that authorizes only `POST /api/projects/<same-project>/deploy` and read-only `GET /api/projects/<same-project>/deployments/<operation-id>/status`. Scoped requests must carry complete GitHub provenance matching the project's registered repository and branch, including a full commit SHA and the exact immutable `sha-<commit>` image tag.
+
+The deploy response is asynchronous and returns a stable `operation.id` plus `status_url`. Callers must poll that status until `operation.terminal` is true and treat only `operation.successful: true` with `status: success` as success. The phases are `pending`, `manual_approval`, `running`, and `terminal`. When auto-apply is disabled, the operation remains in `pending_approval` until an authenticated portal session approves that exact operation; approval is a CSRF-protected mutation and is never authorized by the runner token.
+
+```yaml
+deploy:
+  runs-on: [self-hosted, project-myapp, production]
+  steps:
+    - name: Request deployment
+      env:
+        GH_REF: ${{ github.ref }}
+        GH_SHA: ${{ github.sha }}
+        GH_BRANCH: ${{ github.ref_name }}
+        GH_RUN_ID: ${{ github.run_id }}
+        GH_RUN_NUMBER: ${{ github.run_number }}
+        GH_ACTOR: ${{ github.actor }}
+        GH_REPOSITORY: ${{ github.repository }}
+        GH_WORKFLOW: ${{ github.workflow }}
+      run: |
+        payload=$(jq -n \
+          --arg ref "$GH_REF" \
+          --arg sha "$GH_SHA" \
+          --arg branch "$GH_BRANCH" \
+          --arg run_id "$GH_RUN_ID" \
+          --arg run_number "$GH_RUN_NUMBER" \
+          --arg actor "$GH_ACTOR" \
+          --arg repository "$GH_REPOSITORY" \
+          --arg workflow "$GH_WORKFLOW" \
+          '{ref:$ref,sha:$sha,branch:$branch,image_tag:("sha-"+$sha),confirmation:"deploy",
+            github_run_id:$run_id,github_run_number:$run_number,github_actor:$actor,
+            github_repository:$repository,github_workflow:$workflow}')
+        response=$(curl --fail-with-body --silent --show-error \
+          -H "Content-Type: application/json" \
+          -H "X-Deploy-Control-Token: ${DEPLOY_CONTROL_TOKEN:?missing scoped token}" \
+          --data "$payload" \
+          "${DEPLOY_CONTROL_URL:?missing control URL}/api/projects/myapp/deploy")
+        operation_id=$(jq -er '.operation.id' <<<"$response")
+        # Poll the project-scoped status route with a bounded deadline and fail
+        # unless this exact operation reaches terminal success.
+```
+
+## Security model
+
+- Browser login exchanges the master token for a signed, expiring, HttpOnly, SameSite=Strict session cookie.
+- Browser mutations require a per-session CSRF token; the master token is never embedded in HTML or JavaScript.
+- Master bearer authentication remains available for trusted administration automation.
+- Runner tokens, registry passwords, and project environment overrides use separate encrypted records.
+- App and runner container actions resolve exact Docker Compose ownership labels; names and prefixes are not treated as ownership.
+- Operation locks are per project and survive control-plane restarts while the owner process is alive.
+- The browser SSH terminal is disabled by default. Enabling it also requires a valid `SSH_KNOWN_HOSTS` file; unknown host keys are rejected.
+
+## Main paths
+
+```text
+cmd/devops-control/       Go entrypoint and TCP/Unix listeners
+internal/api/             HTTP, session auth, CSRF, WebSocket handlers
+internal/services/        Project, deploy, backup, restore orchestration
+internal/docker/          Docker Compose ownership and policy boundary
+internal/db/              SQLite schema and encrypted storage
+deploy/project.sh         Fail-closed project deployment
+deploy/runner/            Isolated GitHub runner image and Compose model
+scripts/                  Backup, restore, rollback helpers
+ui/                       React frontend
 ```

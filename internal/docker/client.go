@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -171,7 +173,7 @@ func (c *Client) ContainerReadFile(containerName, filePath string) (string, erro
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "docker", "exec", containerName, "cat", filePath)
+	cmd := exec.CommandContext(ctx, "docker", "exec", containerName, "cat", "--", filePath)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("read file %s from container %s: %w", filePath, containerName, err)
@@ -255,10 +257,7 @@ func (c *Client) ComposeUp(composeFile, projectName string, envVars map[string]s
 	cmdArgs = append(cmdArgs, services...)
 
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Env = os.Environ()
-	for k, v := range envVars {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = dockerCommandEnv(envVars)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("compose up failed: %s: %s", err, strings.TrimSpace(string(output)))
@@ -275,16 +274,28 @@ func (c *Client) ComposeUp(composeFile, projectName string, envVars map[string]s
 }
 
 func (c *Client) ComposeDown(composeFile, projectName string, envVars map[string]string) error {
+	return c.ComposeDownWithEnvFile(composeFile, projectName, "", envVars)
+}
+
+func (c *Client) ComposeDownWithEnvFile(composeFile, projectName, envFile string, envVars map[string]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmdArgs := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName, "down", "--remove-orphans")
-	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Env = os.Environ()
-	for k, v := range envVars {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	cmdArgs := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
+	if envFile != "" {
+		if _, err := os.Stat(envFile); err != nil {
+			return fmt.Errorf("use Compose environment file %s: %w", envFile, err)
+		}
+		cmdArgs = append(cmdArgs, "--env-file", envFile)
 	}
-	return cmd.Run()
+	cmdArgs = append(cmdArgs, "down", "--remove-orphans")
+	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+	cmd.Env = dockerCommandEnv(envVars)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("compose down failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func (c *Client) ListContainers(filter string) ([]string, error) {
@@ -302,6 +313,82 @@ func (c *Client) ListContainers(filter string) ([]string, error) {
 	}
 	names := strings.Fields(string(output))
 	return names, nil
+}
+
+// FindComposeContainer returns the single container owned by an exact Compose
+// project and service. Container names are not an ownership signal.
+func (c *Client) FindComposeContainer(projectName, service string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	args := []string{
+		"ps", "-a", "--format", "{{.Names}}",
+		"--filter", "label=com.docker.compose.project=" + projectName,
+		"--filter", "label=com.docker.compose.service=" + service,
+	}
+	output, err := exec.CommandContext(ctx, "docker", args...).Output()
+	if err != nil {
+		return "", fmt.Errorf("list Compose container for %s/%s: %w", projectName, service, err)
+	}
+	names := strings.Fields(string(output))
+	switch len(names) {
+	case 0:
+		return "", nil
+	case 1:
+		return names[0], nil
+	default:
+		return "", fmt.Errorf("multiple containers claim Compose ownership %s/%s: %s", projectName, service, strings.Join(names, ", "))
+	}
+}
+
+func (c *Client) ListComposeContainers(projectName string) ([]string, error) {
+	return c.ListContainers("label=com.docker.compose.project=" + projectName)
+}
+
+// ListComposeProjects returns the distinct exact Compose project labels whose
+// names start with prefix and whose Compose working directory is exactly the
+// supplied project directory. The working-directory check prevents a project
+// such as "foo" from claiming the historical containers of project "foo-bar".
+func (c *Client) ListComposeProjects(prefix, workingDir string) ([]string, error) {
+	containers, err := c.ListContainers("label=com.docker.compose.project")
+	if err != nil {
+		return nil, fmt.Errorf("list Compose projects: %w", err)
+	}
+	wantedDir := filepath.Clean(workingDir)
+	seen := make(map[string]struct{})
+	for _, containerName := range containers {
+		info, err := c.InspectContainer(containerName)
+		if err != nil {
+			return nil, fmt.Errorf("inspect Compose project container %s: %w", containerName, err)
+		}
+		config, _ := info["Config"].(map[string]any)
+		labels, _ := config["Labels"].(map[string]any)
+		project, _ := labels["com.docker.compose.project"].(string)
+		containerWorkingDir, _ := labels["com.docker.compose.project.working_dir"].(string)
+		if strings.HasPrefix(project, prefix) && filepath.Clean(containerWorkingDir) == wantedDir {
+			seen[project] = struct{}{}
+		}
+	}
+	projects := make([]string, 0, len(seen))
+	for project := range seen {
+		projects = append(projects, project)
+	}
+	sort.Strings(projects)
+	return projects, nil
+}
+
+func (c *Client) VerifyComposeOwnership(containerName, projectName, service string) error {
+	info, err := c.InspectContainer(containerName)
+	if err != nil {
+		return err
+	}
+	config, _ := info["Config"].(map[string]any)
+	labels, _ := config["Labels"].(map[string]any)
+	project, _ := labels["com.docker.compose.project"].(string)
+	ownedService, _ := labels["com.docker.compose.service"].(string)
+	if project != projectName || ownedService != service {
+		return fmt.Errorf("container %s is not owned by Compose project %s service %s", containerName, projectName, service)
+	}
+	return nil
 }
 
 func (c *Client) StartContainer(name string) error {
@@ -363,6 +450,23 @@ func (c *Client) UnpauseContainer(name string) error {
 	return nil
 }
 
+func (c *Client) ContainerAction(action, name string) error {
+	switch action {
+	case "start":
+		return c.StartContainer(name)
+	case "stop":
+		return c.StopContainer(name)
+	case "restart":
+		return c.RestartContainer(name)
+	case "pause":
+		return c.PauseContainer(name)
+	case "resume":
+		return c.UnpauseContainer(name)
+	default:
+		return fmt.Errorf("unsupported container action %q", action)
+	}
+}
+
 func (c *Client) ComposeRecreate(composeFile, projectName, envFile string, service string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -376,11 +480,172 @@ func (c *Client) ComposeRecreate(composeFile, projectName, envFile string, servi
 	cmdArgs = append(cmdArgs, "up", "-d", "--force-recreate", service)
 
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Env = os.Environ()
+	cmd.Env = dockerCommandEnv(nil)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("compose recreate service %s failed: %w: %s", service, err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func (c *Client) ValidateComposeConfig(composeFile, projectName, envFile string, allowedRoots []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	args := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
+	}
+	args = append(args, "config", "--format", "json")
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Env = dockerCommandEnv(nil)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("render Compose config: %w", err)
+	}
+	return validateRenderedComposeConfig(output, projectName, allowedRoots)
+}
+
+type composeResourceConfig struct {
+	Name     string `json:"name"`
+	External bool   `json:"external"`
+}
+
+func validateRenderedComposeConfig(output []byte, projectName string, allowedRoots []string) error {
+	var config struct {
+		Services map[string]map[string]any        `json:"services"`
+		Volumes  map[string]composeResourceConfig `json:"volumes"`
+		Networks map[string]composeResourceConfig `json:"networks"`
+	}
+	if err := json.Unmarshal(output, &config); err != nil {
+		return fmt.Errorf("parse rendered Compose config: %w", err)
+	}
+	if projectName == "" {
+		return fmt.Errorf("Compose policy violation: project name is empty")
+	}
+	for kind, resources := range map[string]map[string]composeResourceConfig{
+		"volume":  config.Volumes,
+		"network": config.Networks,
+	} {
+		for logicalName, resource := range resources {
+			if resource.External {
+				return fmt.Errorf("Compose policy violation: %s %s is external", kind, logicalName)
+			}
+			if !strings.HasPrefix(resource.Name, projectName+"_") {
+				return fmt.Errorf("Compose policy violation: %s %s resolves to %q outside Compose project %s", kind, logicalName, resource.Name, projectName)
+			}
+		}
+	}
+	cleanRoots := make([]string, 0, len(allowedRoots))
+	for _, root := range allowedRoots {
+		cleanRoots = append(cleanRoots, resolveExistingPath(root))
+	}
+	for service, cfg := range config.Services {
+		if privileged, _ := cfg["privileged"].(bool); privileged {
+			return fmt.Errorf("Compose policy violation: %s uses privileged mode", service)
+		}
+		for _, field := range []string{"network_mode", "pid", "ipc"} {
+			if value, _ := cfg[field].(string); value != "" {
+				value = strings.TrimSpace(value)
+				if value == "host" {
+					return fmt.Errorf("Compose policy violation: %s uses host %s", service, field)
+				}
+				if strings.HasPrefix(value, "container:") {
+					return fmt.Errorf("Compose policy violation: %s uses %s from another container", service, field)
+				}
+			}
+		}
+		if values, ok := cfg["volumes_from"].([]any); ok {
+			for _, raw := range values {
+				reference, _ := raw.(string)
+				if strings.HasPrefix(reference, "container:") {
+					return fmt.Errorf("Compose policy violation: %s uses volumes_from from another container", service)
+				}
+				referencedService := strings.SplitN(reference, ":", 2)[0]
+				if _, ok := config.Services[referencedService]; !ok {
+					return fmt.Errorf("Compose policy violation: %s uses volumes_from from undeclared service %s", service, referencedService)
+				}
+			}
+		}
+		for _, field := range []string{"cap_add", "devices"} {
+			if values, ok := cfg[field].([]any); ok && len(values) > 0 {
+				return fmt.Errorf("Compose policy violation: %s sets %s", service, field)
+			}
+		}
+		if mounts, ok := cfg["volumes"].([]any); ok {
+			for _, raw := range mounts {
+				mount, _ := raw.(map[string]any)
+				switch mount["type"] {
+				case "bind":
+					source, _ := mount["source"].(string)
+					if !pathWithinAnyRoot(source, cleanRoots) {
+						return fmt.Errorf("Compose policy violation: %s bind-mounts %s outside project roots", service, source)
+					}
+				case "volume":
+					source, _ := mount["source"].(string)
+					if source != "" {
+						if _, ok := config.Volumes[source]; !ok {
+							return fmt.Errorf("Compose policy violation: %s uses undeclared named volume %s", service, source)
+						}
+					}
+				}
+			}
+		}
+		if ports, ok := cfg["ports"].([]any); ok {
+			for _, raw := range ports {
+				port, _ := raw.(map[string]any)
+				hostIP, _ := port["host_ip"].(string)
+				if hostIP != "127.0.0.1" && hostIP != "::1" {
+					return fmt.Errorf("Compose policy violation: %s publishes a port on %q instead of loopback", service, hostIP)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func pathWithinAnyRoot(path string, roots []string) bool {
+	if path == "" {
+		return false
+	}
+	clean := resolveExistingPath(path)
+	for _, root := range roots {
+		resolvedRoot := resolveExistingPath(root)
+		if clean == resolvedRoot || strings.HasPrefix(clean, resolvedRoot+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveExistingPath(path string) string {
+	clean := filepath.Clean(path)
+	ancestor := clean
+	for {
+		if resolved, err := filepath.EvalSymlinks(ancestor); err == nil {
+			relative, relErr := filepath.Rel(ancestor, clean)
+			if relErr == nil {
+				return filepath.Clean(filepath.Join(resolved, relative))
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return clean
+		}
+		ancestor = parent
+	}
+}
+
+func dockerCommandEnv(overrides map[string]string) []string {
+	env := make([]string, 0, len(overrides)+4)
+	for _, key := range []string{"PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG"} {
+		if value := os.Getenv(key); value != "" {
+			env = append(env, key+"="+value)
+		}
+	}
+	for key, value := range overrides {
+		env = append(env, key+"="+value)
+	}
+	return env
 }
 
 func (c *Client) RegistryLogin(host, username, password string) (bool, string) {
@@ -428,5 +693,3 @@ func (c *Client) ComposeServiceNames(composeFile string) ([]string, error) {
 	}
 	return names, nil
 }
-
-

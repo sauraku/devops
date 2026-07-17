@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,52 +24,49 @@ import (
 func main() {
 	cfg := loadConfig()
 
-	if cfg.Token == "" {
-		log.Fatal("DEPLOY_CONTROL_TOKEN is required; deploy-control refuses to start without auth.")
+	if len(cfg.Token) < 32 {
+		log.Fatal("DEPLOY_CONTROL_TOKEN must be at least 32 characters; deploy-control refuses to start with weak auth")
 	}
 
 	os.MkdirAll(cfg.DataDir, 0o750)
 	os.MkdirAll(filepath.Join(cfg.BaseDir, "Logs"), 0o750)
 	os.MkdirAll(filepath.Join(cfg.BaseDir, "Projects"), 0o750)
+	if err := os.MkdirAll(cfg.RunDir, 0o750); err != nil {
+		log.Fatalf("Failed to create controller runtime directory: %v", err)
+	}
+	if err := os.Chmod(cfg.RunDir, 0o750); err != nil {
+		log.Fatalf("Failed to secure controller runtime directory: %v", err)
+	}
+
+	encKey := getEnv("ENCRYPTION_KEY", "")
+	if len(encKey) < 32 {
+		log.Fatal("ENCRYPTION_KEY must be at least 32 characters for encrypting stored credentials and project environment overrides")
+	}
+	db.InitCrypto(encKey)
 
 	database, err := db.Open(cfg.DataDir)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 	defer database.Close()
+	if err := database.MigrateLegacyRunnerTokens(); err != nil {
+		log.Fatalf("migrate legacy runner credentials: %v", err)
+	}
+	if err := database.MigrateLegacyProjectEnvOverrides(); err != nil {
+		log.Fatalf("migrate legacy project environment overrides: %v", err)
+	}
 
 	dockerClient := docker.NewClient()
-
-	// Release any stale locks from a previous process
-	if err := database.ReleaseAllLocks(); err != nil {
-		log.Printf("Warning: failed to release stale locks: %v", err)
-	}
-	// Also clean up file-based lock directories used by deploy scripts
-	if entries, err := os.ReadDir(cfg.DataDir); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() {
-				lockDir := filepath.Join(cfg.DataDir, entry.Name(), "deploy-lock")
-				if _, err := os.Stat(lockDir); err == nil {
-					log.Printf("Cleaning up stale lock: %s", lockDir)
-					os.RemoveAll(lockDir)
-				}
-			}
-		}
-	}
 
 	auditService := services.NewAuditService(database)
 	projectService := services.NewProjectService(database, dockerClient, auditService, cfg)
 	deployService := services.NewDeployService(database, dockerClient, auditService, cfg)
 	backupService := services.NewBackupService(database, dockerClient, auditService, cfg)
 
-	authenticator := api.NewAuthenticator(cfg.Token, cfg.JWTSecret, cfg.CookieSecret, cfg.CookieSecure)
-	encKey := getEnv("ENCRYPTION_KEY", "")
-	if encKey == "" {
-		log.Fatal("ENCRYPTION_KEY is required for encrypting registry passwords")
-	}
-	db.InitCrypto(encKey)
+	authenticator := api.NewAuthenticator(cfg.Token, cfg.CookieSecret, cfg.CookieSecure)
 	handler := api.NewHandler(projectService, deployService, backupService, auditService, authenticator, cfg)
 	router := api.NewRouter(handler, authenticator, cfg)
+	deployService.ReconcileLocks()
 
 	// Seed GITHUB_TOKEN as runner token for default project if provided
 	if cfg.GithubToken != "" {
@@ -81,7 +80,6 @@ func main() {
 	services.SafeGo("backupScheduler", func() { backupService.StartScheduler() })
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	log.Printf("Deploy Control listening on %s", addr)
 
 	server := &http.Server{
 		Addr:              addr,
@@ -90,7 +88,31 @@ func main() {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
+	unixServer := &http.Server{
+		Handler:           router,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	if err := os.Remove(cfg.SocketPath); err != nil && !os.IsNotExist(err) {
+		log.Fatalf("remove stale control socket: %v", err)
+	}
+	unixListener, err := net.Listen("unix", cfg.SocketPath)
+	if err != nil {
+		log.Fatalf("listen on control socket: %v", err)
+	}
+	if err := os.Chmod(cfg.SocketPath, 0o600); err != nil {
+		unixListener.Close()
+		log.Fatalf("set control socket permissions: %v", err)
+	}
+	defer os.Remove(cfg.SocketPath)
+
+	log.Printf("Deploy Control listening on %s and unix://%s", addr, cfg.SocketPath)
 
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -99,10 +121,16 @@ func main() {
 		log.Println("Shutting down...")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		server.Shutdown(ctx)
-		projectService.StopAllRunners()
-		database.ReleaseAllLocks()
+		_ = server.Shutdown(ctx)
+		_ = unixServer.Shutdown(ctx)
 		log.Println("Cleanup done.")
+	}()
+
+	go func() {
+		if err := unixServer.Serve(unixListener); err != nil && err != http.ErrServerClosed {
+			log.Printf("Unix socket server error: %v", err)
+			_ = server.Close()
+		}
 	}()
 
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
@@ -112,23 +140,28 @@ func main() {
 
 func loadConfig() *models.Config {
 	cfg := &models.Config{
-		Token:          getEnv("DEPLOY_CONTROL_TOKEN", ""),
-		Host:           getEnv("DEPLOY_CONTROL_HOST", "127.0.0.1"),
-		Port:           getEnvInt("DEPLOY_CONTROL_PORT", 8787),
-		JWTSecret:      getEnv("JWT_SECRET", "dev-jwt-secret-change-me"),
-		CookieSecret:   getEnv("COOKIE_SECRET", "dev-cookie-secret-change-me"),
+		Token:            getEnv("DEPLOY_CONTROL_TOKEN", ""),
+		Host:             getEnv("DEPLOY_CONTROL_HOST", "127.0.0.1"),
+		Port:             getEnvInt("DEPLOY_CONTROL_PORT", 8787),
+		CookieSecret:     getEnv("COOKIE_SECRET", "dev-cookie-secret-change-me"),
 		DefaultProjectID: getEnv("DEFAULT_PROJECT_ID", ""),
-		BackupSchedule: getEnv("BACKUP_SCHEDULE", "06:00"),
-		BackupRetention: getEnvInt("BACKUP_RETENTION", 30),
-		EnableRestore:   getEnvBool("ENABLE_RESTORE", false),
-		GithubToken:    getEnv("GITHUB_TOKEN", ""),
-		CookieSecure:   getEnvBool("COOKIE_SECURE", false),
+		BackupSchedule:   getEnv("BACKUP_SCHEDULE", "06:00"),
+		BackupRetention:  getEnvInt("BACKUP_RETENTION", 30),
+		EnableRestore:    getEnvBool("ENABLE_RESTORE", false),
+		GithubToken:      getEnv("GITHUB_TOKEN", ""),
+		RunnerImage:      getEnv("RUNNER_IMAGE", "ghcr.io/sauraku/devops-runner:main"),
+		RunnerNetwork:    getEnv("RUNNER_NETWORK", "devops-control-runners"),
+		CookieSecure:     getEnvBool("COOKIE_SECURE", false),
+		EnableTerminal:   getEnvBool("ENABLE_TERMINAL", false),
+		SSHKnownHosts:    getEnv("SSH_KNOWN_HOSTS", ""),
+	}
+	cfg.RunnerControlURL = strings.TrimRight(getEnv("RUNNER_CONTROL_URL", fmt.Sprintf("http://host.docker.internal:%d", cfg.Port)), "/")
+	runnerURL, err := url.Parse(cfg.RunnerControlURL)
+	if err != nil || runnerURL.Host == "" || (runnerURL.Scheme != "http" && runnerURL.Scheme != "https") || runnerURL.User != nil || runnerURL.RawQuery != "" || runnerURL.Fragment != "" {
+		log.Fatal("RUNNER_CONTROL_URL must be an http(s) origin without credentials, query, or fragment")
 	}
 
-	if cfg.JWTSecret == "dev-jwt-secret-change-me" {
-		log.Fatal("JWT_SECRET must be changed from the default. Set a unique secret via environment variable.")
-	}
-	if cfg.CookieSecret == "dev-cookie-secret-change-me" {
+	if cfg.CookieSecret == "dev-cookie-secret-change-me" || len(cfg.CookieSecret) < 32 {
 		log.Fatal("COOKIE_SECRET must be changed from the default. Set a unique secret via environment variable.")
 	}
 
@@ -143,6 +176,8 @@ func loadConfig() *models.Config {
 	}
 	cfg.BaseDir = baseDir
 	cfg.DataDir = filepath.Join(baseDir, "State")
+	cfg.RunDir = filepath.Join(baseDir, "Run")
+	cfg.SocketPath = filepath.Join(cfg.RunDir, "devops-control.sock")
 
 	// ProjectRoot is where scripts (deploy.sh, docker-compose.runner.yml) live
 	exe, _ := os.Executable()

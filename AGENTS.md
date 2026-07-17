@@ -20,7 +20,7 @@
 
 | What | Command |
 |------|---------|
-| **Local dev** | `./deploy/local.sh` (token: `apple`, BASE_DIR: `./data`) |
+| **Local dev** | `./deploy/local.sh start` (generated secrets in ignored `.env.local`, BASE_DIR defaults to `./data`) |
 | **Prod deploy** | `bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)` |
 | **Prod teardown** | `bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/teardown.sh)` |
 | **Devops UI** | `http://localhost:8787` (local) / `http://{server-ip}:8787` (prod) |
@@ -41,18 +41,20 @@ Go binary (cmd/devops-control) — embeds React UI via //go:embed ui/dist
 - **Frontend**: React + TypeScript + Tailwind v4 + TanStack Query + Vite
 - **Docker**: Multi-stage build (node → go → docker:24-cli) → GHCR
 - **Database**: SQLite (no PostgreSQL needed for the control plane itself)
-- **Auth**: Single token → HMAC comparison → cookie (`deploy_control`) + CSRF token
+- **Auth**: Master token login → signed expiring HttpOnly cookie (`deploy_control`) + per-session CSRF token
 
 ## How to Start
 
 ### Local Development
 ```bash
-./deploy/local.sh
-# Prompts: token (type "apple"), BASE_DIR (accept default ./data)
+./deploy/local.sh start
+# Generates strong secrets when absent; BASE_DIR defaults to ./data
 # Builds UI + Go binary, starts on http://localhost:8787
-# Auto-kills old process on port 8787
+# Keeps the old process through successful builds; stops only its exact recorded PID
 # Secrets persisted in .env.local (gitignored)
 ```
+
+Use `./deploy/local.sh status` for a read-only, timeout-bounded health check and `./deploy/local.sh stop` for a serialized, ownership-checked stop. These commands do not rebuild or rewrite `.env.local`, and unknown port owners are never killed.
 
 ### Production Bootstrap
 ```bash
@@ -85,7 +87,7 @@ The `ghcr.io/sauraku/devops:main` image includes:
 
 - Backend binds `127.0.0.1` by default (prod inside Docker uses `0.0.0.0`)
 - Prod `BASE_DIR` must be `/opt/devops-control` (enforced by `-e BASE_DIR`)
-- Runner needs root for Docker socket access (`user: root` in compose)
+- Runner is non-root and has no Docker socket, Docker CLI, sudo, SSH keys, or host project mounts
 - Deploy scripts need `bash`, `curl`, `gzip`, `python3`, `openssl`
 - `.env.template` must NOT have hardcoded `DATABASE_URL` — compose generates it from `POSTGRES_PASSWORD`
 - Data persistence: volume maps `~/.devops-control` → `/opt/devops-control`
@@ -94,11 +96,11 @@ The `ghcr.io/sauraku/devops:main` image includes:
 ## Security Notes
 
 - Devops token is single-password auth (no multi-user)
-- `JWT_SECRET` also serves as encryption key for registry passwords
-- Runner has Docker socket + runs as root (required for Docker-in-Docker)
-- SSH keys mounted read-only into runner container for git access
+- `ENCRYPTION_KEY` protects separate runner, registry, and project-environment records
+- The runner can only call its project-scoped deploy route and read that project's operation status over the dedicated control network with a scoped token
+- The browser session cookie is signed and expiring; the master token is never embedded in UI assets
 - All child processes receive only `PATH` + `HOME` + explicit env vars (not full `os.Environ()`)
-- Deploy locks auto-cleaned on startup (SQL + file-based)
+- Deploy locks are reconciled on startup and preserved while their owner process is alive
 
 ## Common Tasks
 

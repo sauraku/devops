@@ -30,11 +30,6 @@ func Open(dataDir string) (*DB, error) {
 	if err := db.migrate(); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	// Mark deployments left "running" after a crash as failed
-	if _, err := db.Exec(`UPDATE deployments SET status='failed', finished_at=?, exit_code=-1 WHERE status='running'`,
-		time.Now().UTC().Format(time.RFC3339)); err != nil {
-		log.Printf("Failed to mark stale deployments as failed: %v", err)
-	}
 	// Start periodic WAL checkpointing
 	go db.walCheckpointer()
 	return db, nil
@@ -76,7 +71,7 @@ func (db *DB) migrate() error {
 		id TEXT PRIMARY KEY,
 		project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
 		kind TEXT NOT NULL DEFAULT 'deploy',
-		status TEXT NOT NULL DEFAULT 'running',
+		status TEXT NOT NULL DEFAULT 'pending',
 		ref TEXT NOT NULL DEFAULT '',
 		sha TEXT NOT NULL DEFAULT '',
 		image_tag TEXT NOT NULL DEFAULT '',
@@ -151,6 +146,18 @@ func (db *DB) migrate() error {
 	CREATE TABLE IF NOT EXISTS registry_auth (
 		project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
 		registry_password TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS runner_auth (
+		project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+		runner_token TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS project_env (
+		project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+		encrypted_overrides TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	);
 	`

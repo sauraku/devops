@@ -15,12 +15,12 @@ import (
 )
 
 type Handler struct {
-	projects   *services.ProjectService
-	deploys    *services.DeployService
-	backups    *services.BackupService
-	audit      *services.AuditService
-	auth       *Authenticator
-	cfg        *models.Config
+	projects *services.ProjectService
+	deploys  *services.DeployService
+	backups  *services.BackupService
+	audit    *services.AuditService
+	auth     *Authenticator
+	cfg      *models.Config
 }
 
 func NewHandler(
@@ -51,7 +51,6 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DebugInfo(w http.ResponseWriter, r *http.Request) {
 	projects, _ := h.projects.List()
 
-	svcNames := []string{"postgres", "redis", "backend", "storefront"}
 	type projectDebug struct {
 		ID            string
 		Containers    map[string]string
@@ -60,11 +59,10 @@ func (h *Handler) DebugInfo(w http.ResponseWriter, r *http.Request) {
 	var projectDetails []projectDebug
 	for _, p := range projects {
 		pd := projectDebug{ID: p.ID, Containers: make(map[string]string), ServiceHealth: make(map[string]*models.ServiceHealth)}
-		for _, svc := range svcNames {
-			containerName := h.projects.FindContainerName(p.ID, svc, p.BranchName)
-			summary := h.projects.Docker().ContainerSummary(containerName)
-			pd.Containers[svc] = summary.State
-			pd.ServiceHealth[svc] = h.projects.CheckServiceHealth(svc, containerName, summary)
+		status, err := h.projects.Status(p.ID)
+		if err == nil {
+			pd.Containers = status.Containers["current"]
+			pd.ServiceHealth = status.Health
 		}
 		projectDetails = append(projectDetails, pd)
 	}
@@ -81,7 +79,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"projects":          projects,
+		"projects":           projects,
 		"default_project_id": h.cfg.DefaultProjectID,
 	})
 }
@@ -135,27 +133,21 @@ func (h *Handler) ProjectDeploy(w http.ResponseWriter, r *http.Request, projectI
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	normalized, err := services.ValidateDeployRequest(p, &req, isProjectTokenAuth(r))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req = *normalized
 
 	// Check auto_apply - if false and triggered by GitHub, mark as pending
 	if req.GitHubRunID != "" && !p.AutoApply {
-		pending := map[string]any{
-			"ref":              req.Ref,
-			"sha":              req.SHA,
-			"branch":           req.Branch,
-			"commit_message":   req.CommitMessage,
-			"timestamp":        time.Now().UTC().Format(time.RFC3339),
-			"github_run_id":    req.GitHubRunID,
-			"github_run_number": req.GitHubRunNumber,
-			"github_actor":     req.GitHubActor,
-			"github_repository": req.GitHubRepo,
-			"github_workflow":  req.GitHubWorkflow,
+		deployment, err := h.deploys.RequestApproval(projectID, &req)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"ok":             true,
-			"message":        "Deployment is pending manual approval in the DevOps portal.",
-			"pending":        true,
-			"pending_deploy": pending,
-		})
+		writeDeploymentOperation(w, http.StatusAccepted, projectID, deployment)
 		return
 	}
 
@@ -165,9 +157,42 @@ func (h *Handler) ProjectDeploy(w http.ResponseWriter, r *http.Request, projectI
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok":        true,
-		"operation": deployment,
+	writeDeploymentOperation(w, http.StatusAccepted, projectID, deployment)
+}
+
+func (h *Handler) ProjectDeploymentStatus(w http.ResponseWriter, r *http.Request, projectID, deployID string) {
+	deployment, err := h.deploys.GetDeployment(projectID, deployID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "deployment not found")
+		return
+	}
+	writeDeploymentOperation(w, http.StatusOK, projectID, deployment)
+}
+
+func (h *Handler) ProjectApproveDeployment(w http.ResponseWriter, r *http.Request, projectID, deployID string) {
+	var req models.DeploymentApprovalRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	expected := "approve " + deployID
+	if strings.TrimSpace(req.Confirmation) != expected {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("approval requires the exact confirmation phrase: %q", expected))
+		return
+	}
+	deployment, err := h.deploys.Approve(projectID, deployID)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeDeploymentOperation(w, http.StatusAccepted, projectID, deployment)
+}
+
+func writeDeploymentOperation(w http.ResponseWriter, status int, projectID string, deployment *models.Deployment) {
+	writeJSON(w, status, map[string]any{
+		"ok":         true,
+		"operation":  models.NewDeploymentOperation(deployment),
+		"status_url": fmt.Sprintf("/api/projects/%s/deployments/%s/status", projectID, deployment.ID),
 	})
 }
 
@@ -345,7 +370,7 @@ func (h *Handler) ProjectRestoreDryRun(w http.ResponseWriter, r *http.Request, p
 		"backup":          result.Backup,
 		"restore_enabled": true,
 		"plan":            plan,
-		"tables":           result.TableList,
+		"tables":          result.TableList,
 		"actual_restore":  "disabled in this build; no database mutation was attempted",
 	})
 }
@@ -553,7 +578,10 @@ func (h *Handler) ProjectContainerLogFiles(w http.ResponseWriter, r *http.Reques
 	}
 	var logs []map[string]string
 	for svc, path := range containerLogs {
-		containerName := h.projects.FindContainerName(p.ID, svc, p.BranchName)
+		containerName, ownerErr := h.projects.OwnedContainerName(p, svc)
+		if ownerErr != nil {
+			continue
+		}
 		content, readErr := h.projects.Docker().ContainerReadFile(containerName, path)
 		size := 0
 		if readErr == nil {
@@ -584,7 +612,11 @@ func (h *Handler) ProjectContainerLogFileContent(w http.ResponseWriter, r *http.
 		writeText(w, http.StatusOK, "No log file configured for this service.\n")
 		return
 	}
-	containerName := h.projects.FindContainerName(p.ID, service, p.BranchName)
+	containerName, err := h.projects.OwnedContainerName(p, service)
+	if err != nil {
+		writeText(w, http.StatusNotFound, "Container is not available.\n")
+		return
+	}
 	content, err := h.projects.Docker().ContainerReadFile(containerName, filePath)
 	if err != nil {
 		writeText(w, http.StatusOK, fmt.Sprintf("Log file not available: %s\n", err))
@@ -604,7 +636,11 @@ func (h *Handler) ProjectContainerLogs(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 
-	containerName := h.projects.FindContainerName(p.ID, service, p.BranchName)
+	containerName, err := h.projects.OwnedContainerName(p, service)
+	if err != nil {
+		writeText(w, http.StatusNotFound, "Container is not available.\n")
+		return
+	}
 	tail := 100
 	if t := queryParam(r, "tail"); t != "" {
 		if v, err := strconv.Atoi(t); err == nil && v > 0 && v <= 10000 {
@@ -620,7 +656,7 @@ func (h *Handler) ProjectContainerLogs(w http.ResponseWriter, r *http.Request, p
 func (h *Handler) ProjectDeploymentLog(w http.ResponseWriter, r *http.Request, projectID, deployID string) {
 	// Sanitize deployID to prevent path traversal
 	safeDeployID := filepath.Base(deployID)
-	logContent, err := h.deploys.GetLog(safeDeployID)
+	logContent, err := h.deploys.GetLog(projectID, safeDeployID)
 	if err != nil {
 		p, pErr := h.projects.Get(projectID)
 		if pErr != nil {
@@ -670,7 +706,7 @@ func (h *Handler) ProjectSaveEnvConfig(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	if err := h.projects.SaveEnvConfig(projectID, body.Overrides); err != nil {
-		internalError(w, err)
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -679,5 +715,3 @@ func (h *Handler) ProjectSaveEnvConfig(w http.ResponseWriter, r *http.Request, p
 func (h *Handler) updateProjectState(projectID string, state map[string]any) error {
 	return h.projects.UpdateProjectState(projectID, state)
 }
-
-

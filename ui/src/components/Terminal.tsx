@@ -61,7 +61,8 @@ export function Terminal() {
         return;
       }
       if (text.startsWith('ERROR:') || text.includes('WARNING:')) {
-        setError(text.replace(/\x1b\[[0-9;]*m/g, ''));
+        const ansiColor = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+        setError(text.replace(ansiColor, ''));
       }
       resetTimer();
       xtermRef.current?.write(text);
