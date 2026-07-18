@@ -62,6 +62,36 @@ func TestComposeDownTimeoutCoversStatefulServiceGracePeriod(t *testing.T) {
 	}
 }
 
+func TestRemoveComposeVolumesOnlyRemovesVolumesWithProjectLabel(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	dockerStub := filepath.Join(dir, "docker")
+	stub := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" >> \"" + argsFile + "\"\n" +
+		"if [ \"$1\" = volume ] && [ \"$2\" = ls ]; then printf '%s\\n' project-main_postgres_data project-main_redis_data; fi\n"
+	if err := os.WriteFile(dockerStub, []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := (&Client{}).RemoveComposeVolumes("project-main"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(data)
+	if !strings.Contains(args, "volume\nls\n--filter\nlabel=com.docker.compose.project=project-main\n--format\n{{.Name}}\n") {
+		t.Fatalf("volume listing did not use the exact project label: %q", args)
+	}
+	for _, volume := range []string{"project-main_postgres_data", "project-main_redis_data"} {
+		if !strings.Contains(args, "volume\nrm\n"+volume+"\n") {
+			t.Fatalf("project volume %s was not removed: %q", volume, args)
+		}
+	}
+}
+
 func TestValidateRenderedComposeConfigAllowsProjectNamedVolumes(t *testing.T) {
 	config := []byte(`{
 		"networks": {"medusa-net": {"name": "medusa-main_medusa-net"}},

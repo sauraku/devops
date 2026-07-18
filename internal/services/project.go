@@ -331,6 +331,10 @@ func (s *ProjectService) Delete(projectID string) error {
 	if err := s.stopRunner(p); err != nil {
 		return err
 	}
+	runnerComposeProject := fmt.Sprintf("devops-runner-%s", p.ID)
+	if err := s.docker.RemoveComposeVolumes(runnerComposeProject); err != nil {
+		return fmt.Errorf("remove runner volumes for %s: %w", runnerComposeProject, err)
+	}
 	for composeProject, envFile := range composeProjects {
 		if _, err := os.Stat(composeFile); err == nil {
 			if _, envErr := os.Stat(envFile); envErr != nil {
@@ -368,6 +372,9 @@ func (s *ProjectService) Delete(projectID string) error {
 		}
 		if len(remaining) > 0 {
 			return fmt.Errorf("refusing to delete project data while owned containers remain for %s: %s", composeProject, strings.Join(remaining, ", "))
+		}
+		if err := s.docker.RemoveComposeVolumes(composeProject); err != nil {
+			return fmt.Errorf("remove Compose volumes for %s: %w", composeProject, err)
 		}
 	}
 

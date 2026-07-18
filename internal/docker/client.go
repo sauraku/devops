@@ -304,6 +304,37 @@ func (c *Client) ComposeDownWithEnvFile(composeFile, projectName, envFile string
 	return nil
 }
 
+// RemoveComposeVolumes removes only Docker volumes that Compose labelled as
+// belonging to projectName. Project deletion calls this after Compose has
+// stopped and verified removal of its containers. Using labels rather than
+// `compose down --volumes` keeps a changed or malformed Compose file from
+// naming an unrelated host volume for removal.
+func (c *Client) RemoveComposeVolumes(projectName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	list := exec.CommandContext(ctx, "docker", "volume", "ls",
+		"--filter", "label=com.docker.compose.project="+projectName,
+		"--format", "{{.Name}}")
+	output, err := list.Output()
+	if err != nil {
+		return fmt.Errorf("list Compose volumes for %s: %w", projectName, err)
+	}
+
+	for _, volume := range strings.Fields(string(output)) {
+		remove := exec.CommandContext(ctx, "docker", "volume", "rm", volume)
+		removeOutput, err := remove.CombinedOutput()
+		if err != nil {
+			message := strings.TrimSpace(string(removeOutput))
+			if strings.Contains(strings.ToLower(message), "no such volume") {
+				continue
+			}
+			return fmt.Errorf("remove Compose volume %s for %s: %w: %s", volume, projectName, err, message)
+		}
+	}
+	return nil
+}
+
 func (c *Client) ListContainers(filter string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
