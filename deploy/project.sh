@@ -404,7 +404,10 @@ fi
 
 # Render and validate the effective Compose model before granting it access to
 # the host Docker daemon. The rendered file contains secrets and is ephemeral.
-compose_config_json=$(mktemp "${STATE_DIR}/compose-config.XXXXXX.json")
+# The controller runtime is Alpine/BusyBox, whose mktemp only accepts a
+# template ending in X characters. The file is parsed by content, so it does
+# not need a .json suffix.
+compose_config_json=$(mktemp "${STATE_DIR}/compose-config.XXXXXX")
 if ! "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" config --format json > "${compose_config_json}"; then
   echo "Error: Compose config is invalid or this Compose version cannot emit JSON." >&2
   exit 1

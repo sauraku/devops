@@ -184,6 +184,24 @@ SMTP_HOST=
 	}
 }
 
+func TestProjectScriptUsesBusyBoxCompatibleMktempTemplates(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "project.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+
+	// The production controller image is Alpine-based and therefore uses
+	// BusyBox mktemp, which accepts templates only when the X sequence is at
+	// the end of the pathname.
+	if !strings.Contains(script, `mktemp "${STATE_DIR}/compose-config.XXXXXX"`) {
+		t.Fatal("project deploy script does not use a BusyBox-compatible compose-config mktemp template")
+	}
+	if strings.Contains(script, "compose-config.XXXXXX.json") {
+		t.Fatal("project deploy script appends an extension after the mktemp X template")
+	}
+}
+
 func TestProjectAppDirMustStayInsideProjectsRoot(t *testing.T) {
 	baseDir := t.TempDir()
 	projectsDir := filepath.Join(baseDir, "Projects")
