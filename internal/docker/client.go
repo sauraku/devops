@@ -18,6 +18,12 @@ type Client struct {
 	composeBinary string
 }
 
+// Compose can take longer than the default Docker stop grace period while it
+// concurrently stops stateful services. Keep deletion and runner teardown
+// bounded, but do not kill Compose after it has successfully removed resources
+// and before it has returned its final success status.
+const composeDownTimeout = 2 * time.Minute
+
 func NewClient() *Client {
 	c := &Client{}
 	c.detectComposeBinary()
@@ -278,7 +284,7 @@ func (c *Client) ComposeDown(composeFile, projectName string, envVars map[string
 }
 
 func (c *Client) ComposeDownWithEnvFile(composeFile, projectName, envFile string, envVars map[string]string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), composeDownTimeout)
 	defer cancel()
 
 	cmdArgs := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
