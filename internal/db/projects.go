@@ -444,6 +444,18 @@ func (db *DB) MigrateLegacyProjectEnvOverrides() error {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, candidate := range candidates {
+		// Older controllers could persist an empty string rather than the
+		// schema default `{}`. It contains no legacy overrides to preserve, so
+		// normalize it before attempting the JSON migration. Do not extend this
+		// to non-empty malformed data: that could discard plaintext overrides,
+		// and the transaction must remain atomic in that case.
+		if strings.TrimSpace(candidate.metadata) == "" {
+			if _, err := tx.Exec("UPDATE project_state SET metadata = '{}' WHERE project_id = ?", candidate.projectID); err != nil {
+				return fmt.Errorf("normalize empty project_state metadata for %s: %w", candidate.projectID, err)
+			}
+			continue
+		}
+
 		var metadata map[string]any
 		if err := json.Unmarshal([]byte(candidate.metadata), &metadata); err != nil {
 			return fmt.Errorf("decode project_state metadata for %s: %w", candidate.projectID, err)

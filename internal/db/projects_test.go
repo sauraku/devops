@@ -156,3 +156,31 @@ func TestMigrateLegacyProjectEnvOverridesRollsBackOnInvalidRow(t *testing.T) {
 		t.Fatal("plaintext source was removed despite transaction rollback")
 	}
 }
+
+func TestMigrateLegacyProjectEnvOverridesNormalizesBlankMetadata(t *testing.T) {
+	InitCrypto(strings.Repeat("b", 64))
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	project := &models.Project{ID: "legacy-empty", Name: "Legacy Empty", BranchName: "main"}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertProjectState(project.ID, map[string]any{"metadata": "   "}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.MigrateLegacyProjectEnvOverrides(); err != nil {
+		t.Fatalf("blank legacy metadata must not prevent controller startup: %v", err)
+	}
+	state, err := database.GetProjectState(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state["metadata"]; got != "{}" {
+		t.Fatalf("normalized metadata = %#v, want {}", got)
+	}
+}
