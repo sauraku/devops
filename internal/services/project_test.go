@@ -52,6 +52,72 @@ func TestProjectDeleteRefusesAnActiveOperationBeforeDockerMutation(t *testing.T)
 	}
 }
 
+func TestTeardownEnvironmentUsesOverridesAndSafePlaceholders(t *testing.T) {
+	db.InitCrypto(strings.Repeat("t", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	baseDir := t.TempDir()
+	appDir := filepath.Join(baseDir, "Projects", "medusa")
+	if err := os.MkdirAll(appDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, ".env.template"), []byte(`POSTGRES_PORT=
+REDIS_URL=
+COOKIE_SECURE=
+JWT_SECRET=
+NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY=
+PRESERVED=template
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := &models.Project{ID: "medusa", Name: "Medusa", BranchName: "main", AppDir: appDir}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SaveProjectEnvOverrides(project.ID, map[string]string{
+		"PRESERVED":  "operator-value",
+		"JWT_SECRET": "saved-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewProjectService(database, docker.NewClient(), NewAuditService(database), &models.Config{BaseDir: baseDir})
+	values, err := service.teardownEnvironment(project, "medusa-main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range values {
+		if value == "" {
+			t.Fatalf("teardown environment left %s empty", key)
+		}
+	}
+	if got := values["POSTGRES_PORT"]; got != "1" {
+		t.Fatalf("POSTGRES_PORT placeholder = %q", got)
+	}
+	if got := values["REDIS_URL"]; got != "http://teardown.invalid" {
+		t.Fatalf("REDIS_URL placeholder = %q", got)
+	}
+	if got := values["COOKIE_SECURE"]; got != "false" {
+		t.Fatalf("COOKIE_SECURE placeholder = %q", got)
+	}
+	if got := values["JWT_SECRET"]; got != "saved-secret" {
+		t.Fatalf("saved JWT_SECRET was not preserved")
+	}
+	if got := values["PRESERVED"]; got != "operator-value" {
+		t.Fatalf("saved override = %q", got)
+	}
+	if got := values["COMPOSE_PROJECT_NAME"]; got != "medusa-main" {
+		t.Fatalf("COMPOSE_PROJECT_NAME = %q", got)
+	}
+	if got := values["ENV_NAME"]; got != "main" {
+		t.Fatalf("ENV_NAME = %q", got)
+	}
+}
+
 func TestProjectAndBranchSlugs(t *testing.T) {
 	service := &ProjectService{}
 	if got := service.SlugID(" Medusa Store "); got != "medusa-store" {

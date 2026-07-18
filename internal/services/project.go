@@ -339,7 +339,22 @@ func (s *ProjectService) Delete(projectID string) error {
 					return fmt.Errorf("inspect Compose project %s: %w", composeProject, listErr)
 				}
 				if len(containers) > 0 {
-					return fmt.Errorf("refusing to stop Compose project %s without its environment file %s", composeProject, envFile)
+					// A project can have pre-existing Compose-owned containers but no
+					// generated branch environment yet (for example when it was
+					// registered before its first deploy). Compose still needs every
+					// interpolation value to parse the file for `down`. Build a
+					// short-lived, non-persistent environment from the committed
+					// template and saved operator overrides. It is used only to tear
+					// down the exact Compose project selected above; it never becomes
+					// the project's deployment environment.
+					teardownEnv, teardownErr := s.teardownEnvironment(p, composeProject)
+					if teardownErr != nil {
+						return fmt.Errorf("prepare teardown environment for Compose project %s: %w", composeProject, teardownErr)
+					}
+					if err := s.docker.ComposeDownWithEnvFile(composeFile, composeProject, filepath.Join(projectDir, ".env.template"), teardownEnv); err != nil {
+						return fmt.Errorf("stop Compose project %s with temporary environment: %w", composeProject, err)
+					}
+					continue
 				}
 				continue
 			}
@@ -378,6 +393,67 @@ func (s *ProjectService) Delete(projectID string) error {
 	}
 	s.audit.Log("project_delete", "ok", projectID, "Project deleted and cleaned up.", "")
 	return nil
+}
+
+// teardownEnvironment creates a complete process-only environment for
+// `docker compose down` when a project's generated branch env file does not
+// exist. Compose parses the model before it removes label-owned resources, so
+// every interpolation must be non-empty. The returned values are never
+// persisted; real saved overrides take precedence and blank variables receive
+// type-safe inert placeholders solely for Compose interpolation.
+func (s *ProjectService) teardownEnvironment(p *models.Project, composeProject string) (map[string]string, error) {
+	templatePath := filepath.Join(p.AppDir, ".env.template")
+	data, err := os.ReadFile(templatePath)
+	if err != nil {
+		return nil, fmt.Errorf("read environment template: %w", err)
+	}
+
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		if !envKeyRE.MatchString(key) {
+			return nil, fmt.Errorf("invalid environment key %q in template", key)
+		}
+		values[key] = strings.TrimSpace(parts[1])
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("environment template declares no variables")
+	}
+
+	for key, value := range s.loadEnvOverrides(p.ID) {
+		if _, declared := values[key]; declared {
+			values[key] = value
+		}
+	}
+	for key, value := range values {
+		if strings.TrimSpace(value) == "" {
+			values[key] = teardownPlaceholder(key)
+		}
+	}
+	values["COMPOSE_PROJECT_NAME"] = composeProject
+	values["ENV_NAME"] = branchSlug(p.BranchName)
+	return values, nil
+}
+
+func teardownPlaceholder(key string) string {
+	switch {
+	case strings.HasSuffix(key, "_PORT"):
+		return "1"
+	case strings.HasSuffix(key, "_URL") || strings.HasSuffix(key, "_CORS"):
+		return "http://teardown.invalid"
+	case strings.HasSuffix(key, "_SECURE"), strings.HasPrefix(key, "ALLOW_"), strings.HasPrefix(key, "RESET_"), strings.HasSuffix(key, "_CONFIRMED"), strings.HasSuffix(key, "_APPROVED"):
+		return "false"
+	default:
+		return "teardown-placeholder"
+	}
 }
 
 func (s *ProjectService) Status(projectID string) (*models.ProjectStatus, error) {
