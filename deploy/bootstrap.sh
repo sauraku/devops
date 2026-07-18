@@ -268,11 +268,22 @@ if docker inspect "$CONTAINER" >/dev/null 2>&1; then
 fi
 
 echo "==> Starting devops-control"
+
+# Determine host user UID/GID and docker socket GID so the container
+# can write to the mounted data directory and access the Docker socket
+# despite --cap-drop ALL (which prevents uid-0 from bypassing file
+# permissions on files owned by other users).
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+DOCKER_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo '')"
+
 docker run -d \
   --name "$CONTAINER" \
   --restart unless-stopped \
   --pull never \
   --label com.sauraku.devops.role=control \
+  --user "${HOST_UID}:${HOST_GID}" \
+  --group-add "${DOCKER_GID:-$(getent group docker | cut -d: -f3)}" \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --read-only \
