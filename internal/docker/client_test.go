@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPathWithinAnyRootResolvesSymlinkAncestors(t *testing.T) {
@@ -48,6 +49,16 @@ func TestComposeDownUsesProjectEnvironmentFile(t *testing.T) {
 	args := string(data)
 	if !strings.Contains(args, "--env-file\n"+envFile+"\ndown\n--remove-orphans\n") {
 		t.Fatalf("compose arguments did not include the environment file before down: %q", args)
+	}
+}
+
+func TestComposeDownTimeoutCoversStatefulServiceGracePeriod(t *testing.T) {
+	// Docker's default graceful-stop period is 10 seconds, and Compose must wait
+	// for several stateful services to finish their shutdown before returning.
+	// Keep a substantial budget so a successful teardown cannot be killed just
+	// before Compose emits its final success status.
+	if composeDownTimeout < 2*time.Minute {
+		t.Fatalf("compose down timeout = %s, want at least %s", composeDownTimeout, 2*time.Minute)
 	}
 }
 
