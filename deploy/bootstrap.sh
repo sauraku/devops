@@ -285,7 +285,7 @@ docker run -d \
   --env-file "$ENV_FILE" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$DATA_DIR":"$DATA_DIR" \
-  -p "127.0.0.1:${HOST_PORT}:8787" \
+  -p "${HOST_PORT}:8787" \
   "$IMAGE"
 
 echo "==> Done. Container: $CONTAINER"
