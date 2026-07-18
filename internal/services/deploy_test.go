@@ -1,6 +1,7 @@
 package services
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,6 +93,51 @@ func TestValidateDeployRequestDoesNotMutateCaller(t *testing.T) {
 	}
 }
 
+func TestDeploymentProcessEnvPreservesControllerDockerAuthAndBlocksProjectControlOverrides(t *testing.T) {
+	t.Setenv("PATH", "/controller/bin")
+	t.Setenv("HOME", "/controller/home")
+	t.Setenv("DOCKER_CONFIG", "/tmp/controller-docker-config")
+	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+	t.Setenv("DOCKER_CONTEXT", "controller")
+
+	values := map[string]string{}
+	for _, entry := range deploymentProcessEnv(map[string]string{
+		"NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY": "pk_test",
+		"DEPLOY_ID":                          "deploy-123",
+		"PATH":                               "/project/bin",
+		"HOME":                               "/project/home",
+		"DOCKER_CONFIG":                      "/project/docker-config",
+		"DOCKER_HOST":                        "tcp://untrusted:2375",
+		"PROJECT_ENV_FILE":                   "/tmp/untrusted.env",
+		"BASH_ENV":                           "/tmp/untrusted-bashrc",
+	}) {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 {
+			t.Fatalf("invalid environment entry %q", entry)
+		}
+		values[parts[0]] = parts[1]
+	}
+
+	for key, want := range map[string]string{
+		"PATH":                               "/controller/bin",
+		"HOME":                               "/controller/home",
+		"DOCKER_CONFIG":                      "/tmp/controller-docker-config",
+		"DOCKER_HOST":                        "unix:///var/run/docker.sock",
+		"DOCKER_CONTEXT":                     "controller",
+		"DEPLOY_ID":                          "deploy-123",
+		"NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY": "pk_test",
+	} {
+		if got := values[key]; got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+	for _, key := range []string{"PROJECT_ENV_FILE", "BASH_ENV"} {
+		if _, found := values[key]; found {
+			t.Fatalf("project override for reserved key %s was passed to deployment", key)
+		}
+	}
+}
+
 func TestPendingApprovalRunsSameDeploymentToTerminalSuccess(t *testing.T) {
 	root := t.TempDir()
 	database, err := db.Open(filepath.Join(root, "state"))
@@ -108,8 +154,11 @@ func TestPendingApprovalRunsSameDeploymentToTerminalSuccess(t *testing.T) {
 	if err := os.MkdirAll(scriptDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
+	controllerDockerConfig := filepath.Join(root, "docker-config")
+	t.Setenv("DOCKER_CONFIG", controllerDockerConfig)
 	script := filepath.Join(scriptDir, "project.sh")
-	if err := os.WriteFile(script, []byte("#!/usr/bin/env bash\nset -euo pipefail\ntest -n \"${DEPLOY_ID:-}\"\nsleep 0.1\n"), 0o750); err != nil {
+	scriptBody := fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\ntest -n \"${DEPLOY_ID:-}\"\ntest \"${DOCKER_CONFIG:-}\" = %q\nsleep 0.1\n", controllerDockerConfig)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o750); err != nil {
 		t.Fatal(err)
 	}
 

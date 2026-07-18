@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -404,10 +405,7 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = appDir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = deploymentProcessEnv(env)
 
 	logFile, err := os.Create(d.LogPath)
 	if err != nil {
@@ -479,6 +477,58 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 	_ = s.db.UpsertProjectState(p.ID, stateFile)
 
 	s.audit.Log("deploy_finished", string(status), p.ID, fmt.Sprintf("deploy=%s exit_code=%d", d.ID, exitCode), "")
+}
+
+// deploymentProcessEnv starts deployments with a deliberately narrow process
+// environment. The controller's Docker auth location is required for private
+// registry pulls, so it must survive that narrowing. Project environment
+// overrides must never replace command resolution, Docker selection, or
+// project-control paths used by deploy/project.sh.
+func deploymentProcessEnv(deploymentEnv map[string]string) []string {
+	processEnv := map[string]string{
+		"PATH": os.Getenv("PATH"),
+		"HOME": os.Getenv("HOME"),
+	}
+	for _, key := range []string{"DOCKER_CONFIG", "DOCKER_HOST", "DOCKER_CONTEXT"} {
+		if value := os.Getenv(key); value != "" {
+			processEnv[key] = value
+		}
+	}
+	for key, value := range deploymentEnv {
+		if deploymentProcessReservedEnvKey(key) {
+			continue
+		}
+		processEnv[key] = value
+	}
+
+	keys := make([]string, 0, len(processEnv))
+	for key := range processEnv {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, fmt.Sprintf("%s=%s", key, processEnv[key]))
+	}
+	return result
+}
+
+// deploymentProcessReservedEnvKey identifies environment names whose values
+// are owned by the controller or affect non-interactive shell/Docker behavior.
+// Application configuration belongs in the generated project .env file; it is
+// not allowed to redirect controller-owned files or Docker access.
+func deploymentProcessReservedEnvKey(key string) bool {
+	switch key {
+	case "PATH", "HOME", "DOCKER_CONFIG", "DOCKER_HOST", "DOCKER_CONTEXT",
+		"BASH_ENV", "ENV", "CDPATH", "IFS", "BASHOPTS", "SHELLOPTS",
+		"PROJECT_DIR", "PROJECT_ENV_FILE", "PROJECT_COMPOSE_FILE",
+		"PROJECT_STATE_DIR", "PROJECT_RELEASE_DIR", "PROJECT_LOG_DIR",
+		"COMPOSE_PROJECT_NAME", "DEPLOY_PROCESS_PID", "DEPLOY_ACTOR":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *DeployService) Abort(projectID string) error {
