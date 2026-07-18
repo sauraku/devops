@@ -25,7 +25,7 @@ GITHUB_TOKEN=<github-pat> \
   bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)
 ```
 
-Bootstrap pulls both `ghcr.io/sauraku/devops:main` and `ghcr.io/sauraku/devops-runner:main`, resolves the pulled artifacts to registry digests, and pins the running controller and future runners to those exact digests. Set `IMAGE` and `RUNNER_IMAGE` to explicit digest references when a release process selects them upstream. The portal is published on `127.0.0.1:8787`; expose it through a TLS reverse proxy instead of publishing it directly to the network. Secrets live in `/opt/devops-control/.env.prod` or the fallback `~/.devops-control/.env.prod`.
+Bootstrap pulls both `ghcr.io/sauraku/devops:main` and `ghcr.io/sauraku/devops-runner:main`, resolves the pulled artifacts to registry digests, and pins the running controller and future runners to those exact digests. The bootstrap GitHub credential is also the default GHCR pull credential for projects; its Docker auth file exists only in the controller's tmpfs. Set `IMAGE` and `RUNNER_IMAGE` to explicit digest references when a release process selects them upstream. The portal is published on `127.0.0.1:8787`; expose it through a TLS reverse proxy instead of publishing it directly to the network. Secrets live in `/opt/devops-control/.env.prod` or the fallback `~/.devops-control/.env.prod`.
 
 ## Project contract
 

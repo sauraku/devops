@@ -68,8 +68,14 @@ func main() {
 	router := api.NewRouter(handler, authenticator, cfg)
 	deployService.ReconcileLocks()
 
-	// Seed GITHUB_TOKEN as runner token for default project if provided
+	// The bootstrap credential is the default GHCR credential. Docker stores the
+	// resulting auth config only in the controller's tmpfs DOCKER_CONFIG.
 	if cfg.GithubToken != "" {
+		if ok, message := dockerClient.RegistryLogin("ghcr.io", cfg.GithubUser, cfg.GithubToken); !ok {
+			log.Printf("default GHCR login failed; projects with private images must provide registry credentials: %s", message)
+		}
+
+		// Seed GITHUB_TOKEN as runner token for the default project if provided.
 		services.SafeGo("seedGithubToken", func() { projectService.SeedGithubToken(cfg.DefaultProjectID, cfg.GithubToken) })
 	}
 
@@ -149,6 +155,7 @@ func loadConfig() *models.Config {
 		BackupRetention:  getEnvInt("BACKUP_RETENTION", 30),
 		EnableRestore:    getEnvBool("ENABLE_RESTORE", false),
 		GithubToken:      getEnv("GITHUB_TOKEN", ""),
+		GithubUser:       getEnv("GITHUB_USER", "sauraku"),
 		RunnerImage:      getEnv("RUNNER_IMAGE", "ghcr.io/sauraku/devops-runner:main"),
 		RunnerNetwork:    getEnv("RUNNER_NETWORK", "devops-control-runners"),
 		CookieSecure:     getEnvBool("COOKIE_SECURE", false),

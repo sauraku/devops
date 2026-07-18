@@ -16,6 +16,7 @@ type Config struct {
 	BackupRetention     int
 	ProjectRoot         string
 	GithubToken         string
+	GithubUser          string
 	RunnerImage         string
 	RunnerControlURL    string
 	RunnerNetwork       string

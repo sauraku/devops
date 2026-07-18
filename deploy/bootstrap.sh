@@ -196,6 +196,9 @@ if [ -n "${GITHUB_TOKEN:-}" ] && ! grep -q "^GITHUB_TOKEN=" "$ENV_FILE" 2>/dev/n
   echo "==> Persisting GITHUB_TOKEN to env file"
   echo "GITHUB_TOKEN=$GITHUB_TOKEN" >> "$ENV_FILE"
 fi
+if ! grep -q "^GITHUB_USER=" "$ENV_FILE" 2>/dev/null; then
+  echo "GITHUB_USER=$GITHUB_USER" >> "$ENV_FILE"
+fi
 
 echo "==> Pulling image: $IMAGE"
 docker pull "$IMAGE"
@@ -287,10 +290,12 @@ docker run -d \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --read-only \
-  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777 \
   --network "$RUNNER_NETWORK" \
   -e "BASE_DIR=$DATA_DIR" \
   -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+  -e "GITHUB_USER=$GITHUB_USER" \
+  -e DOCKER_CONFIG=/tmp/docker-config \
   -e "RUNNER_NETWORK=$RUNNER_NETWORK" \
   -e "RUNNER_CONTROL_URL=$RUNNER_CONTROL_URL" \
   --env-file "$ENV_FILE" \
