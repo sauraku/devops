@@ -18,7 +18,7 @@ load_dotenv() {
       return 1
     fi
     case "$key" in
-      HOME|PATH|PWD|OLDPWD|SHLVL|SHELL|BASH_ENV|ENV|CDPATH|GLOBIGNORE|IFS|LD_*|DYLD_*)
+      HOME|PATH|PWD|OLDPWD|SHLVL|SHELL|BASH_ENV|ENV|CDPATH|GLOBIGNORE|IFS|LD_*|DYLD_*|TMPDIR|*_PROXY|DOCKER_*|PYTHON*|NODE_*)
         continue
         ;;
     esac

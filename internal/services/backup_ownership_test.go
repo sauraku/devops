@@ -1,6 +1,8 @@
 package services
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,7 +102,13 @@ func TestBackupRestoreScriptsIgnoreDotenvContainerTargets(t *testing.T) {
 				}
 			}
 			if tc.name == "restore" {
-				if err := os.WriteFile(filepath.Join(backupDir, "selected-backup.dump.gz"), []byte("archive"), 0o600); err != nil {
+				archive := []byte("archive")
+				if err := os.WriteFile(filepath.Join(backupDir, "selected-backup.dump.gz"), archive, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				sum := sha256.Sum256(archive)
+				manifest := fmt.Sprintf("{\"backup_id\":\"selected-backup\",\"sha256\":\"%x\",\"restore_eligible\":true}\n", sum)
+				if err := os.WriteFile(filepath.Join(backupDir, "manifest.jsonl"), []byte(manifest), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -110,6 +118,10 @@ func TestBackupRestoreScriptsIgnoreDotenvContainerTargets(t *testing.T) {
 				"PROJECT_ID=other",
 				"TARGET_BRANCH=other",
 				"COMPOSE_PROJECT_NAME=other-main",
+				"PROJECT_DIR=/untrusted/project",
+				"BACKUP_DIR=/untrusted/backups",
+				"LOCK_DIR=/untrusted/lock",
+				"MANIFEST_FILE=/untrusted/manifest.jsonl",
 				"POSTGRES_CONTAINER=unrelated-postgres",
 				"BACKEND_CONTAINER=unrelated-backend",
 				"STOREFRONT_CONTAINER=unrelated-storefront",

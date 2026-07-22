@@ -23,6 +23,13 @@ case "${PROJECT_ID}" in
     ;;
 esac
 
+case "${IMAGE_TAG}" in
+  *[!A-Za-z0-9_.:@/+~-]*|"")
+    echo "Error: invalid image tag '${IMAGE_TAG}'." >&2
+    exit 2
+    ;;
+esac
+
 normalize_ref_name() {
   local ref="$1"
   case "${ref}" in
@@ -82,7 +89,7 @@ audit() {
     "${action}" \
     "${status}" \
     "${DEPLOY_ID}" \
-    "${DEPLOY_ACTOR:-${GITHUB_ACTOR:-unknown}}" \
+    "$(json_escape "${DEPLOY_ACTOR:-${GITHUB_ACTOR:-unknown}}")" \
     "$(json_escape "${message}")" >> "${AUDIT_LOG}"
 }
 
@@ -171,48 +178,17 @@ cleanup() {
   fi
   exit "${rc}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 COMPOSE_CMD=(docker compose)
-if ! docker compose version >/dev/null 2>&1; then
-  COMPOSE_CMD=(docker-compose)
-fi
 
 if ! acquire_lock; then
   audit "deploy_blocked" "blocked" "lock exists"
   write_state "blocked" "operation lock exists"
   exit 1
 fi
-
-# ---------------------------------------------------------------------------
-# Load devops.json from project directory (the project-source-of-truth contract)
-# ---------------------------------------------------------------------------
-DEVOPS_JSON="${PROJECT_DIR}/devops.json"
-read_devops_json() {
-  if [ ! -f "${DEVOPS_JSON}" ]; then
-    return
-  fi
-  python3 -c "
-import json, sys
-data = json.load(open('${DEVOPS_JSON}'))
-dotpath = sys.argv[1]
-parts = dotpath.split('.')
-val = data
-for p in parts:
-    if isinstance(val, dict):
-        val = val.get(p, {})
-    elif isinstance(val, list):
-        val = {}
-    else:
-        val = {}
-if val is None:
-    val = {}
-if isinstance(val, (dict, list)):
-    print(json.dumps(val))
-else:
-    print(str(val))
-" "$1" 2>/dev/null || true
-}
 
 # ---------------------------------------------------------------------------
 # Pull deploy config image (compose + env template)
@@ -544,8 +520,12 @@ if [ -n "${MEDUSA_ADMIN_EMAIL:-}" ] && [ -n "${MEDUSA_ADMIN_PASSWORD:-}" ]; then
     fi
     sleep 2
   done
-  docker exec "${BACKEND_CONTAINER}" npx medusa user \
-    -e "${MEDUSA_ADMIN_EMAIL}" -p "${MEDUSA_ADMIN_PASSWORD}" 2>&1 || \
+  printf '%s\n%s\n' "${MEDUSA_ADMIN_EMAIL}" "${MEDUSA_ADMIN_PASSWORD}" | \
+    docker exec -i "${BACKEND_CONTAINER}" sh -ceu '
+      IFS= read -r admin_email
+      IFS= read -r admin_password
+      exec npx medusa user -e "$admin_email" -p "$admin_password"
+    ' 2>&1 || \
     echo "Warning: admin user creation failed (may already exist)"
 fi
 

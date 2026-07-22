@@ -6,6 +6,10 @@ RUNNER_DIR="${RUNNER_DIR:-/home/runner/actions-runner}"
 
 # If RUNNER_DIR is mounted to a host directory, ensure its binaries are updated to match the container's version
 if [ "$RUNNER_DIR" != "/home/runner/actions-runner" ]; then
+  if [ -z "${RUNNER_DIR}" ] || [ "${RUNNER_DIR}" = "/" ] || [ "${RUNNER_DIR}" = "/home" ] || [ "${RUNNER_DIR}" = "/home/runner" ]; then
+    echo "❌ Error: Invalid RUNNER_DIR '${RUNNER_DIR}'" >&2
+    exit 1
+  fi
   CURRENT_VER=""
   if [ -f "$RUNNER_DIR/.runner_version" ]; then
     CURRENT_VER=$(cat "$RUNNER_DIR/.runner_version")
@@ -72,7 +76,7 @@ if [ ! -f "$RUNNER_DIR/.runner" ] && [ ! -f "$RUNNER_DIR/.runner_migrated" ]; th
 
   echo "⚙️ Configuring GitHub Actions Runner..."
   cd "$RUNNER_DIR"
-  labels="${RUNNER_LABELS:-development,production}"
+  labels="${RUNNER_LABELS:-development}"
   echo "⚙️ Registering runner with labels: ${labels}"
   if ! ./config.sh --url "$REPO_URL" --token "$RUNNER_TOKEN" --unattended --replace --name "${RUNNER_NAME:-devops-runner-container}" --labels "${labels}"; then
     echo ""

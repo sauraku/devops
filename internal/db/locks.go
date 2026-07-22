@@ -60,8 +60,8 @@ func (db *DB) CreateLock(l *models.DeployLock) error {
 	return nil
 }
 
-func (db *DB) ReleaseLock(projectID string) error {
-	_, err := db.Exec("DELETE FROM deploy_locks WHERE project_id = ?", projectID)
+func (db *DB) ReleaseLock(projectID, operationID string) error {
+	_, err := db.Exec("DELETE FROM deploy_locks WHERE project_id = ? AND operation_id = ?", projectID, operationID)
 	return err
 }
 

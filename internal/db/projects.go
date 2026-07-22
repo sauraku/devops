@@ -40,22 +40,7 @@ func stringsMap(s string, fn func(rune) rune) string {
 }
 
 func stringsTrim(s, cutset string) string {
-	for len(s) > 0 && containsRune(cutset, rune(s[0])) {
-		s = s[1:]
-	}
-	for len(s) > 0 && containsRune(cutset, rune(s[len(s)-1])) {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
-func containsRune(s string, r rune) bool {
-	for _, c := range s {
-		if c == r {
-			return true
-		}
-	}
-	return false
+	return strings.Trim(s, cutset)
 }
 
 func (db *DB) ListProjects() ([]*models.Project, error) {
@@ -223,36 +208,54 @@ func (db *DB) GetProjectState(projectID string) (map[string]any, error) {
 }
 
 func (db *DB) UpsertProjectState(projectID string, state map[string]any) error {
-	paused := boolToInt(getBool(state, "paused"))
-	pausedReason := getStr(state, "paused_reason")
-	pausedAt := getStr(state, "paused_at")
-	pausedBy := getStr(state, "paused_by")
-	lastStatus := getStr(state, "last_deploy_status")
-	lastMsg := getStr(state, "last_deploy_message")
-	lastRun := getStr(state, "last_run_at")
-	activeDeployID := getStr(state, "active_deploy_id")
-	lastCommit := getStr(state, "last_deployed_commit")
-	lastImageTag := getStr(state, "last_deployed_image_tag")
-	metadata := getStr(state, "metadata")
+	columns := []struct {
+		stateKey string
+		column   string
+	}{
+		{"paused", "paused"},
+		{"paused_reason", "paused_reason"},
+		{"paused_at", "paused_at"},
+		{"paused_by", "paused_by"},
+		{"last_deploy_status", "last_deploy_status"},
+		{"last_deploy_message", "last_deploy_message"},
+		{"last_run_at", "last_run_at"},
+		{"active_deploy_id", "active_deploy_id"},
+		{"last_deployed_commit", "last_deployed_commit"},
+		{"last_deployed_image_tag", "last_deployed_image_tag"},
+		{"metadata", "metadata"},
+	}
 
-	_, err := db.Exec(`
-		INSERT INTO project_state (project_id, paused, paused_reason, paused_at, paused_by,
-		                           last_deploy_status, last_deploy_message, last_run_at,
-		                           active_deploy_id, last_deployed_commit, last_deployed_image_tag,
-		                           metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(project_id) DO UPDATE SET
-			paused=excluded.paused, paused_reason=excluded.paused_reason,
-			paused_at=excluded.paused_at, paused_by=excluded.paused_by,
-			last_deploy_status=excluded.last_deploy_status,
-			last_deploy_message=excluded.last_deploy_message,
-			last_run_at=excluded.last_run_at,
-			active_deploy_id=excluded.active_deploy_id,
-			last_deployed_commit=excluded.last_deployed_commit,
-			last_deployed_image_tag=excluded.last_deployed_image_tag,
-			metadata=excluded.metadata
-	`, projectID, paused, pausedReason, pausedAt, pausedBy, lastStatus, lastMsg, lastRun, activeDeployID, lastCommit, lastImageTag, metadata)
-	return err
+	sets := make([]string, 0, len(columns))
+	args := make([]any, 0, len(columns)+1)
+	for _, field := range columns {
+		value, ok := state[field.stateKey]
+		if !ok {
+			continue
+		}
+		sets = append(sets, field.column+" = ?")
+		if field.stateKey == "paused" {
+			args = append(args, boolToInt(getBool(map[string]any{"paused": value}, "paused")))
+		} else {
+			args = append(args, getStr(map[string]any{field.stateKey: value}, field.stateKey))
+		}
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("INSERT INTO project_state (project_id) VALUES (?) ON CONFLICT(project_id) DO NOTHING", projectID); err != nil {
+		return err
+	}
+	args = append(args, projectID)
+	if _, err := tx.Exec("UPDATE project_state SET "+strings.Join(sets, ", ")+" WHERE project_id = ?", args...); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (db *DB) SaveRunnerStatus(projectID, status string) error {

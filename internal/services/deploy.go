@@ -72,7 +72,7 @@ func (s *DeployService) failInterruptedOperation(lock *models.DeployLock) {
 	now := time.Now().UTC()
 	exitCode := -1
 	_ = s.db.UpdateDeploymentStatus(lock.OperationID, models.DeploymentStatusFailed, &exitCode, &now)
-	_ = s.db.ReleaseLock(lock.ProjectID)
+	_ = s.db.ReleaseLock(lock.ProjectID, lock.OperationID)
 	_ = os.RemoveAll(filepath.Join(s.cfg.DataDir, lock.ProjectID, "deploy-lock"))
 	s.audit.Log("operation_interrupted", "failed", lock.ProjectID,
 		fmt.Sprintf("operation=%s id=%s controller ownership was interrupted; verify external effects", lock.Operation, lock.OperationID), "")
@@ -267,7 +267,7 @@ func (s *DeployService) startDeployment(deployment *models.Deployment, p *models
 	if expectedStatus == models.DeploymentStatusPendingApproval {
 		transitioned, err := s.db.TransitionDeploymentStatus(deployment.ID, expectedStatus, models.DeploymentStatusPending)
 		if err != nil || !transitioned {
-			_ = s.db.ReleaseLock(p.ID)
+			_ = s.db.ReleaseLock(p.ID, deployment.ID)
 			if err != nil {
 				return fmt.Errorf("queue approved deployment: %w", err)
 			}
@@ -459,7 +459,7 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 	if updateErr != nil {
 		log.Printf("runDeploy: update deployment %s completion: %v", d.ID, updateErr)
 	}
-	_ = s.db.ReleaseLock(p.ID)
+	_ = s.db.ReleaseLock(p.ID, d.ID)
 	if !completed {
 		return
 	}
@@ -495,7 +495,7 @@ func deploymentProcessEnv(deploymentEnv map[string]string) []string {
 		}
 	}
 	for key, value := range deploymentEnv {
-		if deploymentProcessReservedEnvKey(key) {
+		if docker.IsReservedCommandEnvKey(key) {
 			continue
 		}
 		processEnv[key] = value
@@ -512,23 +512,6 @@ func deploymentProcessEnv(deploymentEnv map[string]string) []string {
 		result = append(result, fmt.Sprintf("%s=%s", key, processEnv[key]))
 	}
 	return result
-}
-
-// deploymentProcessReservedEnvKey identifies environment names whose values
-// are owned by the controller or affect non-interactive shell/Docker behavior.
-// Application configuration belongs in the generated project .env file; it is
-// not allowed to redirect controller-owned files or Docker access.
-func deploymentProcessReservedEnvKey(key string) bool {
-	switch key {
-	case "PATH", "HOME", "DOCKER_CONFIG", "DOCKER_HOST", "DOCKER_CONTEXT",
-		"BASH_ENV", "ENV", "CDPATH", "IFS", "BASHOPTS", "SHELLOPTS",
-		"PROJECT_DIR", "PROJECT_ENV_FILE", "PROJECT_COMPOSE_FILE",
-		"PROJECT_STATE_DIR", "PROJECT_RELEASE_DIR", "PROJECT_LOG_DIR",
-		"COMPOSE_PROJECT_NAME", "DEPLOY_PROCESS_PID", "DEPLOY_ACTOR":
-		return true
-	default:
-		return false
-	}
 }
 
 func (s *DeployService) Abort(projectID string) error {
@@ -554,7 +537,9 @@ func (s *DeployService) Abort(projectID string) error {
 		ec := -9
 		_ = s.db.UpdateDeploymentStatus(d.ID, models.DeploymentStatusAborted, &ec, &now)
 	}
-	_ = s.db.ReleaseLock(projectID)
+	if len(deployments) > 0 {
+		_ = s.db.ReleaseLock(projectID, deployments[0].ID)
+	}
 
 	// Clean up the file lock after the owning process has been signalled.
 	lockDir := filepath.Join(s.cfg.DataDir, projectID, "deploy-lock")

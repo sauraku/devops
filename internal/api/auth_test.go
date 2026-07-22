@@ -9,7 +9,7 @@ import (
 )
 
 func TestSignedSessionAndCSRF(t *testing.T) {
-	auth := NewAuthenticator(strings.Repeat("m", 64), strings.Repeat("c", 64), false)
+	auth := NewAuthenticator(strings.Repeat("m", 64), strings.Repeat("c", 64), false, nil)
 	form := url.Values{"token": {strings.Repeat("m", 64)}}
 	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -51,7 +51,7 @@ func TestSignedSessionAndCSRF(t *testing.T) {
 }
 
 func TestProjectTokenIsScoped(t *testing.T) {
-	auth := NewAuthenticator(strings.Repeat("m", 64), strings.Repeat("c", 64), false)
+	auth := NewAuthenticator(strings.Repeat("m", 64), strings.Repeat("c", 64), false, nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/projects/medusa/deploy", nil)
 	req.Header.Set("X-Deploy-Control-Token", auth.ProjectToken("medusa"))
 	if !auth.VerifyProjectToken(req, "medusa") {
@@ -118,5 +118,27 @@ func TestProjectTokenActionsAreReadOnlyAndProjectScoped(t *testing.T) {
 		if projectTokenActionAllowed(action) {
 			t.Fatalf("project token unexpectedly allowed action %q", action)
 		}
+	}
+}
+
+func TestLoginBackoffIsScopedToRemoteIP(t *testing.T) {
+	auth := NewAuthenticator("correct-token", strings.Repeat("c", 64), false, nil)
+	failed := func(remoteAddr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(url.Values{"token": {"wrong-token"}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.RemoteAddr = remoteAddr
+		recorder := httptest.NewRecorder()
+		auth.LoginHandler(recorder, req)
+		return recorder
+	}
+
+	if recorder := failed("192.0.2.1:1234"); recorder.Code != http.StatusOK {
+		t.Fatalf("first invalid login status = %d, want 200", recorder.Code)
+	}
+	if recorder := failed("192.0.2.1:1235"); recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited login status = %d, want 429", recorder.Code)
+	}
+	if recorder := failed("192.0.2.2:1234"); recorder.Code != http.StatusOK {
+		t.Fatalf("different remote IP status = %d, want 200", recorder.Code)
 	}
 }

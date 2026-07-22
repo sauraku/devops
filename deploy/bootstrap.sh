@@ -17,12 +17,22 @@ DATA_DIR="${DATA_DIR:-/opt/devops-control}"
 ENV_FILE_WAS_SET="${ENV_FILE+x}"
 ENV_FILE="${ENV_FILE:-/opt/devops-control/.env.prod}"
 HOST_PORT="${HOST_PORT:-8787}"
+HOST_BIND="${HOST_BIND:-127.0.0.1}"
 GITHUB_USER="${GITHUB_USER:-sauraku}"
 RUNNER_NETWORK="${RUNNER_NETWORK:-devops-control-runners}"
 RUNNER_CONTROL_URL="${RUNNER_CONTROL_URL:-http://${CONTAINER}:8787}"
 INSTALL_MARKER_NAME=".devops-control-installation"
 INSTALL_MARKER_PRODUCT="product=devops-control"
 INSTALL_MARKER_FORMAT="format=1"
+
+case "${HOST_BIND}" in
+  127.0.0.1|0.0.0.0)
+    ;;
+  *)
+    echo "HOST_BIND must be 127.0.0.1 (default) or 0.0.0.0." >&2
+    exit 2
+    ;;
+esac
 
 trim_directory_suffix() {
   local path="$1" previous
@@ -176,7 +186,10 @@ RUNNER_CONTROL_URL=$RUNNER_CONTROL_URL
 EOF
   chmod 600 "$ENV_FILE"
   echo "    Secrets written to $ENV_FILE"
-elif ! grep -q "^BASE_DIR=" "$ENV_FILE"; then
+else
+  chmod 600 "$ENV_FILE"
+fi
+if ! grep -q "^BASE_DIR=" "$ENV_FILE"; then
   echo "==> Adding BASE_DIR to existing env file"
   echo "BASE_DIR=$DATA_DIR" >> "$ENV_FILE"
 fi
@@ -293,7 +306,6 @@ docker run -d \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777 \
   --network "$RUNNER_NETWORK" \
   -e "BASE_DIR=$DATA_DIR" \
-  -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
   -e "GITHUB_USER=$GITHUB_USER" \
   -e DOCKER_CONFIG=/tmp/docker-config \
   -e "RUNNER_NETWORK=$RUNNER_NETWORK" \
@@ -301,11 +313,15 @@ docker run -d \
   --env-file "$ENV_FILE" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$DATA_DIR":"$DATA_DIR" \
-  -p "${HOST_PORT}:8787" \
+  -p "${HOST_BIND}:${HOST_PORT}:8787" \
   "$IMAGE"
 
 echo "==> Done. Container: $CONTAINER"
 echo "    Logs: docker logs -f $CONTAINER"
 echo "    Token: saved in $ENV_FILE"
-echo "    Login locally at http://127.0.0.1:${HOST_PORT} or through your TLS reverse proxy"
+if [ "${HOST_BIND}" = "127.0.0.1" ]; then
+  echo "    Login locally at http://127.0.0.1:${HOST_PORT} or through your TLS reverse proxy"
+else
+  echo "    Control plane is published on ${HOST_BIND}:${HOST_PORT}; use a TLS reverse proxy for browser access."
+fi
 echo "    To update later, run the same command again."

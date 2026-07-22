@@ -6,25 +6,46 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/sauraku/devops-control/internal/services"
 )
 
 const sessionLifetime = 12 * time.Hour
 
-type Authenticator struct {
-	token        string
-	cookieSecret []byte
-	cookieSecure bool
+const (
+	loginInitialBackoff   = time.Second
+	loginMaxBackoff       = time.Minute
+	loginAttemptRetention = 10 * time.Minute
+)
+
+type loginAttempt struct {
+	failures    int
+	retryAfter  time.Time
+	lastAttempt time.Time
 }
 
-func NewAuthenticator(token, cookieSecret string, cookieSecure bool) *Authenticator {
+type Authenticator struct {
+	token         string
+	cookieSecret  []byte
+	cookieSecure  bool
+	audit         *services.AuditService
+	loginMu       sync.Mutex
+	loginAttempts map[string]loginAttempt
+}
+
+func NewAuthenticator(token, cookieSecret string, cookieSecure bool, audit *services.AuditService) *Authenticator {
 	return &Authenticator{
-		token:        token,
-		cookieSecret: []byte(cookieSecret),
-		cookieSecure: cookieSecure,
+		token:         token,
+		cookieSecret:  []byte(cookieSecret),
+		cookieSecure:  cookieSecure,
+		audit:         audit,
+		loginAttempts: make(map[string]loginAttempt),
 	}
 }
 
@@ -96,6 +117,12 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	ip := loginRemoteIP(r.RemoteAddr)
+	if retryAfter, blocked := a.loginBlocked(ip, time.Now()); blocked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many login attempts; try again later")
+		return
+	}
 
 	token := strings.TrimSpace(r.FormValue("token"))
 	if token == "" {
@@ -106,9 +133,15 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !secureEqual(token, a.token) {
+		retryAfter := a.recordLoginFailure(ip, time.Now())
+		if a.audit != nil {
+			a.audit.Log("login_failed", "denied", "", "remote_ip="+ip, "")
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
 		sendLoginPage(w)
 		return
 	}
+	a.clearLoginFailures(ip)
 
 	sessionIDBytes := make([]byte, 32)
 	if _, err := rand.Read(sessionIDBytes); err != nil {
@@ -133,6 +166,59 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func loginRemoteIP(remoteAddr string) string {
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil || ip == "" {
+		return remoteAddr
+	}
+	return ip
+}
+
+func (a *Authenticator) loginBlocked(ip string, now time.Time) (time.Duration, bool) {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	a.pruneLoginAttemptsLocked(now)
+	attempt, ok := a.loginAttempts[ip]
+	if !ok || !now.Before(attempt.retryAfter) {
+		return 0, false
+	}
+	return time.Until(attempt.retryAfter), true
+}
+
+func (a *Authenticator) recordLoginFailure(ip string, now time.Time) time.Duration {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	a.pruneLoginAttemptsLocked(now)
+	attempt := a.loginAttempts[ip]
+	attempt.failures++
+	if attempt.failures > 7 {
+		attempt.failures = 7
+	}
+	delay := loginInitialBackoff << (attempt.failures - 1)
+	if delay > loginMaxBackoff {
+		delay = loginMaxBackoff
+	}
+	attempt.retryAfter = now.Add(delay)
+	attempt.lastAttempt = now
+	a.loginAttempts[ip] = attempt
+	return delay
+}
+
+func (a *Authenticator) clearLoginFailures(ip string) {
+	a.loginMu.Lock()
+	delete(a.loginAttempts, ip)
+	a.loginMu.Unlock()
+}
+
+func (a *Authenticator) pruneLoginAttemptsLocked(now time.Time) {
+	cutoff := now.Add(-loginAttemptRetention)
+	for ip, attempt := range a.loginAttempts {
+		if attempt.lastAttempt.Before(cutoff) {
+			delete(a.loginAttempts, ip)
+		}
+	}
 }
 
 func (a *Authenticator) LogoutHandler(w http.ResponseWriter, r *http.Request) {

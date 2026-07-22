@@ -291,7 +291,7 @@ func (s *ProjectService) Delete(projectID string) error {
 	if err := s.db.CreateLock(lock); err != nil {
 		return fmt.Errorf("cannot delete project while another operation is active: %w", err)
 	}
-	defer s.db.ReleaseLock(projectID)
+	defer s.db.ReleaseLock(projectID, deleteID)
 
 	projectDir := p.AppDir
 	if projectDir == "" {
@@ -1503,7 +1503,7 @@ func (s *ProjectService) composeServices(p *models.Project) []string {
 	composeFile := filepath.Join(p.AppDir, "docker-compose.yml")
 	svcNames, err := s.docker.ComposeServiceNames(composeFile)
 	if err != nil || len(svcNames) == 0 {
-		return []string{"postgres", "redis", "backend", "storefront"}
+		return nil
 	}
 	sort.Strings(svcNames)
 	return svcNames
@@ -1519,22 +1519,10 @@ func truncateStr(s string, maxLen int) string {
 func updateEnvFileWithOverrides(envFile string, overrides map[string]string, projectID, branchSlug string) error {
 	data, err := os.ReadFile(envFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			var lines []string
-			envMap := make(map[string]string)
-			for k, v := range overrides {
-				envMap[k] = v
-			}
-			if projectID != "" && branchSlug != "" {
-				envMap["COMPOSE_PROJECT_NAME"] = fmt.Sprintf("%s-%s", projectID, branchSlug)
-				envMap["ENV_NAME"] = branchSlug
-			}
-			for k, v := range envMap {
-				lines = append(lines, fmt.Sprintf("%s=%s", k, v))
-			}
-			return os.WriteFile(envFile, []byte(strings.Join(lines, "\n")+"\n"), 0600)
+		if !os.IsNotExist(err) {
+			return err
 		}
-		return err
+		data = nil
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -1560,9 +1548,49 @@ func updateEnvFileWithOverrides(envFile string, overrides map[string]string, pro
 		envMap["ENV_NAME"] = branchSlug
 	}
 
-	var newLines []string
-	for k, v := range envMap {
-		newLines = append(newLines, fmt.Sprintf("%s=%s", k, v))
+	keys := make([]string, 0, len(envMap))
+	for key := range envMap {
+		keys = append(keys, key)
 	}
-	return os.WriteFile(envFile, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
+	sort.Strings(keys)
+	newLines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		newLines = append(newLines, fmt.Sprintf("%s=%s", key, envMap[key]))
+	}
+	return writeEnvFileAtomically(envFile, []byte(strings.Join(newLines, "\n")+"\n"))
+}
+
+func writeEnvFileAtomically(envFile string, content []byte) error {
+	dir := filepath.Dir(envFile)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(envFile)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	keepTemp := true
+	defer func() {
+		if keepTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(content); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, envFile); err != nil {
+		return err
+	}
+	keepTemp = false
+	return nil
 }

@@ -140,11 +140,6 @@ func (r *Router) serveStatic(w http.ResponseWriter, req *http.Request) {
 	// Try the embedded UI first
 	data, err := fs.ReadFile(uiFS, "ui/dist/"+path)
 	if err != nil {
-		// Fallback for non-embedded paths
-		http.NotFound(w, req)
-		return
-	}
-	if err != nil {
 		http.NotFound(w, req)
 		return
 	}
@@ -271,7 +266,7 @@ func (r *Router) routeProjectAction(w http.ResponseWriter, req *http.Request, pr
 	case "env-config":
 		r.h.ProjectSaveEnvConfig(w, req, projectID)
 	case "deployments":
-		r.h.ProjectStatus(w, req, projectID) // fallback for deployments list
+		writeError(w, http.StatusNotImplemented, "deployments list not yet implemented")
 	default:
 		// Check for nested routes
 		if strings.HasPrefix(action, "containers/") {
@@ -305,10 +300,12 @@ func (r *Router) routeProjectAction(w http.ResponseWriter, req *http.Request, pr
 				r.h.ProjectDeploymentStatus(w, req, projectID, deployID)
 			case "approve":
 				r.h.ProjectApproveDeployment(w, req, projectID, deployID)
+			case "stream":
+				r.h.WebSocketHandler(w, req, projectID, deployID)
 			case "":
 				// Stream via websocket if upgrade requested
-				if strings.Contains(req.Header.Get("Upgrade"), "websocket") {
-					r.h.WebSocketHandler(w, req, projectID)
+				if strings.Contains(strings.ToLower(req.Header.Get("Upgrade")), "websocket") {
+					r.h.WebSocketHandler(w, req, projectID, deployID)
 					return
 				}
 				r.h.ProjectDeploymentLog(w, req, projectID, deployID)
@@ -330,7 +327,7 @@ func projectActionPolicy(action, requestMethod string) (allowed bool, mutation b
 	}
 	if _, subAction, ok := deploymentSubAction(action); ok {
 		switch subAction {
-		case "", "status":
+		case "", "status", "stream":
 			return requestMethod == http.MethodGet, false
 		case "approve":
 			return requestMethod == http.MethodPost, true

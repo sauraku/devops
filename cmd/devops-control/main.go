@@ -63,7 +63,7 @@ func main() {
 	deployService := services.NewDeployService(database, dockerClient, auditService, cfg)
 	backupService := services.NewBackupService(database, dockerClient, auditService, cfg)
 
-	authenticator := api.NewAuthenticator(cfg.Token, cfg.CookieSecret, cfg.CookieSecure)
+	authenticator := api.NewAuthenticator(cfg.Token, cfg.CookieSecret, cfg.CookieSecure, auditService)
 	handler := api.NewHandler(projectService, deployService, backupService, auditService, authenticator, cfg)
 	router := api.NewRouter(handler, authenticator, cfg)
 	deployService.ReconcileLocks()

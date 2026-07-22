@@ -1,8 +1,10 @@
 package docker
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,51 @@ func TestPathWithinAnyRootResolvesSymlinkAncestors(t *testing.T) {
 	}
 	if pathWithinAnyRoot(filepath.Join(root, "escape", "new-file"), []string{root}) {
 		t.Fatal("path through an escaping symlink was accepted")
+	}
+}
+
+func TestDockerCommandEnvDoesNotAllowOverrideOfControllerEnvironment(t *testing.T) {
+	t.Setenv("PATH", "/trusted/bin")
+	t.Setenv("HOME", "/trusted/home")
+	t.Setenv("DOCKER_HOST", "unix:///trusted/docker.sock")
+	got := strings.Join(dockerCommandEnv(map[string]string{
+		"PATH":                 "/untrusted/bin",
+		"HOME":                 "/untrusted/home",
+		"DOCKER_HOST":          "tcp://untrusted:2375",
+		"DOCKER_CONFIG":        "/untrusted/config",
+		"PROJECT_DIR":          "/untrusted/project",
+		"COMPOSE_PROJECT_NAME": "untrusted-project",
+		"APP_SETTING":          "allowed",
+	}), "\n")
+	for _, forbidden := range []string{
+		"/untrusted/bin", "/untrusted/home", "tcp://untrusted:2375",
+		"/untrusted/config", "/untrusted/project", "untrusted-project",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("reserved value leaked into Docker command environment: %q", got)
+		}
+	}
+	for _, expected := range []string{
+		"PATH=/trusted/bin", "HOME=/trusted/home", "DOCKER_HOST=unix:///trusted/docker.sock", "APP_SETTING=allowed",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("Docker command environment missing %q: %q", expected, got)
+		}
+	}
+}
+
+func TestContainerReadFileRejectsOversizedOutput(t *testing.T) {
+	dir := t.TempDir()
+	dockerStub := filepath.Join(dir, "docker")
+	stub := "#!/bin/sh\nhead -c " + strconv.Itoa(ContainerReadFileLimit+1) + " /dev/zero\n"
+	if err := os.WriteFile(dockerStub, []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := (&Client{}).ContainerReadFile("medusa-main-backend", "/app/logs/app.log")
+	if !errors.Is(err, ErrContainerFileTooLarge) {
+		t.Fatalf("ContainerReadFile error = %v, want size-limit error", err)
 	}
 }
 

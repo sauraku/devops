@@ -1,8 +1,8 @@
 package api
 
 import (
+	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	dockerclient "github.com/sauraku/devops-control/internal/docker"
 	"github.com/sauraku/devops-control/internal/models"
 	"github.com/sauraku/devops-control/internal/services"
 )
@@ -108,10 +109,6 @@ func (h *Handler) ProjectStatus(w http.ResponseWriter, r *http.Request, projectI
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
-	}
-	if status.Containers != nil {
-		states := status.Containers["current"]
-		log.Printf("Status %s containers: %v", projectID, states)
 	}
 	writeJSON(w, http.StatusOK, status)
 }
@@ -619,7 +616,11 @@ func (h *Handler) ProjectContainerLogFileContent(w http.ResponseWriter, r *http.
 	}
 	content, err := h.projects.Docker().ContainerReadFile(containerName, filePath)
 	if err != nil {
-		writeText(w, http.StatusOK, fmt.Sprintf("Log file not available: %s\n", err))
+		if errors.Is(err, dockerclient.ErrContainerFileTooLarge) {
+			writeText(w, http.StatusOK, "Log file exceeds 10MB limit.\n")
+			return
+		}
+		writeText(w, http.StatusOK, "Log file not available.\n")
 		return
 	}
 	if len(content) > 10*1024*1024 {

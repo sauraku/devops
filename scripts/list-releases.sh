@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RELEASE_DIR="${SERVER_DIR}/Releases"
+# Usage: list-releases.sh <project_id>
+# Lists release manifests from ${BASE_DIR}/Releases/${PROJECT_ID}/
+BASE_DIR="${BASE_DIR:-/opt/devops-control}"
+PROJECT_ID="${1:?project_id is required}"
+RELEASE_DIR="${BASE_DIR}/Releases/${PROJECT_ID}"
 
 python3 - "${RELEASE_DIR}" <<'PY'
 import json

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -52,8 +53,31 @@ const (
 	terminalRateLimit   = 5 * time.Second
 )
 
-var lastTerminalAttempt time.Time
-var terminalAttemptMu sync.Mutex
+var (
+	lastTerminalAttempt   = make(map[string]time.Time)
+	terminalAttemptMu     sync.Mutex
+	terminalLastPruneTime time.Time
+)
+
+func terminalAttemptAllowed(ip string, now time.Time) bool {
+	terminalAttemptMu.Lock()
+	defer terminalAttemptMu.Unlock()
+
+	if terminalLastPruneTime.IsZero() || now.Sub(terminalLastPruneTime) >= terminalRateLimit {
+		cutoff := now.Add(-terminalRateLimit)
+		for attemptedIP, attemptedAt := range lastTerminalAttempt {
+			if attemptedAt.Before(cutoff) {
+				delete(lastTerminalAttempt, attemptedIP)
+			}
+		}
+		terminalLastPruneTime = now
+	}
+	if last, exists := lastTerminalAttempt[ip]; exists && now.Sub(last) < terminalRateLimit {
+		return false
+	}
+	lastTerminalAttempt[ip] = now
+	return true
+}
 
 func writeTerminalMessage(conn *websocket.Conn, msg string) {
 	terminalWriteMu.Lock()
@@ -64,14 +88,15 @@ func writeTerminalMessage(conn *websocket.Conn, msg string) {
 }
 
 func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
-	terminalAttemptMu.Lock()
-	if time.Since(lastTerminalAttempt) < terminalRateLimit {
-		terminalAttemptMu.Unlock()
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+
+	if !terminalAttemptAllowed(ip, time.Now()) {
 		writeError(w, http.StatusTooManyRequests, "too many terminal attempts; wait 5 seconds")
 		return
 	}
-	lastTerminalAttempt = time.Now()
-	terminalAttemptMu.Unlock()
 
 	conn, err := terminalUpgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -104,10 +129,12 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 
 	var authMethods []ssh.AuthMethod
 	home, _ := os.UserHomeDir()
-	keyPath := filepath.Join(home, ".ssh", "id_rsa")
-	if keyData, err := os.ReadFile(keyPath); err == nil {
-		if signer, err := ssh.ParsePrivateKey(keyData); err == nil {
-			authMethods = append(authMethods, ssh.PublicKeys(signer))
+	for _, keyName := range []string{"id_ed25519", "id_rsa"} {
+		keyPath := filepath.Join(home, ".ssh", keyName)
+		if keyData, err := os.ReadFile(keyPath); err == nil {
+			if signer, err := ssh.ParsePrivateKey(keyData); err == nil {
+				authMethods = append(authMethods, ssh.PublicKeys(signer))
+			}
 		}
 	}
 	if len(passBytes) > 0 {
@@ -116,7 +143,8 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 
 	hostKeyCallback, err := h.knownHostKeyCallback()
 	if err != nil {
-		writeTerminalMessage(conn, "ERROR: SSH known_hosts is not configured: "+err.Error())
+		log.Printf("Terminal: configure known_hosts: %v", err)
+		writeTerminalMessage(conn, "ERROR: SSH host verification is not configured")
 		return
 	}
 	sshConfig := &ssh.ClientConfig{
@@ -132,7 +160,8 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	sshConn, err := ssh.Dial("tcp", sshHost+":22", sshConfig)
 	if err != nil {
-		writeTerminalMessage(conn, "ERROR: SSH connection failed: "+err.Error())
+		log.Printf("Terminal: SSH connection to %s failed: %v", sshHost, err)
+		writeTerminalMessage(conn, "ERROR: SSH connection failed")
 		return
 	}
 	defer sshConn.Close()
@@ -154,8 +183,16 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stdinPipe, _ := session.StdinPipe()
-	stdoutPipe, _ := session.StdoutPipe()
+	stdinPipe, err := session.StdinPipe()
+	if err != nil {
+		writeTerminalMessage(conn, "ERROR: cannot request stdin pipe")
+		return
+	}
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		writeTerminalMessage(conn, "ERROR: cannot request stdout pipe")
+		return
+	}
 
 	if err := session.Shell(); err != nil {
 		writeTerminalMessage(conn, "ERROR: cannot start shell")

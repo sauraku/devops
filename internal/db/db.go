@@ -25,7 +25,7 @@ func Open(dataDir string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	conn.SetMaxOpenConns(4) // WAL mode supports concurrent readers
+	conn.SetMaxOpenConns(1)
 	db := &DB{DB: conn, DataDir: dataDir}
 	if err := db.migrate(); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)

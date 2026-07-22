@@ -184,3 +184,49 @@ func TestMigrateLegacyProjectEnvOverridesNormalizesBlankMetadata(t *testing.T) {
 		t.Fatalf("normalized metadata = %#v, want {}", got)
 	}
 }
+
+func TestUpsertProjectStatePatchesOnlySuppliedFields(t *testing.T) {
+	InitCrypto(strings.Repeat("p", 64))
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	project := &models.Project{ID: "medusa", Name: "Medusa", BranchName: "main"}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertProjectState(project.ID, map[string]any{
+		"last_deploy_status":      "success",
+		"last_deployed_commit":    "abc123",
+		"active_deploy_id":        "deploy-medusa-1",
+		"last_deployed_image_tag": "sha-abc123",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertProjectState(project.ID, map[string]any{
+		"paused":        true,
+		"paused_reason": "maintenance",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := database.GetProjectState(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state["paused"] != true || state["paused_reason"] != "maintenance" {
+		t.Fatalf("pause state = %#v", state)
+	}
+	for key, want := range map[string]string{
+		"last_deploy_status":      "success",
+		"last_deployed_commit":    "abc123",
+		"active_deploy_id":        "deploy-medusa-1",
+		"last_deployed_image_tag": "sha-abc123",
+	} {
+		if got := state[key]; got != want {
+			t.Errorf("%s = %#v, want %q", key, got, want)
+		}
+	}
+}

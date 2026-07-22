@@ -6,19 +6,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=../deploy/lib.sh
 source "${SERVER_DIR}/deploy/lib.sh"
-PROJECT_DIR="${PROJECT_DIR:-$PWD}"
-STATE_DIR="${PROJECT_STATE_DIR:-${BASE_DIR:-${SERVER_DIR}}/State/${PROJECT_ID:-default}}"
-BACKUP_DIR="${BACKUP_DIR_PATH:-${BASE_DIR:-${SERVER_DIR}}/Backups/${PROJECT_ID:-default}}"
-LOG_DIR="${PROJECT_LOG_DIR:-${BASE_DIR:-${SERVER_DIR}}/Logs/${PROJECT_ID:-default}}"
-LOCK_DIR="${STATE_DIR}/deploy-lock"
-MANIFEST_FILE="${BACKUP_MANIFEST_FILE:-${BACKUP_DIR}/manifest.jsonl}"
+TRUSTED_PROJECT_DIR="${PROJECT_DIR:-$PWD}"
+TRUSTED_STATE_DIR="${PROJECT_STATE_DIR:-${BASE_DIR:-${SERVER_DIR}}/State/${PROJECT_ID:-default}}"
+TRUSTED_BACKUP_DIR="${BACKUP_DIR_PATH:-${BASE_DIR:-${SERVER_DIR}}/Backups/${PROJECT_ID:-default}}"
+TRUSTED_LOG_DIR="${PROJECT_LOG_DIR:-${BASE_DIR:-${SERVER_DIR}}/Logs/${PROJECT_ID:-default}}"
+TRUSTED_LOCK_DIR="${TRUSTED_STATE_DIR}/deploy-lock"
+TRUSTED_MANIFEST_FILE="${BACKUP_MANIFEST_FILE:-${TRUSTED_BACKUP_DIR}/manifest.jsonl}"
+PROJECT_DIR="${TRUSTED_PROJECT_DIR}"
+STATE_DIR="${TRUSTED_STATE_DIR}"
+BACKUP_DIR="${TRUSTED_BACKUP_DIR}"
+LOG_DIR="${TRUSTED_LOG_DIR}"
+LOCK_DIR="${TRUSTED_LOCK_DIR}"
+MANIFEST_FILE="${TRUSTED_MANIFEST_FILE}"
 
 mkdir -p "${STATE_DIR}" "${BACKUP_DIR}" "${LOG_DIR}"
 
 COMPOSE_CMD=(docker compose)
-if ! docker compose version >/dev/null 2>&1; then
-  COMPOSE_CMD=(docker-compose)
-fi
 
 TARGET_BRANCH="${TARGET_BRANCH:-${GITHUB_REF_NAME:-main}}"
 case "${TARGET_BRANCH}" in
@@ -63,6 +66,15 @@ fi
 
 load_dotenv "${DEPLOY_ENV_FILE}"
 
+# The project dotenv is application configuration, not control-plane input.
+# Restore controller-owned paths after parsing it so a project cannot redirect
+# backup output, logs, manifests, or the cross-operation lock.
+PROJECT_DIR="${TRUSTED_PROJECT_DIR}"
+STATE_DIR="${TRUSTED_STATE_DIR}"
+BACKUP_DIR="${TRUSTED_BACKUP_DIR}"
+LOG_DIR="${TRUSTED_LOG_DIR}"
+LOCK_DIR="${TRUSTED_LOCK_DIR}"
+MANIFEST_FILE="${TRUSTED_MANIFEST_FILE}"
 PROJECT_ID="${TRUSTED_PROJECT_ID}"
 TARGET_BRANCH="${TRUSTED_TARGET_BRANCH}"
 ENV_NAME="${branch_slug}"
@@ -76,6 +88,12 @@ BACKUP_KIND="${BACKUP_KIND:-manual}"
 BACKUP_REASON="${BACKUP_REASON:-${BACKUP_KIND}}"
 BACKUP_SKIP_LOCK="${BACKUP_SKIP_LOCK:-false}"
 BACKUP_ID="${BACKUP_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-${ENV_NAME}-${BACKUP_KIND}}"
+case "${BACKUP_ID}" in
+  *[!a-zA-Z0-9_.-]*|"")
+    echo "Error: invalid backup id '${BACKUP_ID}'." >&2
+    exit 2
+    ;;
+esac
 BACKUP_FILE="${BACKUP_DIR}/${BACKUP_ID}.dump.gz"
 TMP_FILE="${BACKUP_FILE}.tmp"
 VERIFY_LOG="${BACKUP_DIR}/${BACKUP_ID}.pg_restore.list"
@@ -135,7 +153,9 @@ cleanup() {
   fi
   exit "${rc}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "${BACKUP_SKIP_LOCK}" != "true" ]; then
   if mkdir "${LOCK_DIR}" 2>/dev/null; then
@@ -263,7 +283,26 @@ FIREBASE_BUCKET="${FIREBASE_STORAGE_BUCKET:-}"
 FIREBASE_CREDS="${GOOGLE_APPLICATION_CREDENTIALS:-}"
 FIREBASE_CLIENT="${FIREBASE_CLIENT_EMAIL:-}"
 FIREBASE_PK_B64="${FIREBASE_PRIVATE_KEY_B64:-}"
-FIREBASE_TOKEN_URI="${FIREBASE_TOKEN_URI:-https://oauth2.googleapis.com/token}"
+FIREBASE_TOKEN_URI="https://oauth2.googleapis.com/token"
+
+firebase_curl() {
+  local access_token="$1" config rc
+  shift
+  case "${access_token}" in
+    *[!A-Za-z0-9._~-]*|"") return 1 ;;
+  esac
+  config="$(mktemp)" || return 1
+  chmod 600 "${config}"
+  printf 'header = "Authorization: Bearer %s"\n' "${access_token}" > "${config}"
+  if curl --config "${config}" "$@"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  rm -f "${config}"
+  return "${rc}"
+}
+
 if [ -n "${FIREBASE_BUCKET}" ]; then
   echo "Uploading backup to Firebase Storage..."
   ACCESS_TOKEN=$(python3 -c "
@@ -275,7 +314,6 @@ if creds_path and os.path.isfile(creds_path):
     with open(creds_path) as f:
         key = json.load(f)
     client_email = key['client_email']
-    token_uri = key.get('token_uri', token_uri)
     pem_bytes = key['private_key'].encode()
 elif pk_b64:
     pem_bytes = base64.b64decode(pk_b64)
@@ -293,12 +331,16 @@ payload_b64 = base64.urlsafe_b64encode(json.dumps({
 }, separators=(',',':')).encode()).rstrip(b'=').decode()
 sign_input = (header_b64 + '.' + payload_b64).encode()
 
-with tempfile.NamedTemporaryFile(delete=False) as tf:
-    tf.write(pem_bytes)
-    key_path = tf.name
-result = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', key_path], input=sign_input, capture_output=True)
-os.unlink(key_path)
-result.check_returncode()
+key_path = None
+try:
+    with tempfile.NamedTemporaryFile(delete=False) as tf:
+        tf.write(pem_bytes)
+        key_path = tf.name
+    result = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', key_path], input=sign_input, capture_output=True)
+    result.check_returncode()
+finally:
+    if key_path and os.path.exists(key_path):
+        os.unlink(key_path)
 signature = base64.urlsafe_b64encode(result.stdout).rstrip(b'=').decode()
 
 jwt_assertion = f'{sign_input.decode()}.{signature}'
@@ -312,15 +354,25 @@ print(token_data['access_token'])
   if [ -n "${ACCESS_TOKEN:-}" ]; then
     REMOTE_PATH="backups/${COMPOSE_PROJECT_NAME}/${BACKUP_ID}.dump.gz"
     ENCODED_PATH=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${REMOTE_PATH}" 2>/dev/null)
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    HTTP_CODE=$(firebase_curl "${ACCESS_TOKEN}" -s -o /dev/null -w "%{http_code}" \
       -X POST \
-      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
       -H "Content-Type: application/octet-stream" \
       --data-binary "@${BACKUP_FILE}" \
       "https://storage.googleapis.com/upload/storage/v1/b/${FIREBASE_BUCKET}/o?uploadType=media&name=${ENCODED_PATH}" 2>&1)
 
     if [ "${HTTP_CODE}" = "200" ]; then
-      echo "Firebase upload complete."
+      REMOTE_MANIFEST_PATH="backups/${COMPOSE_PROJECT_NAME}/manifest.jsonl"
+      ENCODED_MANIFEST_PATH=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${REMOTE_MANIFEST_PATH}" 2>/dev/null)
+      MANIFEST_HTTP_CODE=$(firebase_curl "${ACCESS_TOKEN}" -s -o /dev/null -w "%{http_code}" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        --data-binary "@${MANIFEST_FILE}" \
+        "https://storage.googleapis.com/upload/storage/v1/b/${FIREBASE_BUCKET}/o?uploadType=media&name=${ENCODED_MANIFEST_PATH}" 2>&1)
+      if [ "${MANIFEST_HTTP_CODE}" = "200" ]; then
+        echo "Firebase upload complete."
+      else
+        echo "WARNING: Firebase manifest upload failed (HTTP ${MANIFEST_HTTP_CODE}). Local backup remains verified." >&2
+      fi
     else
       echo "WARNING: Firebase upload failed (HTTP ${HTTP_CODE}). Backup is available locally." >&2
     fi

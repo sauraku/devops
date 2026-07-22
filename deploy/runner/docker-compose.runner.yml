@@ -18,8 +18,6 @@ services:
       - RUNNER_LABELS=${RUNNER_LABELS:-development}
       - DEPLOY_CONTROL_TOKEN=${DEPLOY_CONTROL_TOKEN}
       - DEPLOY_CONTROL_URL=${DEPLOY_CONTROL_URL:?DEPLOY_CONTROL_URL is required}
-    extra_hosts:
-      - host.docker.internal:host-gateway
     volumes:
       - runner-state:/home/runner/runner-state
     networks:

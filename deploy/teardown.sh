@@ -5,7 +5,7 @@
 #
 # Run via:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/teardown.sh)
-set -uo pipefail
+set -euo pipefail
 
 CONTAINER="${CONTAINER:-devops-control}"
 INSTALL_MARKER_NAME=".devops-control-installation"
@@ -194,6 +194,8 @@ for compose_project in ${COMPOSE_PROJECTS}; do
   COMPOSE_VOLUMES="${COMPOSE_VOLUMES} ${matched_volumes}"
   DEV_NETWORKS="${DEV_NETWORKS} ${matched_networks}"
 done
+runner_networks=$(docker network ls --filter "label=com.sauraku.devops.role=runner-network" --format '{{.Name}}' 2>/dev/null || true)
+DEV_NETWORKS="${DEV_NETWORKS} ${runner_networks}"
 COMPOSE_CONTAINERS=$(echo "${COMPOSE_CONTAINERS}" | tr ' ' '\n' | sort -u | xargs)
 COMPOSE_VOLUMES=$(echo "${COMPOSE_VOLUMES}" | tr ' ' '\n' | sort -u | xargs)
 
@@ -250,12 +252,27 @@ fi
 echo "⚠  WARNING: Only the resources listed above will be removed."
 echo "   Unrelated containers (jellyfin, immich, etc.) will NOT be touched."
 echo ""
-echo -n "Type 'yes' to confirm permanent deletion of listed resources: "
-read -r CONFIRM
-if [ "${CONFIRM}" != "yes" ]; then
-  echo "Aborted."
-  exit 0
-fi
+case "${TEARDOWN_CONFIRM:-}" in
+  yes)
+    echo "Using non-interactive confirmation from TEARDOWN_CONFIRM=yes."
+    ;;
+  "")
+    if [ ! -t 0 ]; then
+      echo "Refusing non-interactive teardown without TEARDOWN_CONFIRM=yes." >&2
+      exit 2
+    fi
+    echo -n "Type 'yes' to confirm permanent deletion of listed resources: "
+    read -r CONFIRM
+    if [ "${CONFIRM}" != "yes" ]; then
+      echo "Aborted."
+      exit 0
+    fi
+    ;;
+  *)
+    echo "TEARDOWN_CONFIRM must be exactly 'yes'." >&2
+    exit 2
+    ;;
+esac
 
 # Re-check the installation identity after confirmation and before any
 # destructive Docker, process, or filesystem operation.

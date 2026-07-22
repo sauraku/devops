@@ -39,7 +39,7 @@ func TestProjectTokenCanOnlyReadItsDeploymentStatus(t *testing.T) {
 	cfg := &models.Config{Host: "127.0.0.1", BaseDir: root, DataDir: root, ProjectRoot: root}
 	audit := services.NewAuditService(database)
 	deploys := services.NewDeployService(database, nil, audit, cfg)
-	auth := NewAuthenticator(strings.Repeat("m", 64), strings.Repeat("c", 64), false)
+	auth := NewAuthenticator(strings.Repeat("m", 64), strings.Repeat("c", 64), false, nil)
 	router := NewRouter(&Handler{deploys: deploys}, auth, cfg)
 	statusPath := "/api/projects/medusa/deployments/deploy-medusa-123/status"
 

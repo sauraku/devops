@@ -1,9 +1,12 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +27,10 @@ type Client struct {
 // and before it has returned its final success status.
 const composeDownTimeout = 2 * time.Minute
 
+const ContainerReadFileLimit = 10 * 1024 * 1024
+
+var ErrContainerFileTooLarge = errors.New("container file exceeds read limit")
+
 func NewClient() *Client {
 	c := &Client{}
 	c.detectComposeBinary()
@@ -31,7 +38,9 @@ func NewClient() *Client {
 }
 
 func (c *Client) detectComposeBinary() {
-	if err := exec.Command("docker", "compose", "version").Run(); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "docker", "compose", "version").Run(); err == nil {
 		c.composeBinary = "docker compose"
 	} else {
 		c.composeBinary = "docker-compose"
@@ -180,9 +189,28 @@ func (c *Client) ContainerReadFile(containerName, filePath string) (string, erro
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "docker", "exec", containerName, "cat", "--", filePath)
-	output, err := cmd.Output()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("read file %s from container %s: %w", filePath, containerName, err)
+		return "", fmt.Errorf("open container file stream: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start container file read: %w", err)
+	}
+	output, readErr := io.ReadAll(io.LimitReader(stdout, ContainerReadFileLimit+1))
+	if len(output) > ContainerReadFileLimit {
+		cancel()
+		_ = cmd.Wait()
+		return "", fmt.Errorf("%w (%d bytes)", ErrContainerFileTooLarge, ContainerReadFileLimit)
+	}
+	if readErr != nil {
+		cancel()
+		_ = cmd.Wait()
+		return "", fmt.Errorf("read container file stream: %w", readErr)
+	}
+	if err := cmd.Wait(); err != nil {
+		return "", fmt.Errorf("read file from container: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return string(output), nil
 }
@@ -269,12 +297,22 @@ func (c *Client) ComposeUp(composeFile, projectName string, envVars map[string]s
 		return fmt.Errorf("compose up failed: %s: %s", err, strings.TrimSpace(string(output)))
 	}
 
-	// Enforce restart: unless-stopped on started containers so they survive host reboots
+	// Enforce restart: unless-stopped on the exact Compose-owned containers so
+	// this remains correct for custom container names and Compose naming changes.
 	for _, svc := range services {
-		name := fmt.Sprintf("%s-%s-1", projectName, svc)
+		name, err := c.FindComposeContainer(projectName, svc)
+		if err != nil {
+			return fmt.Errorf("resolve started Compose service %s/%s: %w", projectName, svc, err)
+		}
+		if name == "" {
+			return fmt.Errorf("started Compose service %s/%s was not found", projectName, svc)
+		}
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-		exec.CommandContext(ctx2, "docker", "update", "--restart", "unless-stopped", name).Run()
+		updateOutput, updateErr := exec.CommandContext(ctx2, "docker", "update", "--restart", "unless-stopped", name).CombinedOutput()
 		cancel2()
+		if updateErr != nil {
+			return fmt.Errorf("set restart policy for Compose service %s/%s: %w: %s", projectName, svc, updateErr, strings.TrimSpace(string(updateOutput)))
+		}
 	}
 	return nil
 }
@@ -510,9 +548,10 @@ func (c *Client) ComposeRecreate(composeFile, projectName, envFile string, servi
 
 	cmdArgs := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
 	if envFile != "" {
-		if _, err := os.Stat(envFile); err == nil {
-			cmdArgs = append(cmdArgs, "--env-file", envFile)
+		if _, err := os.Stat(envFile); err != nil {
+			return fmt.Errorf("env file %s is missing or inaccessible: %w", envFile, err)
 		}
+		cmdArgs = append(cmdArgs, "--env-file", envFile)
 	}
 	cmdArgs = append(cmdArgs, "up", "-d", "--force-recreate", service)
 
@@ -680,9 +719,28 @@ func dockerCommandEnv(overrides map[string]string) []string {
 		}
 	}
 	for key, value := range overrides {
+		if IsReservedCommandEnvKey(key) {
+			continue
+		}
 		env = append(env, key+"="+value)
 	}
 	return env
+}
+
+// IsReservedCommandEnvKey identifies environment names owned by the controller
+// or the Docker CLI. Project configuration must not redirect command lookup,
+// Docker access, or controller-managed paths.
+func IsReservedCommandEnvKey(key string) bool {
+	switch key {
+	case "PATH", "HOME", "DOCKER_CONFIG", "DOCKER_HOST", "DOCKER_CONTEXT",
+		"BASH_ENV", "ENV", "CDPATH", "IFS", "BASHOPTS", "SHELLOPTS",
+		"PROJECT_DIR", "PROJECT_ENV_FILE", "PROJECT_COMPOSE_FILE",
+		"PROJECT_STATE_DIR", "PROJECT_RELEASE_DIR", "PROJECT_LOG_DIR",
+		"COMPOSE_PROJECT_NAME", "DEPLOY_PROCESS_PID", "DEPLOY_ACTOR":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Client) RegistryLogin(host, username, password string) (bool, string) {

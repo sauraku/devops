@@ -321,6 +321,9 @@ func TestRunnerComposeHasNoRegistrationCredentialEnvironment(t *testing.T) {
 	if !strings.Contains(compose, "/run/devops-runner-registration") || !strings.Contains(compose, "tmpfs:") {
 		t.Fatal("runner registration handoff is not backed by tmpfs")
 	}
+	if strings.Contains(compose, "host.docker.internal") || strings.Contains(compose, "host-gateway") {
+		t.Fatal("runner Compose configuration exposes host services")
+	}
 }
 
 func TestRunnerRegistrationTokenErrorDoesNotExposeCredentialOrResponse(t *testing.T) {
@@ -468,5 +471,48 @@ func TestComposeServicesPrefersMonitoringContract(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("composeServices = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestComposeServicesDoesNotInventMedusaServices(t *testing.T) {
+	service := &ProjectService{docker: docker.NewClient()}
+	if got := service.composeServices(&models.Project{AppDir: t.TempDir()}); len(got) != 0 {
+		t.Fatalf("composeServices = %v, want no inferred services", got)
+	}
+}
+
+func TestUpdateEnvFileWithOverridesWritesSortedAtomically(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, ".env.main")
+	if err := os.WriteFile(envFile, []byte("ZED=old\nALPHA=old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateEnvFileWithOverrides(envFile, map[string]string{
+		"ZED":    "new",
+		"MIDDLE": "value",
+	}, "medusa", "main"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ALPHA=old\nCOMPOSE_PROJECT_NAME=medusa-main\nENV_NAME=main\nMIDDLE=value\nZED=new\n"
+	if got := string(data); got != want {
+		t.Fatalf("env file = %q, want %q", got, want)
+	}
+	info, err := os.Stat(envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("env file mode = %o, want 600", info.Mode().Perm())
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".env.main.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary env files left behind: %v", matches)
 	}
 }

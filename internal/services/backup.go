@@ -234,7 +234,7 @@ func (s *BackupService) runBackup(d *models.Deployment, p *models.Project, env m
 	}
 
 	_ = s.db.UpdateDeploymentStatus(d.ID, status, &exitCode, &finishedAt)
-	_ = s.db.ReleaseLock(p.ID)
+	_ = s.db.ReleaseLock(p.ID, d.ID)
 	s.audit.Log("backup_finished", string(status), p.ID, fmt.Sprintf("backup=%s exit_code=%d", d.ID, exitCode), "")
 
 	// Sync manifest entries into the DB so restore/verify can find them
@@ -617,7 +617,7 @@ func (s *BackupService) runRestore(d *models.Deployment, p *models.Project, env 
 	}
 
 	_ = s.db.UpdateDeploymentStatus(d.ID, status, &exitCode, &finishedAt)
-	_ = s.db.ReleaseLock(p.ID)
+	_ = s.db.ReleaseLock(p.ID, d.ID)
 	s.audit.Log("restore_finished", string(status), p.ID, fmt.Sprintf("restore=%s exit_code=%d", d.ID, exitCode), "")
 
 	if logFile != nil {
@@ -730,7 +730,7 @@ func (s *BackupService) runRollback(d *models.Deployment, p *models.Project, env
 	}
 
 	_ = s.db.UpdateDeploymentStatus(d.ID, status, &exitCode, &finishedAt)
-	_ = s.db.ReleaseLock(p.ID)
+	_ = s.db.ReleaseLock(p.ID, d.ID)
 	s.audit.Log("rollback_finished", string(status), p.ID, fmt.Sprintf("rollback=%s exit_code=%d", d.ID, exitCode), "")
 
 	if logFile != nil {

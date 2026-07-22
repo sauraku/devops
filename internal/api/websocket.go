@@ -32,12 +32,17 @@ var upgrader = websocket.Upgrader{
 
 type LogStreamer struct {
 	mu      sync.RWMutex
-	clients map[string]map[*websocket.Conn]bool
+	clients map[string]map[*wsClient]bool
+}
+
+type wsClient struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
 }
 
 func NewLogStreamer() *LogStreamer {
 	return &LogStreamer{
-		clients: make(map[string]map[*websocket.Conn]bool),
+		clients: make(map[string]map[*wsClient]bool),
 	}
 }
 
@@ -47,25 +52,27 @@ func (ls *LogStreamer) HandleWebSocket(w http.ResponseWriter, r *http.Request, l
 		return
 	}
 	defer conn.Close()
+	client := &wsClient{conn: conn}
 
 	ls.mu.Lock()
 	if ls.clients[logPath] == nil {
-		ls.clients[logPath] = make(map[*websocket.Conn]bool)
+		ls.clients[logPath] = make(map[*wsClient]bool)
 	}
-	ls.clients[logPath][conn] = true
+	ls.clients[logPath][client] = true
 	ls.mu.Unlock()
 
 	defer func() {
 		ls.mu.Lock()
-		delete(ls.clients[logPath], conn)
+		delete(ls.clients[logPath], client)
 		ls.mu.Unlock()
 	}()
 
 	// Start streaming the log file
-	ls.streamLogFile(conn, logPath)
+	ls.streamLogFile(client, logPath)
 }
 
-func (ls *LogStreamer) streamLogFile(conn *websocket.Conn, logPath string) {
+func (ls *LogStreamer) streamLogFile(client *wsClient, logPath string) {
+	conn := client.conn
 	lastSize := int64(0)
 	if info, err := os.Stat(logPath); err == nil {
 		lastSize = info.Size()
@@ -91,8 +98,12 @@ func (ls *LogStreamer) streamLogFile(conn *websocket.Conn, logPath string) {
 		case <-ticker.C:
 			info, err := os.Stat(logPath)
 			if err != nil {
-				writeWSMessage(conn, map[string]string{"type": "waiting", "message": "Waiting for log file..."})
+				writeWSMessage(client, map[string]string{"type": "waiting", "message": "Waiting for log file..."})
 				continue
+			}
+
+			if info.Size() < lastSize {
+				lastSize = 0
 			}
 
 			if info.Size() == lastSize {
@@ -114,7 +125,7 @@ func (ls *LogStreamer) streamLogFile(conn *websocket.Conn, logPath string) {
 
 			if n > 0 {
 				lastSize = info.Size()
-				writeWSMessage(conn, map[string]any{
+				writeWSMessage(client, map[string]any{
 					"type": "log",
 					"data": string(data[:n]),
 				})
@@ -127,7 +138,10 @@ func (ls *LogStreamer) StreamDeploymentLog(projectID, deployID, logDir string) {
 	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", deployID))
 
 	ls.mu.RLock()
-	clients := ls.clients[logPath]
+	clients := make([]*wsClient, 0, len(ls.clients[logPath]))
+	for client := range ls.clients[logPath] {
+		clients = append(clients, client)
+	}
 	ls.mu.RUnlock()
 
 	if len(clients) == 0 {
@@ -144,29 +158,27 @@ func (ls *LogStreamer) StreamDeploymentLog(projectID, deployID, logDir string) {
 		"data": string(data),
 	}
 
-	ls.mu.RLock()
-	defer ls.mu.RUnlock()
-	for conn := range ls.clients[logPath] {
-		writeWSMessage(conn, msg)
+	for _, client := range clients {
+		writeWSMessage(client, msg)
 	}
 }
 
-func writeWSMessage(conn *websocket.Conn, msg any) {
+func writeWSMessage(client *wsClient, msg any) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-	wsMu.RLock()
-	conn.WriteMessage(websocket.TextMessage, data)
-	wsMu.RUnlock()
+	client.writeMu.Lock()
+	defer client.writeMu.Unlock()
+	if err := client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return
+	}
+	_ = client.conn.WriteMessage(websocket.TextMessage, data)
 }
 
-var wsMu sync.RWMutex
-
-func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request, projectID string) {
-	logName := queryParam(r, "name")
-	if logName == "" {
-		writeError(w, http.StatusBadRequest, "log name is required")
+func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request, projectID, deployID string) {
+	if deployID == "" {
+		writeError(w, http.StatusBadRequest, "deploy ID is required")
 		return
 	}
 
@@ -177,7 +189,7 @@ func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request, proje
 	}
 
 	logDir := h.projects.LogDir(p)
-	logPath := filepath.Join(logDir, filepath.Base(logName))
+	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", deployID))
 
 	streamer := NewLogStreamer()
 	streamer.HandleWebSocket(w, r, logPath)
