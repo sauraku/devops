@@ -3,6 +3,7 @@ package docker
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -94,6 +95,7 @@ printf '%s\n' '{"auths":{}}' > "$DOCKER_CONFIG/config.json"
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_HOST", "unix:///explicit-test-docker.sock")
 
 	type result struct {
 		auth *RegistryAuth
@@ -149,6 +151,250 @@ printf '%s\n' '{"auths":{}}' > "$DOCKER_CONFIG/config.json"
 		if !strings.Contains(logged, "|"+password+"|700") {
 			t.Fatalf("login did not use a private mode-0700 config: %q", logged)
 		}
+	}
+}
+
+func TestRegistryLoginIsolatedImportsActiveContextWithoutGlobalAuth(t *testing.T) {
+	root := t.TempDir()
+	globalConfigDir := filepath.Join(root, "global-docker")
+	if err := os.MkdirAll(globalConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const globalSecret = "global-auth-must-not-be-copied"
+	globalConfig := `{"currentContext":"colima","auths":{"registry.example":{"auth":"` + globalSecret + `"}}}`
+	if err := os.WriteFile(filepath.Join(globalConfigDir, "config.json"), []byte(globalConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(root, "docker-log")
+	dockerStub := filepath.Join(root, "docker")
+	stub := `#!/bin/sh
+set -eu
+case "${1:-}:${2:-}" in
+  context:export)
+    [ "${3:-}" = "--" ]
+    [ "${4:-}" = "colima" ]
+    [ "${5:-}" = "-" ]
+    [ "$DOCKER_CONFIG" = ` + strconv.Quote(globalConfigDir) + ` ]
+    printf 'export|%s\n' "$DOCKER_CONFIG" >> ` + strconv.Quote(logPath) + `
+    printf 'colima-context-archive'
+    ;;
+  context:import)
+    [ "${3:-}" = "--" ]
+    [ "${4:-}" = "colima" ]
+    [ "${5:-}" = "-" ]
+    [ "$DOCKER_CONFIG" != ` + strconv.Quote(globalConfigDir) + ` ]
+    [ ! -e "$DOCKER_CONFIG/config.json" ]
+    [ "$(cat)" = "colima-context-archive" ]
+    : > "$DOCKER_CONFIG/imported-colima"
+    printf 'import|%s\n' "$DOCKER_CONFIG" >> ` + strconv.Quote(logPath) + `
+    ;;
+  context:use)
+    [ "${3:-}" = "--" ]
+    [ "${4:-}" = "colima" ]
+    [ -f "$DOCKER_CONFIG/imported-colima" ]
+    printf '%s\n' '{"currentContext":"colima"}' > "$DOCKER_CONFIG/config.json"
+    printf 'use|%s\n' "$DOCKER_CONFIG" >> ` + strconv.Quote(logPath) + `
+    ;;
+  login:registry.example)
+    [ -f "$DOCKER_CONFIG/imported-colima" ]
+    grep -q '"currentContext":"colima"' "$DOCKER_CONFIG/config.json"
+    password="$(cat)"
+    [ "$password" = "project-registry-password" ]
+    printf '%s\n' '{"currentContext":"colima","auths":{"registry.example":{"auth":"isolated-auth"}}}' > "$DOCKER_CONFIG/config.json"
+    printf 'login|%s\n' "$DOCKER_CONFIG" >> ` + strconv.Quote(logPath) + `
+    ;;
+  version:)
+    [ -f "$DOCKER_CONFIG/imported-colima" ]
+    grep -q '"currentContext":"colima"' "$DOCKER_CONFIG/config.json"
+    ! grep -q ` + strconv.Quote(globalSecret) + ` "$DOCKER_CONFIG/config.json"
+    printf 'version|%s\n' "$DOCKER_CONFIG" >> ` + strconv.Quote(logPath) + `
+    ;;
+  *)
+    exit 97
+    ;;
+esac
+`
+	if err := os.WriteFile(dockerStub, []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", root)
+	t.Setenv("DOCKER_CONFIG", globalConfigDir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	auth, ok, message := (&Client{}).RegistryLoginIsolated("registry.example", "operator", "project-registry-password")
+	if !ok || auth == nil {
+		t.Fatalf("isolated registry login failed: %s", message)
+	}
+	t.Cleanup(func() { _ = auth.Close() })
+	if auth.ConfigDir() == globalConfigDir {
+		t.Fatal("registry login reused the global Docker config")
+	}
+
+	command := exec.Command("docker", "version")
+	command.Env = CommandEnvForConfig(auth.ConfigDir())
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("subsequent Docker command did not use imported context: %v: %s", err, output)
+	}
+
+	isolatedConfig, err := os.ReadFile(filepath.Join(auth.ConfigDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(isolatedConfig), globalSecret) {
+		t.Fatal("global registry auth was copied into the isolated Docker config")
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(logged)), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("Docker command sequence = %q", logged)
+	}
+	isolatedDir := auth.ConfigDir()
+	for index, prefix := range []string{"export|" + globalConfigDir, "import|" + isolatedDir, "use|" + isolatedDir, "login|" + isolatedDir, "version|" + isolatedDir} {
+		if lines[index] != prefix {
+			t.Fatalf("Docker command %d = %q, want %q", index, lines[index], prefix)
+		}
+	}
+}
+
+func TestRegistryLoginIsolatedKeepsExplicitDockerHostAuthoritative(t *testing.T) {
+	root := t.TempDir()
+	globalConfigDir := filepath.Join(root, "global-docker")
+	if err := os.MkdirAll(globalConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(globalConfigDir, "config.json"), []byte(`{"currentContext":"colima"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(root, "docker-log")
+	dockerStub := filepath.Join(root, "docker")
+	const explicitHost = "unix:///explicit/docker.sock"
+	stub := `#!/bin/sh
+set -eu
+[ "${DOCKER_HOST:-}" = ` + strconv.Quote(explicitHost) + ` ]
+[ -z "${DOCKER_CONTEXT+x}" ]
+case "${1:-}" in
+  context)
+    exit 96
+    ;;
+  login)
+    password="$(cat)"
+    [ "$password" = "project-registry-password" ]
+    printf '%s\n' '{"auths":{"registry.example":{"auth":"isolated-auth"}}}' > "$DOCKER_CONFIG/config.json"
+    printf 'login\n' >> ` + strconv.Quote(logPath) + `
+    ;;
+  version)
+    printf 'version\n' >> ` + strconv.Quote(logPath) + `
+    ;;
+  *)
+    exit 97
+    ;;
+esac
+`
+	if err := os.WriteFile(dockerStub, []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", root)
+	t.Setenv("DOCKER_CONFIG", globalConfigDir)
+	t.Setenv("DOCKER_HOST", explicitHost)
+	t.Setenv("DOCKER_CONTEXT", "colima")
+
+	auth, ok, message := (&Client{}).RegistryLoginIsolated("registry.example", "operator", "project-registry-password")
+	if !ok || auth == nil {
+		t.Fatalf("isolated registry login failed: %s", message)
+	}
+	t.Cleanup(func() { _ = auth.Close() })
+
+	command := exec.Command("docker", "version")
+	command.Env = CommandEnvForConfig(auth.ConfigDir())
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("subsequent Docker command did not preserve DOCKER_HOST: %v: %s", err, output)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(logged) != "login\nversion\n" {
+		t.Fatalf("unexpected Docker commands: %q", logged)
+	}
+}
+
+func TestRegistryLoginIsolatedRejectsOptionLikeDockerContextName(t *testing.T) {
+	root := t.TempDir()
+	unexpectedPath := filepath.Join(root, "unexpected-docker-command")
+	dockerStub := filepath.Join(root, "docker")
+	stub := "#!/bin/sh\n: > " + strconv.Quote(unexpectedPath) + "\nexit 98\n"
+	if err := os.WriteFile(dockerStub, []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", root)
+	t.Setenv("DOCKER_CONFIG", "")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "--help")
+
+	auth, ok, message := (&Client{}).RegistryLoginIsolated("registry.example", "operator", "project-registry-password")
+	if ok || auth != nil {
+		if auth != nil {
+			_ = auth.Close()
+		}
+		t.Fatal("option-like Docker context name was accepted")
+	}
+	if !strings.Contains(message, "active Docker context name is invalid") {
+		t.Fatalf("unexpected failure: %s", message)
+	}
+	if _, err := os.Stat(unexpectedPath); !os.IsNotExist(err) {
+		t.Fatalf("Docker CLI ran with an option-like context name: %v", err)
+	}
+}
+
+func TestRegistryLoginIsolatedRejectsOversizedContextExport(t *testing.T) {
+	root := t.TempDir()
+	globalConfigDir := filepath.Join(root, "global-docker")
+	if err := os.MkdirAll(globalConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(globalConfigDir, "config.json"), []byte(`{"currentContext":"colima"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unexpectedPath := filepath.Join(root, "unexpected-command")
+	dockerStub := filepath.Join(root, "docker")
+	stub := `#!/bin/sh
+set -eu
+if [ "${1:-}" = context ] && [ "${2:-}" = export ]; then
+  head -c ` + strconv.Itoa(maxDockerContextArchiveSize+1) + ` /dev/zero
+  exit 0
+fi
+: > ` + strconv.Quote(unexpectedPath) + `
+exit 98
+`
+	if err := os.WriteFile(dockerStub, []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", root)
+	t.Setenv("DOCKER_CONFIG", globalConfigDir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	auth, ok, message := (&Client{}).RegistryLoginIsolated("registry.example", "operator", "project-registry-password")
+	if ok || auth != nil {
+		if auth != nil {
+			_ = auth.Close()
+		}
+		t.Fatal("oversized Docker context export was accepted")
+	}
+	if !strings.Contains(message, "context export exceeds size limit") {
+		t.Fatalf("unexpected failure: %s", message)
+	}
+	if _, err := os.Stat(unexpectedPath); !os.IsNotExist(err) {
+		t.Fatalf("context import or registry login ran after oversized export: %v", err)
 	}
 }
 

@@ -122,7 +122,6 @@ func TestOperationProcessEnvironmentsPreserveTrustedDockerSettings(t *testing.T)
 				"PATH":               "/controller/bin",
 				"HOME":               "/controller/home",
 				"DOCKER_HOST":        "tcp://controller.example:2376",
-				"DOCKER_CONTEXT":     "controller-context",
 				"DOCKER_TLS":         "1",
 				"DOCKER_TLS_VERIFY":  "1",
 				"DOCKER_CERT_PATH":   "/controller/docker-certs",
@@ -131,6 +130,9 @@ func TestOperationProcessEnvironmentsPreserveTrustedDockerSettings(t *testing.T)
 				if got := values[key]; got != want {
 					t.Fatalf("%s = %q, want trusted controller value %q", key, got, want)
 				}
+			}
+			if _, found := values["DOCKER_CONTEXT"]; found {
+				t.Fatalf("DOCKER_CONTEXT overrode the explicit controller DOCKER_HOST in %s environment", tc.name)
 			}
 			for key, want := range tc.want {
 				if got := values[key]; got != want {
@@ -144,4 +146,13 @@ func TestOperationProcessEnvironmentsPreserveTrustedDockerSettings(t *testing.T)
 			}
 		})
 	}
+
+	t.Run("context is preserved without explicit host", func(t *testing.T) {
+		t.Setenv("DOCKER_HOST", "")
+		t.Setenv("DOCKER_CONTEXT", "controller-context")
+		values := environmentMap(t, deploymentProcessEnv(nil))
+		if got := values["DOCKER_CONTEXT"]; got != "controller-context" {
+			t.Fatalf("DOCKER_CONTEXT = %q, want controller-context", got)
+		}
+	})
 }

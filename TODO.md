@@ -55,6 +55,7 @@
   - [x] `deploy/lib.sh:20-24`: extend dotenv blocklist (`TMPDIR`, `*_PROXY`, `DOCKER_*`, `PYTHON*`, `NODE_*`); tolerate readonly-var export failures.
   - [x] `deploy/runner/entrypoint.sh`: guard `rm -rf` against empty/`/` `RUNNER_DIR`; align default labels with compose (`development` only); execute the runner directly so output and exit status are byte-preserved without a detector, FIFO, or temporary log. Recovery decisions belong exclusively to the controller and GitHub API (`tests/runner_entrypoint_test.sh`).
   - [x] `deploy/runner/docker-compose.runner.yml`: remove `host.docker.internal:host-gateway`; runner callbacks use the dedicated control network.
+  - [x] Compose CLI selection is centralized in `deploy/lib.sh`; deploy, backup, and restore support both the Docker CLI plugin and the standalone Compose v2 binary, and fail before mutating project state when neither is available.
   - [x] GCP private key tempfile unlinked only on happy path (`scripts/backup-db.sh:296-300`, `scripts/restore-db.sh:174-178`) — try/finally or in-process signing.
   - [x] Signal traps use explicit 130/143 exits so cleanup records cancellation as a failure.
   - [x] `deploy/project.sh:498-503`: `IMAGE_TAG` never charset-validated before being written into the dotenv file (newline → env injection).
@@ -65,7 +66,7 @@
 
 - [ ] **Unify the four operation runners:** `runDeploy` / `runBackup` / `runRestore` / `runRollback` still duplicate process-group, log, exit-code, and lock-release handling. All four now use the same controller-owned environment allowlist, so the remaining work is to extract one `runOperation(script, args, env, timeout, logPath, kind)` helper and make log-open failures explicit.
 - [x] **Use patch semantics for project state and environment overrides:** state callers submit only owned fields to the SQL patch, while environment saves use an encrypted transactional read-modify-write with explicit clear keys. Pause/resume, deploy completion, abort, partial SMTP updates, and explicit clears have regression coverage.
-- [ ] **Move duplicated script blocks into `deploy/lib.sh`:** `branch_slug` ×3, compose-binary detect ×3, `verify_owned_container` ×2 verbatim, Firebase JWT/upload ×2 verbatim (drift has already caused bugs — see list-releases and BACKUP_ID validation).
+- [ ] **Move duplicated script blocks into `deploy/lib.sh`:** `branch_slug` ×3, `verify_owned_container` ×2 verbatim, Firebase JWT/upload ×2 verbatim (drift has already caused bugs — see list-releases and BACKUP_ID validation).
 - [x] **Delete the hardcoded service fallback** (`internal/services/project.go`): return no inferred services when neither `devops.json` nor Compose parsing provides them.
 - [x] **`case "deployments"` → ProjectStatus fake endpoint** (`internal/api/router.go:273-274`): now returns 501 instead of wrong data.
 - [ ] **Gate the sibling-checkout fallback in `ensureEnvTemplate` behind a dev flag** (`internal/services/project.go:907-918`) — local-dev workaround in prod code.

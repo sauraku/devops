@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -135,6 +137,51 @@ func TestDeploymentStatePatchesPreserveConcurrentPauseFields(t *testing.T) {
 	}
 }
 
+func TestWaitCommandWithContextCleanupKillsRemainingProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	childPIDPath := filepath.Join(dir, "child.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", `trap "" TERM; sleep 30 & echo "$!" > "$1"; wait`, "sh", childPIDPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	var childPID int
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(childPIDPath)
+		if err == nil {
+			childPID, err = strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if childPID <= 1 {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		t.Fatal("child process did not start")
+	}
+
+	cancel()
+	if err := waitCommandWithContextCleanup(ctx, cmd); err == nil {
+		t.Fatal("cancelled command returned success")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		output, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(childPID)).Output()
+		state := strings.TrimSpace(string(output))
+		if err != nil || state == "" || strings.HasPrefix(state, "Z") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("child process %d remained active after context cancellation", childPID)
+}
+
 func TestValidateDeployRequestAcceptsMatchingGitHubCallback(t *testing.T) {
 	project := &models.Project{ID: "medusa", RepoURL: "https://github.com/sauraku/medusa.git", BranchName: "dev"}
 	request := githubDeployRequest()
@@ -245,7 +292,6 @@ func TestDeploymentProcessEnvPreservesControllerDockerAuthAndBlocksProjectContro
 		"HOME":               "/controller/home",
 		"DOCKER_CONFIG":      "/tmp/project-operation-docker-config",
 		"DOCKER_HOST":        "unix:///var/run/docker.sock",
-		"DOCKER_CONTEXT":     "controller",
 		"DOCKER_TLS":         "1",
 		"DOCKER_TLS_VERIFY":  "1",
 		"DOCKER_CERT_PATH":   "/tmp/controller-docker-certificates",
@@ -257,6 +303,9 @@ func TestDeploymentProcessEnvPreservesControllerDockerAuthAndBlocksProjectContro
 		if got := values[key]; got != want {
 			t.Fatalf("%s = %q, want %q", key, got, want)
 		}
+	}
+	if _, found := values["DOCKER_CONTEXT"]; found {
+		t.Fatal("DOCKER_CONTEXT overrode the explicit controller DOCKER_HOST")
 	}
 	for _, key := range []string{
 		"LD_PRELOAD", "LD_LIBRARY_PATH", "GCONV_PATH", "BASH_ENV", "PYTHONPATH", "PYTHONINSPECT",
@@ -450,6 +499,9 @@ ENV_NAME=
 		filepath.Join(projectDir, ".env.template"): template,
 		filepath.Join(projectDir, ".env.main"): `APP_VALUE=old-app-value
 REMOVED_KEY=stale-removed-value
+OPENSEARCH_INITIAL_ADMIN_PASSWORD=retired-admin-secret
+OPENSEARCH_KEYSTORE_PASSWORD=retired-keystore-secret
+OPENSEARCH_SECURITY_MIGRATION_APPROVED=true
 DEPLOY_ID=stale-deploy-id
 GITHUB_RUN_ID=stale-run-id
 IMAGE_TAG=stale-image
@@ -481,23 +533,32 @@ for key in LD_PRELOAD LD_LIBRARY_PATH GCONV_PATH BASH_ENV PYTHONPATH PYTHONINSPE
   fi
 done
 if [[ "${1:-}" == "compose" ]]; then
+  if [[ "${2:-}" == "version" && "${3:-}" == "--short" ]]; then
+    printf '%s\n' '2.0.0'
+    exit 0
+  fi
   for argument in "$@"; do
     if [[ "${argument}" == "config" ]]; then
       printf '%s\n' '{"volumes":{},"networks":{},"services":{}}'
       exit 0
     fi
   done
+  is_up=false
+  removes_orphans=false
+  for argument in "$@"; do
+    [[ "${argument}" == "up" ]] && is_up=true
+    [[ "${argument}" == "--remove-orphans" ]] && removes_orphans=true
+  done
+  if [[ "${is_up}" == "true" && "${removes_orphans}" != "true" ]]; then
+    echo "compose up omitted --remove-orphans" >&2
+    exit 43
+  fi
   exit 0
 fi
 if [[ "${1:-}" == "ps" ]]; then
   exit 0
 fi
 exit 0
-`
-	timeoutStub := `#!/usr/bin/env bash
-set -euo pipefail
-shift
-exec "$@"
 `
 	validatorStub := `#!/usr/bin/env bash
 set -euo pipefail
@@ -523,7 +584,6 @@ esac
 `
 	for path, content := range map[string]string{
 		filepath.Join(binDir, "docker"):         dockerStub,
-		filepath.Join(binDir, "timeout"):        timeoutStub,
 		filepath.Join(binDir, "devops-control"): validatorStub,
 	} {
 		if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
@@ -624,6 +684,8 @@ esac
 	for _, key := range []string{
 		"UNDECLARED_APPLICATION", "REMOVED_KEY", "DEPLOY_ID", "GITHUB_RUN_ID",
 		"DOCKER_TLS_VERIFY", "COMPOSE_PROFILES", "BUILDKIT_HOST", "BUILDX_CONFIG",
+		"OPENSEARCH_INITIAL_ADMIN_PASSWORD", "OPENSEARCH_KEYSTORE_PASSWORD",
+		"OPENSEARCH_SECURITY_MIGRATION_APPROVED",
 	} {
 		if _, exists := rendered[key]; exists {
 			t.Fatalf("stale or undeclared key %s was rendered", key)

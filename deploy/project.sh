@@ -189,7 +189,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-COMPOSE_CMD=(docker compose)
+select_compose_command
 
 if ! acquire_lock; then
   audit "deploy_blocked" "blocked" "lock exists"
@@ -498,8 +498,15 @@ echo "  Compose file: ${COMPOSE_FILE}"
 echo "  Env file: ${ENV_FILE}"
 echo "========================================="
 
-if ! timeout 300 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${runtime_compose_file}" --env-file "${runtime_env_file}" pull; then
-  echo "Error: image pull failed or timed out; refusing to deploy stale cached images." >&2
+set +e
+run_with_timeout 900 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${runtime_compose_file}" --env-file "${runtime_env_file}" pull
+pull_status=$?
+set -e
+if [ "${pull_status}" -eq 124 ]; then
+  echo "Error: image pull timed out after 900 seconds; refusing to deploy stale cached images." >&2
+  exit 1
+elif [ "${pull_status}" -ne 0 ]; then
+  echo "Error: image pull failed with status ${pull_status}; refusing to deploy stale cached images." >&2
   exit 1
 fi
 

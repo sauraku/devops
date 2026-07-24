@@ -1090,13 +1090,13 @@ func TestRestoreCommandMustBeArgumentArray(t *testing.T) {
 
 func TestComposeServicesPrefersMonitoringContract(t *testing.T) {
 	dir := t.TempDir()
-	config := `{"services":{"storefront":{},"backend":{},"opensearch":{}}}`
+	config := `{"services":{"storefront":{},"backend":{},"redis":{},"postgres":{}}}`
 	if err := os.WriteFile(filepath.Join(dir, "devops.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	service := &ProjectService{}
 	got := service.composeServices(&models.Project{AppDir: dir})
-	want := []string{"backend", "opensearch", "storefront"}
+	want := []string{"backend", "postgres", "redis", "storefront"}
 	if len(got) != len(want) {
 		t.Fatalf("composeServices = %v, want %v", got, want)
 	}

@@ -728,6 +728,12 @@ func dockerCommandEnvWithConfig(overrides map[string]string, configDir string) [
 	}
 	if configDir != "" {
 		values["DOCKER_CONFIG"] = configDir
+		// Docker gives DOCKER_CONTEXT precedence over DOCKER_HOST. When the
+		// operator explicitly selected a daemon endpoint, do not let a stale
+		// context variable redirect isolated registry/deployment commands.
+		if values["DOCKER_HOST"] != "" {
+			delete(values, "DOCKER_CONTEXT")
+		}
 	}
 	for key, value := range overrides {
 		if IsReservedCommandEnvKey(key) {
@@ -813,12 +819,184 @@ func (c *Client) RegistryLoginIsolated(host, username, password string) (*Regist
 		return nil, false, fmt.Sprintf("secure isolated Docker credential directory: %s", err)
 	}
 	auth := &RegistryAuth{configDir: configDir}
+	if err := preserveActiveDockerContext(configDir); err != nil {
+		_ = auth.Close()
+		return nil, false, fmt.Sprintf("prepare isolated Docker context: %s", err)
+	}
 	ok, message := c.registryLogin(host, username, password, configDir)
 	if !ok {
 		_ = auth.Close()
 		return nil, false, message
 	}
 	return auth, true, message
+}
+
+const (
+	maxDockerConfigSize         = 1024 * 1024
+	maxDockerContextArchiveSize = 8 * 1024 * 1024
+	dockerContextCommandTimeout = 15 * time.Second
+)
+
+// preserveActiveDockerContext imports only the selected context into the
+// operation's private Docker config. It intentionally does not copy the global
+// config.json, which may contain unrelated registry credentials.
+func preserveActiveDockerContext(isolatedConfigDir string) error {
+	contextName, err := activeDockerContext()
+	if err != nil {
+		return err
+	}
+	if contextName == "" || contextName == "default" {
+		return nil
+	}
+	if !validDockerContextName(contextName) {
+		return fmt.Errorf("active Docker context name is invalid")
+	}
+
+	archive, err := exportDockerContext(contextName)
+	if err != nil {
+		return err
+	}
+	if err := importDockerContext(isolatedConfigDir, contextName, archive); err != nil {
+		return err
+	}
+	return useDockerContext(isolatedConfigDir, contextName)
+}
+
+func activeDockerContext() (string, error) {
+	// DOCKER_HOST identifies the daemon directly and must remain authoritative.
+	if strings.TrimSpace(os.Getenv("DOCKER_HOST")) != "" {
+		return "", nil
+	}
+	if contextName := strings.TrimSpace(os.Getenv("DOCKER_CONTEXT")); contextName != "" {
+		return contextName, nil
+	}
+
+	configDir := strings.TrimSpace(os.Getenv("DOCKER_CONFIG"))
+	if configDir == "" {
+		home := strings.TrimSpace(os.Getenv("HOME"))
+		if home == "" {
+			return "", nil
+		}
+		configDir = filepath.Join(home, ".docker")
+	}
+	configPath := filepath.Join(configDir, "config.json")
+	file, err := os.Open(configPath)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read Docker client configuration: %w", err)
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil {
+		return "", fmt.Errorf("inspect Docker client configuration: %w", err)
+	} else if info.Size() > maxDockerConfigSize {
+		return "", fmt.Errorf("Docker client configuration exceeds size limit")
+	}
+
+	var config struct {
+		CurrentContext string `json:"currentContext"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(file, maxDockerConfigSize+1))
+	if err := decoder.Decode(&config); err != nil {
+		return "", fmt.Errorf("parse Docker client configuration: %w", err)
+	}
+	return strings.TrimSpace(config.CurrentContext), nil
+}
+
+func validDockerContextName(name string) bool {
+	if name == "" || len(name) > 255 {
+		return false
+	}
+	first := name[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') ||
+		(first >= '0' && first <= '9')) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+type boundedCommandBuffer struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (b *boundedCommandBuffer) Write(p []byte) (int, error) {
+	originalLength := len(p)
+	remaining := b.limit - b.buffer.Len()
+	if remaining <= 0 {
+		b.exceeded = b.exceeded || originalLength > 0
+		return originalLength, nil
+	}
+	if len(p) > remaining {
+		_, _ = b.buffer.Write(p[:remaining])
+		b.exceeded = true
+		return originalLength, nil
+	}
+	_, _ = b.buffer.Write(p)
+	return originalLength, nil
+}
+
+func exportDockerContext(contextName string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerContextCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "context", "export", "--", contextName, "-")
+	cmd.Env = dockerCommandEnvWithConfig(nil, "")
+	cmd.Stderr = io.Discard
+	output := &boundedCommandBuffer{limit: maxDockerContextArchiveSize}
+	cmd.Stdout = output
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("Docker context export timed out")
+		}
+		return nil, fmt.Errorf("export active Docker context: %w", err)
+	}
+	if output.exceeded {
+		return nil, fmt.Errorf("Docker context export exceeds size limit")
+	}
+	return output.buffer.Bytes(), nil
+}
+
+func importDockerContext(configDir, contextName string, archive []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerContextCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "context", "import", "--", contextName, "-")
+	cmd.Env = dockerCommandEnvWithConfig(nil, configDir)
+	cmd.Stdin = bytes.NewReader(archive)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("Docker context import timed out")
+		}
+		return fmt.Errorf("import active Docker context: %w", err)
+	}
+	return nil
+}
+
+func useDockerContext(configDir, contextName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerContextCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "context", "use", "--", contextName)
+	cmd.Env = dockerCommandEnvWithConfig(nil, configDir)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("Docker context selection timed out")
+		}
+		return fmt.Errorf("select imported Docker context: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) registryLogin(host, username, password, configDir string) (bool, string) {

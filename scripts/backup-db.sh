@@ -21,7 +21,7 @@ MANIFEST_FILE="${TRUSTED_MANIFEST_FILE}"
 
 mkdir -p "${STATE_DIR}" "${BACKUP_DIR}" "${LOG_DIR}"
 
-COMPOSE_CMD=(docker compose)
+select_compose_command
 
 TARGET_BRANCH="${TARGET_BRANCH:-${GITHUB_REF_NAME:-main}}"
 case "${TARGET_BRANCH}" in

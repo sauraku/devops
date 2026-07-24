@@ -539,7 +539,7 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, contr
 				err = fmt.Errorf("deployment was cancelled before execution")
 			}
 		} else {
-			err = cmd.Wait()
+			err = waitCommandWithContextCleanup(ctx, cmd)
 		}
 		streamErr := overrideStream.finish()
 		if err == nil && streamErr != nil {
@@ -581,6 +581,17 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, contr
 	}
 
 	s.audit.Log("deploy_finished", string(status), p.ID, fmt.Sprintf("deploy=%s exit_code=%d", d.ID, exitCode), "")
+}
+
+func waitCommandWithContextCleanup(ctx context.Context, cmd *exec.Cmd) error {
+	err := cmd.Wait()
+	if ctx.Err() != nil && cmd.Process != nil {
+		// exec.CommandContext kills only the process leader. Deployment commands
+		// run in their own process group, so kill the remaining descendants
+		// immediately after Wait observes context cancellation.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	return err
 }
 
 // recordDeploymentCompletionState patches only fields owned by the deployment
@@ -713,6 +724,12 @@ func controllerProcessEnv(controllerEnv map[string]string, allowedKeys map[strin
 		if _, ok := allowedKeys[key]; ok {
 			processEnv[key] = value
 		}
+	}
+	// Docker gives DOCKER_CONTEXT precedence over DOCKER_HOST. An explicitly
+	// configured endpoint must remain authoritative for both registry login and
+	// the deployment/backup/restore commands that follow it.
+	if processEnv["DOCKER_HOST"] != "" {
+		delete(processEnv, "DOCKER_CONTEXT")
 	}
 
 	keys := make([]string, 0, len(processEnv))
