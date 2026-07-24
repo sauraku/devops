@@ -18,6 +18,7 @@ func installFakeOwnershipDocker(t *testing.T, projectLabel string) {
 	script := `#!/usr/bin/env bash
 set -eu
 if [ "${1:-}" = "compose" ] && [ "${2:-}" = "version" ]; then
+  printf '2.40.3\n'
   exit 0
 fi
 if [ "${1:-}" = "ps" ]; then
@@ -139,6 +140,7 @@ func TestBackupRestoreScriptsIgnoreDotenvContainerTargets(t *testing.T) {
 set -eu
 printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG}"
 if [ "${1:-}" = "compose" ] && [ "${2:-}" = "version" ]; then
+  printf '2.40.3\n'
   exit 0
 fi
 if [ "${1:-}" = "ps" ]; then
