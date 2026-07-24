@@ -206,10 +206,7 @@ func (s *BackupService) runBackup(d *models.Deployment, p *models.Project, env m
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = appDir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = backupProcessEnv(env)
 
 	logFile, err := os.Create(d.LogPath)
 	if err == nil {
@@ -234,7 +231,9 @@ func (s *BackupService) runBackup(d *models.Deployment, p *models.Project, env m
 	}
 
 	_ = s.db.UpdateDeploymentStatus(d.ID, status, &exitCode, &finishedAt)
-	_ = s.db.ReleaseLock(p.ID, d.ID)
+	if err := s.db.ReleaseLock(p.ID, d.ID); err != nil {
+		log.Printf("release completed backup lock for project %s operation %s: %v", p.ID, d.ID, err)
+	}
 	s.audit.Log("backup_finished", string(status), p.ID, fmt.Sprintf("backup=%s exit_code=%d", d.ID, exitCode), "")
 
 	// Sync manifest entries into the DB so restore/verify can find them
@@ -589,10 +588,7 @@ func (s *BackupService) runRestore(d *models.Deployment, p *models.Project, env 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = p.AppDir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = restoreProcessEnv(env)
 
 	logFile, err := os.Create(d.LogPath)
 	if err == nil {
@@ -617,7 +613,9 @@ func (s *BackupService) runRestore(d *models.Deployment, p *models.Project, env 
 	}
 
 	_ = s.db.UpdateDeploymentStatus(d.ID, status, &exitCode, &finishedAt)
-	_ = s.db.ReleaseLock(p.ID, d.ID)
+	if err := s.db.ReleaseLock(p.ID, d.ID); err != nil {
+		log.Printf("release completed restore lock for project %s operation %s: %v", p.ID, d.ID, err)
+	}
 	s.audit.Log("restore_finished", string(status), p.ID, fmt.Sprintf("restore=%s exit_code=%d", d.ID, exitCode), "")
 
 	if logFile != nil {
@@ -630,6 +628,16 @@ func (s *BackupService) ListBackups(projectID string, limit int) ([]*models.Back
 }
 
 func (s *BackupService) Rollback(projectID, commit string) (*models.Deployment, error) {
+	var registryAuth *docker.RegistryAuth
+	registryAuthHandedOff := false
+	defer func() {
+		if registryAuth != nil && !registryAuthHandedOff {
+			if err := registryAuth.Close(); err != nil {
+				log.Printf("remove isolated registry credentials for %s rollback: %v", projectID, err)
+			}
+		}
+	}()
+
 	p, err := s.db.GetProject(projectID)
 	if err != nil {
 		return nil, fmt.Errorf("project not found: %s", projectID)
@@ -640,7 +648,10 @@ func (s *BackupService) Rollback(projectID, commit string) (*models.Deployment, 
 	if password, err := s.db.GetRegistryPassword(projectID); err != nil {
 		return nil, fmt.Errorf("load registry credentials: %w", err)
 	} else if password != "" {
-		if ok, message := s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, password); !ok {
+		var ok bool
+		var message string
+		registryAuth, ok, message = s.docker.RegistryLoginIsolated(p.RegistryHost, p.RegistryUsername, password)
+		if !ok {
 			return nil, fmt.Errorf("registry login failed: %s", message)
 		}
 	}
@@ -657,6 +668,9 @@ func (s *BackupService) Rollback(projectID, commit string) (*models.Deployment, 
 		"REPO_URL":        p.RepoURL,
 		"REGISTRY_HOST":   p.RegistryHost,
 		"PROJECT_LOG_DIR": filepath.Join(s.cfg.BaseDir, "Logs", projectID),
+	}
+	if registryAuth != nil {
+		env["DOCKER_CONFIG"] = registryAuth.ConfigDir()
 	}
 
 	deployment := &models.Deployment{
@@ -687,7 +701,17 @@ func (s *BackupService) Rollback(projectID, commit string) (*models.Deployment, 
 
 	s.audit.Log("rollback_started", "running", projectID, fmt.Sprintf("rollback=%s commit=%s", deployID, commit), "")
 
-	safeGo("runRollback", func() { s.runRollback(deployment, p, env, commit) })
+	safeGo("runRollback", func() {
+		if registryAuth != nil {
+			defer func() {
+				if err := registryAuth.Close(); err != nil {
+					log.Printf("remove isolated registry credentials for %s rollback: %v", projectID, err)
+				}
+			}()
+		}
+		s.runRollback(deployment, p, env, commit)
+	})
+	registryAuthHandedOff = true
 
 	return deployment, nil
 }
@@ -702,10 +726,7 @@ func (s *BackupService) runRollback(d *models.Deployment, p *models.Project, env
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = p.AppDir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	cmd.Env = rollbackProcessEnv(env)
 
 	logFile, err := os.Create(d.LogPath)
 	if err == nil {
@@ -730,7 +751,9 @@ func (s *BackupService) runRollback(d *models.Deployment, p *models.Project, env
 	}
 
 	_ = s.db.UpdateDeploymentStatus(d.ID, status, &exitCode, &finishedAt)
-	_ = s.db.ReleaseLock(p.ID, d.ID)
+	if err := s.db.ReleaseLock(p.ID, d.ID); err != nil {
+		log.Printf("release completed rollback lock for project %s operation %s: %v", p.ID, d.ID, err)
+	}
 	s.audit.Log("rollback_finished", string(status), p.ID, fmt.Sprintf("rollback=%s exit_code=%d", d.ID, exitCode), "")
 
 	if logFile != nil {

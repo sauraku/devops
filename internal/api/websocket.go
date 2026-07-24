@@ -13,31 +13,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return false
-		}
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		expected := fmt.Sprintf("%s://%s", scheme, r.Host)
-		return origin == expected
-	},
-}
-
 type LogStreamer struct {
 	mu      sync.RWMutex
 	clients map[string]map[*wsClient]bool
 }
 
 type wsClient struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	conn      *websocket.Conn
+	writeMu   sync.Mutex
+	closeOnce sync.Once
 }
 
 func NewLogStreamer() *LogStreamer {
@@ -46,13 +30,18 @@ func NewLogStreamer() *LogStreamer {
 	}
 }
 
-func (ls *LogStreamer) HandleWebSocket(w http.ResponseWriter, r *http.Request, logPath string) {
+func (ls *LogStreamer) handleWebSocket(w http.ResponseWriter, r *http.Request, logPath string, trust *RequestTrust) {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     trust.sameOrigin,
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	defer conn.Close()
 	client := &wsClient{conn: conn}
+	defer client.close()
 
 	ls.mu.Lock()
 	if ls.clients[logPath] == nil {
@@ -62,9 +51,7 @@ func (ls *LogStreamer) HandleWebSocket(w http.ResponseWriter, r *http.Request, l
 	ls.mu.Unlock()
 
 	defer func() {
-		ls.mu.Lock()
-		delete(ls.clients[logPath], client)
-		ls.mu.Unlock()
+		ls.removeClient(logPath, client)
 	}()
 
 	// Start streaming the log file
@@ -98,7 +85,9 @@ func (ls *LogStreamer) streamLogFile(client *wsClient, logPath string) {
 		case <-ticker.C:
 			info, err := os.Stat(logPath)
 			if err != nil {
-				writeWSMessage(client, map[string]string{"type": "waiting", "message": "Waiting for log file..."})
+				if err := writeWSMessage(client, map[string]string{"type": "waiting", "message": "Waiting for log file..."}); err != nil {
+					return
+				}
 				continue
 			}
 
@@ -125,10 +114,12 @@ func (ls *LogStreamer) streamLogFile(client *wsClient, logPath string) {
 
 			if n > 0 {
 				lastSize = info.Size()
-				writeWSMessage(client, map[string]any{
+				if err := writeWSMessage(client, map[string]any{
 					"type": "log",
 					"data": string(data[:n]),
-				})
+				}); err != nil {
+					return
+				}
 			}
 		}
 	}
@@ -159,24 +150,51 @@ func (ls *LogStreamer) StreamDeploymentLog(projectID, deployID, logDir string) {
 	}
 
 	for _, client := range clients {
-		writeWSMessage(client, msg)
+		if err := writeWSMessage(client, msg); err != nil {
+			ls.removeClient(logPath, client)
+			client.close()
+		}
 	}
 }
 
-func writeWSMessage(client *wsClient, msg any) {
+func (ls *LogStreamer) removeClient(logPath string, client *wsClient) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	delete(ls.clients[logPath], client)
+	if len(ls.clients[logPath]) == 0 {
+		delete(ls.clients, logPath)
+	}
+}
+
+func (client *wsClient) close() {
+	client.closeOnce.Do(func() {
+		_ = client.conn.Close()
+	})
+}
+
+func writeWSMessage(client *wsClient, msg any) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return
+		return fmt.Errorf("encode websocket message: %w", err)
 	}
 	client.writeMu.Lock()
 	defer client.writeMu.Unlock()
 	if err := client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return
+		client.close()
+		return fmt.Errorf("set websocket write deadline: %w", err)
 	}
-	_ = client.conn.WriteMessage(websocket.TextMessage, data)
+	if err := client.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		client.close()
+		return fmt.Errorf("write websocket message: %w", err)
+	}
+	return nil
 }
 
 func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request, projectID, deployID string) {
+	if !h.deploymentWebSocketTransportAllowed(r) {
+		writeError(w, http.StatusUpgradeRequired, "HTTPS is required for deployment logs")
+		return
+	}
 	if deployID == "" {
 		writeError(w, http.StatusBadRequest, "deploy ID is required")
 		return
@@ -192,5 +210,9 @@ func (h *Handler) WebSocketHandler(w http.ResponseWriter, r *http.Request, proje
 	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", deployID))
 
 	streamer := NewLogStreamer()
-	streamer.HandleWebSocket(w, r, logPath)
+	streamer.handleWebSocket(w, r, logPath, h.requestTrust)
+}
+
+func (h *Handler) deploymentWebSocketTransportAllowed(r *http.Request) bool {
+	return h.requestTrust.allowsSensitiveWebSocket(r)
 }

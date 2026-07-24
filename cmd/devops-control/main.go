@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sauraku/devops-control/internal/api"
+	"github.com/sauraku/devops-control/internal/composepolicy"
 	"github.com/sauraku/devops-control/internal/db"
 	"github.com/sauraku/devops-control/internal/docker"
 	"github.com/sauraku/devops-control/internal/models"
@@ -22,6 +24,21 @@ import (
 )
 
 func main() {
+	if handled, err := validateComposeSourceCommand(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "validate Compose source: %v\n", err)
+			os.Exit(2)
+		}
+		return
+	}
+	if handled, err := validateTrustedProxyCommand(os.Args[1:], os.Getenv("TRUSTED_PROXY_CIDRS")); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "validate TRUSTED_PROXY_CIDRS: %v\n", err)
+			os.Exit(2)
+		}
+		return
+	}
+
 	cfg := loadConfig()
 
 	if len(cfg.Token) < 32 {
@@ -63,8 +80,9 @@ func main() {
 	deployService := services.NewDeployService(database, dockerClient, auditService, cfg)
 	backupService := services.NewBackupService(database, dockerClient, auditService, cfg)
 
-	authenticator := api.NewAuthenticator(cfg.Token, cfg.CookieSecret, cfg.CookieSecure, auditService)
-	handler := api.NewHandler(projectService, deployService, backupService, auditService, authenticator, cfg)
+	requestTrust := api.NewRequestTrust(cfg.TrustedProxyCIDRs)
+	authenticator := api.NewAuthenticatorWithRequestTrust(cfg.Token, cfg.CookieSecret, cfg.CookieSecure, auditService, requestTrust)
+	handler := api.NewHandler(projectService, deployService, backupService, auditService, authenticator, cfg, requestTrust)
 	router := api.NewRouter(handler, authenticator, cfg)
 	deployService.ReconcileLocks()
 
@@ -144,6 +162,43 @@ func main() {
 	}
 }
 
+func validateComposeSourceCommand(args []string) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	switch args[0] {
+	case "validate-compose-source":
+		if len(args) != 3 {
+			return true, fmt.Errorf("usage: devops-control validate-compose-source <compose-file> <project-root>")
+		}
+		return true, composepolicy.ValidateSource(args[1], args[2])
+	case "snapshot-compose-input":
+		if len(args) != 5 {
+			return true, fmt.Errorf("usage: devops-control snapshot-compose-input <compose-file> <env-file> <project-root> <private-destination>")
+		}
+		_, _, err := composepolicy.SnapshotInputs(args[1], args[2], args[3], args[4])
+		return true, err
+	case "validate-compose-rendered":
+		if len(args) != 3 {
+			return true, fmt.Errorf("usage: devops-control validate-compose-rendered <rendered-json-file> <compose-project>")
+		}
+		return true, composepolicy.ValidateRenderedFile(args[1], args[2])
+	default:
+		return false, nil
+	}
+}
+
+func validateTrustedProxyCommand(args []string, raw string) (bool, error) {
+	if len(args) == 0 || args[0] != "validate-trusted-proxy-cidrs" {
+		return false, nil
+	}
+	if len(args) != 1 {
+		return true, fmt.Errorf("validate-trusted-proxy-cidrs does not accept additional arguments")
+	}
+	_, err := parseTrustedProxyCIDRs(raw)
+	return true, err
+}
+
 func loadConfig() *models.Config {
 	cfg := &models.Config{
 		Token:            getEnv("DEPLOY_CONTROL_TOKEN", ""),
@@ -162,6 +217,11 @@ func loadConfig() *models.Config {
 		EnableTerminal:   getEnvBool("ENABLE_TERMINAL", false),
 		SSHKnownHosts:    getEnv("SSH_KNOWN_HOSTS", ""),
 	}
+	trustedProxyCIDRs, err := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		log.Fatalf("invalid TRUSTED_PROXY_CIDRS: %v", err)
+	}
+	cfg.TrustedProxyCIDRs = trustedProxyCIDRs
 	cfg.RunnerControlURL = strings.TrimRight(getEnv("RUNNER_CONTROL_URL", fmt.Sprintf("http://host.docker.internal:%d", cfg.Port)), "/")
 	runnerURL, err := url.Parse(cfg.RunnerControlURL)
 	if err != nil || runnerURL.Host == "" || (runnerURL.Scheme != "http" && runnerURL.Scheme != "https") || runnerURL.User != nil || runnerURL.RawQuery != "" || runnerURL.Fragment != "" {
@@ -198,6 +258,40 @@ func loadConfig() *models.Config {
 	}
 
 	return cfg
+}
+
+func parseTrustedProxyCIDRs(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	entries := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(entry); err == nil {
+			addr = addr.Unmap()
+			prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not an IP address or CIDR", entry)
+		}
+		addr := prefix.Addr().Unmap()
+		bits := prefix.Bits()
+		if addr.Is4() && prefix.Addr().Is4In6() {
+			bits -= 96
+		}
+		if bits < 0 || bits > addr.BitLen() {
+			return nil, fmt.Errorf("%q has an invalid prefix length", entry)
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, bits).Masked())
+	}
+	return prefixes, nil
 }
 
 func getEnv(key, defaultVal string) string {

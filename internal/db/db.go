@@ -1,11 +1,13 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,6 +16,9 @@ import (
 type DB struct {
 	*sql.DB
 	DataDir string
+	stopCh  chan struct{}
+	stop    sync.Once
+	wg      sync.WaitGroup
 }
 
 func Open(dataDir string) (*DB, error) {
@@ -26,30 +31,109 @@ func Open(dataDir string) (*DB, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	conn.SetMaxOpenConns(1)
-	db := &DB{DB: conn, DataDir: dataDir}
+	db := &DB{DB: conn, DataDir: dataDir, stopCh: make(chan struct{})}
 	if err := db.migrate(); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	// Start periodic WAL checkpointing
+	db.wg.Add(1)
 	go db.walCheckpointer()
 	return db, nil
 }
 
 func (db *DB) walCheckpointer() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("PANIC in WAL checkpointer: %v", r)
-		}
-	}()
+	defer db.wg.Done()
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
 	for {
-		time.Sleep(1 * time.Hour)
-		if _, err := db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
-			log.Printf("WAL checkpoint error: %v", err)
+		select {
+		case <-db.stopCh:
+			return
+		case <-ticker.C:
+			db.checkpointWAL()
 		}
 	}
 }
 
+func (db *DB) checkpointWAL() {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("PANIC in WAL checkpointer: %v", recovered)
+		}
+	}()
+	if _, err := db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+		log.Printf("WAL checkpoint error: %v", err)
+	}
+}
+
+func (db *DB) Close() error {
+	db.stop.Do(func() { close(db.stopCh) })
+	db.wg.Wait()
+	return db.DB.Close()
+}
+
+type schemaMigration struct {
+	version int
+	name    string
+	apply   func(*sql.Tx) error
+}
+
+var schemaMigrations = []schemaMigration{
+	{version: 1, name: "initial schema", apply: createInitialSchema},
+	{version: 2, name: "deployment result columns", apply: addDeploymentResultColumns},
+}
+
 func (db *DB) migrate() error {
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at TEXT NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	var newest int
+	if err := db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&newest); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	latest := schemaMigrations[len(schemaMigrations)-1].version
+	if newest > latest {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", newest, latest)
+	}
+
+	for _, migration := range schemaMigrations {
+		var applied int
+		if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE version = ?", migration.version).Scan(&applied); err != nil {
+			return fmt.Errorf("check migration %d: %w", migration.version, err)
+		}
+		if applied != 0 {
+			continue
+		}
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			return fmt.Errorf("begin migration %d: %w", migration.version, err)
+		}
+		if err := migration.apply(tx); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("apply migration %d (%s): %w", migration.version, migration.name, err)
+		}
+		if _, err := tx.Exec(
+			"INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+			migration.version, migration.name, time.Now().UTC().Format(time.RFC3339Nano),
+		); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %d: %w", migration.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %d: %w", migration.version, err)
+		}
+	}
+	return nil
+}
+
+func createInitialSchema(tx *sql.Tx) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS projects (
 		id TEXT PRIMARY KEY,
@@ -138,8 +222,6 @@ func (db *DB) migrate() error {
 		last_deploy_message TEXT NOT NULL DEFAULT '',
 		last_run_at TEXT,
 		active_deploy_id TEXT NOT NULL DEFAULT '',
-		last_deployed_commit TEXT NOT NULL DEFAULT '',
-		last_deployed_image_tag TEXT NOT NULL DEFAULT '',
 		metadata TEXT NOT NULL DEFAULT '{}'
 	);
 
@@ -161,15 +243,48 @@ func (db *DB) migrate() error {
 		updated_at TEXT NOT NULL
 	);
 	`
-	_, err := db.Exec(schema)
-	if err != nil {
-		return err
+	if _, err := tx.Exec(schema); err != nil {
+		return fmt.Errorf("create initial schema: %w", err)
 	}
-
-	// Migrate: add last_deployed_commit and last_deployed_image_tag columns
-	// (added 2026-06-27 — safe to run on schema that already has them)
-	db.Exec("ALTER TABLE project_state ADD COLUMN last_deployed_commit TEXT NOT NULL DEFAULT ''")
-	db.Exec("ALTER TABLE project_state ADD COLUMN last_deployed_image_tag TEXT NOT NULL DEFAULT ''")
-
 	return nil
+}
+
+func addDeploymentResultColumns(tx *sql.Tx) error {
+	for _, column := range []string{"last_deployed_commit", "last_deployed_image_tag"} {
+		exists, err := tableHasColumn(tx, "project_state", column)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := tx.Exec(fmt.Sprintf(
+			"ALTER TABLE project_state ADD COLUMN %s TEXT NOT NULL DEFAULT ''",
+			column,
+		)); err != nil {
+			return fmt.Errorf("add project_state.%s: %w", column, err)
+		}
+	}
+	return nil
+}
+
+func tableHasColumn(tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, fmt.Errorf("inspect table %s column: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }

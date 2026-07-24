@@ -8,9 +8,14 @@ import {
   isMissingEnvValue,
   missingRequiredEnvVariables,
 } from '../lib/env';
+import { buildEnvPatch } from '../lib/envPatch.mjs';
 
 interface EnvConfigProps {
   project: Project;
+}
+
+function isControllerManagedVariable(variable: { key: string; controller_managed: boolean }) {
+  return variable.controller_managed || /^(DOCKER_|COMPOSE_|BUILDKIT_|BUILDX_)/.test(variable.key);
 }
 
 export function EnvConfig({ project }: EnvConfigProps) {
@@ -27,19 +32,37 @@ export function EnvConfig({ project }: EnvConfigProps) {
   });
 
   const variables = data?.variables ?? [];
-  const savedOverrides = data?.overrides ?? {};
+  const controllerManagedKeys = new Set(
+    variables.filter(isControllerManagedVariable).map((variable) => variable.key),
+  );
+  const editableKeys = new Set(
+    variables.filter((variable) => !isControllerManagedVariable(variable)).map((variable) => variable.key),
+  );
+  const savedEditableOverrides: Record<string, string> = Object.fromEntries(
+    Object.entries(data?.overrides ?? {}).filter(([key]) => editableKeys.has(key)),
+  );
 
   useEffect(() => {
-    if (savedOverrides && Object.keys(savedOverrides).length > 0) {
-      setValues((prev) => ({ ...savedOverrides, ...prev }));
+    if (!data) {
+      setValues({});
+      return;
     }
-  }, [savedOverrides]);
+    const managedKeys = new Set(
+      data.variables.filter(isControllerManagedVariable).map((variable) => variable.key),
+    );
+    setValues(Object.fromEntries(
+      Object.entries(data.overrides ?? {}).filter(([key]) => !managedKeys.has(key)),
+    ));
+  }, [data, project.id]);
 
   const missingRequiredVariables = missingRequiredEnvVariables(variables, values);
   const hasMissing = missingRequiredVariables.length > 0;
 
   const saveMutation = useMutation({
-    mutationFn: () => api.saveEnvConfig(project.id, values),
+    mutationFn: () => {
+      const patch = buildEnvPatch(editableKeys, savedEditableOverrides, values);
+      return api.saveEnvConfig(project.id, patch.overrides, patch.clearKeys);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['env-template', project.id] });
       toast('Environment variables saved successfully.', 'success');
@@ -109,8 +132,8 @@ export function EnvConfig({ project }: EnvConfigProps) {
 
         <div className="p-6 space-y-5">
           {variables.map((v) => {
-            const currentVal = values[v.key] ?? v.default ?? '';
-            const isControllerManaged = v.controller_managed;
+            const isControllerManaged = isControllerManagedVariable(v);
+            const currentVal = isControllerManaged ? (v.default ?? '') : (values[v.key] ?? v.default ?? '');
             const isMissing = v.operator_required && !isControllerManaged && isMissingEnvValue(currentVal);
             const isOptional = !v.operator_required && !isControllerManaged && isMissingEnvValue(currentVal);
             return (
@@ -151,9 +174,16 @@ export function EnvConfig({ project }: EnvConfigProps) {
                 <input
                   type={v.is_secret ? 'password' : 'text'}
                   value={currentVal}
-                  onChange={(e) => setValues((prev) => ({ ...prev, [v.key]: e.target.value }))}
+                  onChange={(e) => {
+                    if (!isControllerManaged) {
+                      setValues((prev) => ({ ...prev, [v.key]: e.target.value }));
+                    }
+                  }}
+                  disabled={isControllerManaged}
+                  readOnly={isControllerManaged}
+                  aria-readonly={isControllerManaged}
                   placeholder={v.default || `Specify value for ${v.key}`}
-                  className={`w-full px-4 py-2.5 rounded-xl bg-surface-2/65 border text-xs font-mono focus:outline-none focus:border-accent/40 focus:bg-surface-2 transition-all text-ink ${
+                  className={`w-full px-4 py-2.5 rounded-xl bg-surface-2/65 border text-xs font-mono focus:outline-none focus:border-accent/40 focus:bg-surface-2 transition-all text-ink disabled:cursor-not-allowed disabled:opacity-60 ${
                     isMissing ? 'border-bad/30 bg-bad/2' : 'border-line'
                   }`}
                 />
@@ -180,9 +210,6 @@ export function EnvConfig({ project }: EnvConfigProps) {
                     const parsed: Record<string, string> = {};
                     const ignored = new Set<string>();
                     const declaredKeys = new Set(variables.map((variable) => variable.key));
-                    const controllerManagedKeys = new Set(
-                      variables.filter((variable) => variable.controller_managed).map((variable) => variable.key),
-                    );
                     for (const line of e.target.value.split('\n')) {
                       const trimmed = line.trim();
                       if (!trimmed || trimmed.startsWith('#')) continue;
@@ -194,9 +221,9 @@ export function EnvConfig({ project }: EnvConfigProps) {
                         if (key) ignored.add(key);
                         continue;
                       }
-                      // Do not turn an omitted controller-managed value into a
-                      // blank override. Existing generated values stay sealed.
-                      if (controllerManagedKeys.has(key) && value === '') continue;
+                      // Controller-managed keys are display-only and never
+                      // enter local state or the save payload.
+                      if (controllerManagedKeys.has(key)) continue;
                       parsed[key] = value;
                     }
                     setIgnoredBulkKeys([...ignored].sort());
@@ -207,7 +234,7 @@ export function EnvConfig({ project }: EnvConfigProps) {
                   rows={6}
                 />
                 <p className="text-[10px] text-muted">
-                  Paste environment configuration directly, one line per variable. Local-only keys are ignored; blank controller-managed values are generated or derived during deployment.
+                  Paste environment configuration directly, one line per variable. Local-only and controller-managed keys are ignored.
                 </p>
                 {ignoredBulkKeys.length > 0 && (
                   <p className="text-[10px] text-warn">

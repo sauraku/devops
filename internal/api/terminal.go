@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,22 +15,6 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
-
-var terminalUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return false
-		}
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		return origin == scheme+"://"+r.Host
-	},
-}
 
 type TerminalSession struct {
 	sshConn *ssh.Client
@@ -53,29 +36,50 @@ const (
 	terminalRateLimit   = 5 * time.Second
 )
 
-var (
-	lastTerminalAttempt   = make(map[string]time.Time)
-	terminalAttemptMu     sync.Mutex
-	terminalLastPruneTime time.Time
-)
+type terminalControlFrame struct {
+	Type string `json:"type"`
+	Cols int    `json:"cols"`
+	Rows int    `json:"rows"`
+}
 
-func terminalAttemptAllowed(ip string, now time.Time) bool {
-	terminalAttemptMu.Lock()
-	defer terminalAttemptMu.Unlock()
+func parseTerminalResizeFrame(message []byte) (cols, rows int, ok bool) {
+	var frame terminalControlFrame
+	if json.Unmarshal(message, &frame) != nil ||
+		frame.Type != "resize" ||
+		frame.Cols <= 0 || frame.Cols > terminalMaxCols ||
+		frame.Rows <= 0 || frame.Rows > terminalMaxRows {
+		return 0, 0, false
+	}
+	return frame.Cols, frame.Rows, true
+}
 
-	if terminalLastPruneTime.IsZero() || now.Sub(terminalLastPruneTime) >= terminalRateLimit {
+type terminalAttemptLimiter struct {
+	mu            sync.Mutex
+	lastAttempt   map[string]time.Time
+	lastPruneTime time.Time
+}
+
+func newTerminalAttemptLimiter() *terminalAttemptLimiter {
+	return &terminalAttemptLimiter{lastAttempt: make(map[string]time.Time)}
+}
+
+func (l *terminalAttemptLimiter) allow(ip string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.lastPruneTime.IsZero() || now.Sub(l.lastPruneTime) >= terminalRateLimit {
 		cutoff := now.Add(-terminalRateLimit)
-		for attemptedIP, attemptedAt := range lastTerminalAttempt {
+		for attemptedIP, attemptedAt := range l.lastAttempt {
 			if attemptedAt.Before(cutoff) {
-				delete(lastTerminalAttempt, attemptedIP)
+				delete(l.lastAttempt, attemptedIP)
 			}
 		}
-		terminalLastPruneTime = now
+		l.lastPruneTime = now
 	}
-	if last, exists := lastTerminalAttempt[ip]; exists && now.Sub(last) < terminalRateLimit {
+	if last, exists := l.lastAttempt[ip]; exists && now.Sub(last) < terminalRateLimit {
 		return false
 	}
-	lastTerminalAttempt[ip] = now
+	l.lastAttempt[ip] = now
 	return true
 }
 
@@ -88,16 +92,23 @@ func writeTerminalMessage(conn *websocket.Conn, msg string) {
 }
 
 func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		ip = r.RemoteAddr
+	trust := h.requestTrust
+	if !trust.allowsSensitiveWebSocket(r) {
+		writeError(w, http.StatusUpgradeRequired, "HTTPS is required for terminal access")
+		return
 	}
+	ip := trust.clientIP(r)
 
-	if !terminalAttemptAllowed(ip, time.Now()) {
+	if !h.terminalLimiter.allow(ip, time.Now()) {
 		writeError(w, http.StatusTooManyRequests, "too many terminal attempts; wait 5 seconds")
 		return
 	}
 
+	terminalUpgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     trust.sameOrigin,
+	}
 	conn, err := terminalUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -266,17 +277,14 @@ func (h *Handler) TerminalHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			lastActivity.Store(time.Now().UnixNano())
-			if len(msg) > 0 && msg[0] == '{' {
-				var resize struct {
-					Cols int `json:"cols"`
-					Rows int `json:"rows"`
-				}
-				if json.Unmarshal(msg, &resize) == nil && resize.Cols > 0 && resize.Cols <= terminalMaxCols && resize.Rows > 0 && resize.Rows <= terminalMaxRows {
-					session.WindowChange(resize.Rows, resize.Cols)
-					continue
-				}
+			if cols, rows, ok := parseTerminalResizeFrame(msg); ok {
+				_ = session.WindowChange(rows, cols)
+				continue
 			}
-			stdinPipe.Write(msg)
+			if _, err := stdinPipe.Write(msg); err != nil {
+				cancel()
+				return
+			}
 		}
 	}()
 

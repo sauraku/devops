@@ -110,7 +110,7 @@ export function Terminal() {
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
       resizeTimerRef.current = setTimeout(() => {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ cols: term.cols, rows: term.rows }));
+          wsRef.current.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
         }
       }, RESIZE_DEBOUNCE);
     });

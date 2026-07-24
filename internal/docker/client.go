@@ -12,13 +12,41 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/sauraku/devops-control/internal/composepolicy"
 	"github.com/sauraku/devops-control/internal/models"
 )
 
 type Client struct {
 	composeBinary string
+}
+
+// RegistryAuth owns an isolated Docker client configuration for one project
+// operation. Keeping the directory private prevents concurrent projects from
+// replacing each other's credentials in the controller-wide DOCKER_CONFIG.
+type RegistryAuth struct {
+	configDir string
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (a *RegistryAuth) ConfigDir() string {
+	if a == nil {
+		return ""
+	}
+	return a.configDir
+}
+
+func (a *RegistryAuth) Close() error {
+	if a == nil {
+		return nil
+	}
+	a.closeOnce.Do(func() {
+		a.closeErr = os.RemoveAll(a.configDir)
+	})
+	return a.closeErr
 }
 
 // Compose can take longer than the default Docker stop grace period while it
@@ -543,20 +571,29 @@ func (c *Client) ContainerAction(action, name string) error {
 }
 
 func (c *Client) ComposeRecreate(composeFile, projectName, envFile string, service string) error {
+	snapshot, err := newComposeInputSnapshot(composeFile, envFile, filepath.Dir(composeFile))
+	if err != nil {
+		return err
+	}
+	defer snapshot.Close()
+
+	commandEnv := dockerCommandEnv(nil)
+	rendered, err := c.renderComposeSnapshot(snapshot, projectName, commandEnv)
+	if err != nil {
+		return err
+	}
+	if err := composepolicy.ValidateRendered(rendered, projectName); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	cmdArgs := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
-	if envFile != "" {
-		if _, err := os.Stat(envFile); err != nil {
-			return fmt.Errorf("env file %s is missing or inaccessible: %w", envFile, err)
-		}
-		cmdArgs = append(cmdArgs, "--env-file", envFile)
-	}
+	cmdArgs := c.composeSnapshotArgs(snapshot, projectName)
 	cmdArgs = append(cmdArgs, "up", "-d", "--force-recreate", service)
 
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Env = dockerCommandEnv(nil)
+	cmd.Env = commandEnv
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("compose recreate service %s failed: %w: %s", service, err, strings.TrimSpace(string(output)))
 	}
@@ -564,118 +601,82 @@ func (c *Client) ComposeRecreate(composeFile, projectName, envFile string, servi
 }
 
 func (c *Client) ValidateComposeConfig(composeFile, projectName, envFile string, allowedRoots []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	args := append(c.ComposeCommand(), "-f", composeFile, "-p", projectName)
-	if envFile != "" {
-		args = append(args, "--env-file", envFile)
+	projectRoot := filepath.Dir(composeFile)
+	if len(allowedRoots) > 0 {
+		projectRoot = allowedRoots[0]
 	}
-	args = append(args, "config", "--format", "json")
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	cmd.Env = dockerCommandEnv(nil)
-	output, err := cmd.Output()
+	snapshot, err := newComposeInputSnapshot(composeFile, envFile, projectRoot)
 	if err != nil {
-		return fmt.Errorf("render Compose config: %w", err)
+		return err
 	}
-	return validateRenderedComposeConfig(output, projectName, allowedRoots)
+	defer snapshot.Close()
+
+	output, err := c.renderComposeSnapshot(snapshot, projectName, dockerCommandEnv(nil))
+	if err != nil {
+		return err
+	}
+	return composepolicy.ValidateRendered(output, projectName)
 }
 
-type composeResourceConfig struct {
-	Name     string `json:"name"`
-	External bool   `json:"external"`
+type composeInputSnapshot struct {
+	dir         string
+	composeFile string
+	envFile     string
+}
+
+func newComposeInputSnapshot(composeFile, envFile, projectRoot string) (*composeInputSnapshot, error) {
+	dir, err := os.MkdirTemp("", "devops-compose-input-*")
+	if err != nil {
+		return nil, fmt.Errorf("create private Compose snapshot directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("secure private Compose snapshot directory: %w", err)
+	}
+	composeSnapshot, envSnapshot, err := composepolicy.SnapshotInputs(composeFile, envFile, projectRoot, dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	return &composeInputSnapshot{
+		dir:         dir,
+		composeFile: composeSnapshot,
+		envFile:     envSnapshot,
+	}, nil
+}
+
+func (s *composeInputSnapshot) Close() error {
+	if s == nil || s.dir == "" {
+		return nil
+	}
+	return os.RemoveAll(s.dir)
+}
+
+func (c *Client) composeSnapshotArgs(snapshot *composeInputSnapshot, projectName string) []string {
+	args := append(c.ComposeCommand(), "-f", snapshot.composeFile, "-p", projectName)
+	if snapshot.envFile != "" {
+		args = append(args, "--env-file", snapshot.envFile)
+	}
+	return args
+}
+
+func (c *Client) renderComposeSnapshot(snapshot *composeInputSnapshot, projectName string, commandEnv []string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	args := c.composeSnapshotArgs(snapshot, projectName)
+	args = append(args, "config", "--format", "json")
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Env = commandEnv
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("render Compose config: %w", err)
+	}
+	return output, nil
 }
 
 func validateRenderedComposeConfig(output []byte, projectName string, allowedRoots []string) error {
-	var config struct {
-		Services map[string]map[string]any        `json:"services"`
-		Volumes  map[string]composeResourceConfig `json:"volumes"`
-		Networks map[string]composeResourceConfig `json:"networks"`
-	}
-	if err := json.Unmarshal(output, &config); err != nil {
-		return fmt.Errorf("parse rendered Compose config: %w", err)
-	}
-	if projectName == "" {
-		return fmt.Errorf("Compose policy violation: project name is empty")
-	}
-	for kind, resources := range map[string]map[string]composeResourceConfig{
-		"volume":  config.Volumes,
-		"network": config.Networks,
-	} {
-		for logicalName, resource := range resources {
-			if resource.External {
-				return fmt.Errorf("Compose policy violation: %s %s is external", kind, logicalName)
-			}
-			if !strings.HasPrefix(resource.Name, projectName+"_") {
-				return fmt.Errorf("Compose policy violation: %s %s resolves to %q outside Compose project %s", kind, logicalName, resource.Name, projectName)
-			}
-		}
-	}
-	cleanRoots := make([]string, 0, len(allowedRoots))
-	for _, root := range allowedRoots {
-		cleanRoots = append(cleanRoots, resolveExistingPath(root))
-	}
-	for service, cfg := range config.Services {
-		if privileged, _ := cfg["privileged"].(bool); privileged {
-			return fmt.Errorf("Compose policy violation: %s uses privileged mode", service)
-		}
-		for _, field := range []string{"network_mode", "pid", "ipc"} {
-			if value, _ := cfg[field].(string); value != "" {
-				value = strings.TrimSpace(value)
-				if value == "host" {
-					return fmt.Errorf("Compose policy violation: %s uses host %s", service, field)
-				}
-				if strings.HasPrefix(value, "container:") {
-					return fmt.Errorf("Compose policy violation: %s uses %s from another container", service, field)
-				}
-			}
-		}
-		if values, ok := cfg["volumes_from"].([]any); ok {
-			for _, raw := range values {
-				reference, _ := raw.(string)
-				if strings.HasPrefix(reference, "container:") {
-					return fmt.Errorf("Compose policy violation: %s uses volumes_from from another container", service)
-				}
-				referencedService := strings.SplitN(reference, ":", 2)[0]
-				if _, ok := config.Services[referencedService]; !ok {
-					return fmt.Errorf("Compose policy violation: %s uses volumes_from from undeclared service %s", service, referencedService)
-				}
-			}
-		}
-		for _, field := range []string{"cap_add", "devices"} {
-			if values, ok := cfg[field].([]any); ok && len(values) > 0 {
-				return fmt.Errorf("Compose policy violation: %s sets %s", service, field)
-			}
-		}
-		if mounts, ok := cfg["volumes"].([]any); ok {
-			for _, raw := range mounts {
-				mount, _ := raw.(map[string]any)
-				switch mount["type"] {
-				case "bind":
-					source, _ := mount["source"].(string)
-					if !pathWithinAnyRoot(source, cleanRoots) {
-						return fmt.Errorf("Compose policy violation: %s bind-mounts %s outside project roots", service, source)
-					}
-				case "volume":
-					source, _ := mount["source"].(string)
-					if source != "" {
-						if _, ok := config.Volumes[source]; !ok {
-							return fmt.Errorf("Compose policy violation: %s uses undeclared named volume %s", service, source)
-						}
-					}
-				}
-			}
-		}
-		if ports, ok := cfg["ports"].([]any); ok {
-			for _, raw := range ports {
-				port, _ := raw.(map[string]any)
-				hostIP, _ := port["host_ip"].(string)
-				if hostIP != "127.0.0.1" && hostIP != "::1" {
-					return fmt.Errorf("Compose policy violation: %s publishes a port on %q instead of loopback", service, hostIP)
-				}
-			}
-		}
-	}
-	return nil
+	_ = allowedRoots // Bind mounts are forbidden for image-mode projects.
+	return composepolicy.ValidateRendered(output, projectName)
 }
 
 func pathWithinAnyRoot(path string, roots []string) bool {
@@ -712,31 +713,83 @@ func resolveExistingPath(path string) string {
 }
 
 func dockerCommandEnv(overrides map[string]string) []string {
-	env := make([]string, 0, len(overrides)+4)
-	for _, key := range []string{"PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG"} {
+	return dockerCommandEnvWithConfig(overrides, "")
+}
+
+func dockerCommandEnvWithConfig(overrides map[string]string, configDir string) []string {
+	values := make(map[string]string, len(overrides)+9)
+	for _, key := range []string{"PATH", "HOME"} {
 		if value := os.Getenv(key); value != "" {
-			env = append(env, key+"="+value)
+			values[key] = value
 		}
+	}
+	for key, value := range TrustedDockerCommandEnv() {
+		values[key] = value
+	}
+	if configDir != "" {
+		values["DOCKER_CONFIG"] = configDir
 	}
 	for key, value := range overrides {
 		if IsReservedCommandEnvKey(key) {
 			continue
 		}
-		env = append(env, key+"="+value)
+		values[key] = value
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+values[key])
 	}
 	return env
+}
+
+// CommandEnvForConfig returns the controller-owned environment needed by a
+// Docker subprocess while selecting an isolated credential directory.
+func CommandEnvForConfig(configDir string) []string {
+	return dockerCommandEnvWithConfig(nil, configDir)
+}
+
+// TrustedDockerCommandEnv returns a fresh copy of controller-owned Docker
+// connection settings that child Docker and deployment processes require.
+// Project environment must never be merged into this map.
+func TrustedDockerCommandEnv() map[string]string {
+	trusted := make(map[string]string, 7)
+	for _, key := range [...]string{
+		"DOCKER_CONFIG",
+		"DOCKER_HOST",
+		"DOCKER_CONTEXT",
+		"DOCKER_TLS",
+		"DOCKER_TLS_VERIFY",
+		"DOCKER_CERT_PATH",
+		"DOCKER_API_VERSION",
+	} {
+		if value := os.Getenv(key); value != "" {
+			trusted[key] = value
+		}
+	}
+	return trusted
 }
 
 // IsReservedCommandEnvKey identifies environment names owned by the controller
 // or the Docker CLI. Project configuration must not redirect command lookup,
 // Docker access, or controller-managed paths.
 func IsReservedCommandEnvKey(key string) bool {
+	for _, prefix := range []string{"DOCKER_", "COMPOSE_", "BUILDKIT_", "BUILDX_"} {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
 	switch key {
-	case "PATH", "HOME", "DOCKER_CONFIG", "DOCKER_HOST", "DOCKER_CONTEXT",
+	case "PATH", "HOME",
 		"BASH_ENV", "ENV", "CDPATH", "IFS", "BASHOPTS", "SHELLOPTS",
 		"PROJECT_DIR", "PROJECT_ENV_FILE", "PROJECT_COMPOSE_FILE",
 		"PROJECT_STATE_DIR", "PROJECT_RELEASE_DIR", "PROJECT_LOG_DIR",
-		"COMPOSE_PROJECT_NAME", "DEPLOY_PROCESS_PID", "DEPLOY_ACTOR":
+		"DEPLOY_PROCESS_PID", "DEPLOY_ACTOR":
 		return true
 	default:
 		return false
@@ -744,11 +797,37 @@ func IsReservedCommandEnvKey(key string) bool {
 }
 
 func (c *Client) RegistryLogin(host, username, password string) (bool, string) {
+	return c.registryLogin(host, username, password, "")
+}
+
+// RegistryLoginIsolated authenticates in a fresh mode-0700 Docker config.
+// Callers must close the returned handle after every Docker command belonging
+// to the operation has completed.
+func (c *Client) RegistryLoginIsolated(host, username, password string) (*RegistryAuth, bool, string) {
+	configDir, err := os.MkdirTemp("", "devops-registry-auth-*")
+	if err != nil {
+		return nil, false, fmt.Sprintf("create isolated Docker credential directory: %s", err)
+	}
+	if err := os.Chmod(configDir, 0o700); err != nil {
+		_ = os.RemoveAll(configDir)
+		return nil, false, fmt.Sprintf("secure isolated Docker credential directory: %s", err)
+	}
+	auth := &RegistryAuth{configDir: configDir}
+	ok, message := c.registryLogin(host, username, password, configDir)
+	if !ok {
+		_ = auth.Close()
+		return nil, false, message
+	}
+	return auth, true, message
+}
+
+func (c *Client) registryLogin(host, username, password, configDir string) (bool, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "docker", "login", host, "-u", username, "--password-stdin")
 	cmd.Stdin = strings.NewReader(password)
+	cmd.Env = dockerCommandEnvWithConfig(nil, configDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return false, fmt.Sprintf("docker login failed: %s: %s", err, strings.TrimSpace(string(output)))

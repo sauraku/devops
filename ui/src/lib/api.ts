@@ -183,10 +183,14 @@ export function getEnvTemplate(projectId: string) {
   );
 }
 
-export function saveEnvConfig(projectId: string, overrides: Record<string, string>) {
+export function saveEnvConfig(
+  projectId: string,
+  overrides: Record<string, string>,
+  clearKeys: string[] = [],
+) {
   return request<{ ok: boolean }>(
     `/api/projects/${encodeURIComponent(projectId)}/env-config`,
-    { method: 'POST', body: JSON.stringify({ overrides }) }
+    { method: 'POST', body: JSON.stringify({ overrides, clear_keys: clearKeys }) }
   );
 }
 

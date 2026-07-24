@@ -44,3 +44,11 @@ func internalError(w http.ResponseWriter, err error) {
 	log.Printf("Internal error: %v", err)
 	writeError(w, http.StatusInternalServerError, "internal server error")
 }
+
+// serviceError keeps infrastructure details, absolute paths, command output,
+// and provider responses in controller logs while returning a stable
+// operation-specific message to the client.
+func serviceError(w http.ResponseWriter, status int, publicMessage string, err error) {
+	log.Printf("%s: %v", publicMessage, err)
+	writeError(w, status, publicMessage)
+}

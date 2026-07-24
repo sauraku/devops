@@ -57,6 +57,7 @@ BRANCH_SLUG="$(branch_slug "${BRANCH}")"
 PROJECT_DIR="${PROJECT_DIR:-${BASE_DIR}/Projects/${PROJECT_ID}}"
 ENV_FILE="${PROJECT_ENV_FILE:-${PROJECT_DIR}/.env.${BRANCH_SLUG}}"
 COMPOSE_FILE="${PROJECT_COMPOSE_FILE:-${PROJECT_DIR}/docker-compose.yml}"
+DEVOPS_JSON="${PROJECT_DEVOPS_FILE:-${PROJECT_DIR}/devops.json}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${PROJECT_ID}-${BRANCH_SLUG}}"
 STATE_DIR="${PROJECT_STATE_DIR:-${BASE_DIR}/State/${PROJECT_ID}}"
 RELEASE_DIR="${PROJECT_RELEASE_DIR:-${BASE_DIR}/Releases/${PROJECT_ID}}"
@@ -70,6 +71,9 @@ LOCK_ACQUIRED=0
 temp_container=""
 config_tmp_dir=""
 compose_config_json=""
+compose_input_dir=""
+runtime_compose_file=""
+runtime_env_file=""
 
 mkdir -p "${STATE_DIR}" "${RELEASE_DIR}" "${LOG_DIR}"
 PROJECT_LOG_DIR="${LOG_DIR}"
@@ -83,7 +87,7 @@ audit() {
   local action="$1"
   local status="${2:-info}"
   local message="${3:-}"
-  printf '{"timestamp":"%s","project_id":"%s","action":"%s","status":"%s","deploy_id":"%s","actor":"%s","message":%s}\n' \
+  printf '{"timestamp":"%s","project_id":"%s","action":"%s","status":"%s","deploy_id":"%s","actor":%s,"message":%s}\n' \
     "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
     "${PROJECT_ID}" \
     "${action}" \
@@ -169,6 +173,9 @@ cleanup() {
   if [ -n "${compose_config_json}" ]; then
     rm -f "${compose_config_json}"
   fi
+  if [ -n "${compose_input_dir}" ]; then
+    rm -rf "${compose_input_dir}"
+  fi
   if [ "${LOCK_ACQUIRED}" -eq 1 ]; then
     rm -rf "${LOCK_DIR}"
   fi
@@ -240,23 +247,50 @@ if [ "${GENERATE}" = true ] && [ -f "${PROJECT_DIR}/.env.template" ]; then
   IS_MAIN="false"
   if [ "${BRANCH}" = "main" ]; then IS_MAIN="true"; fi
 
-  python3 - "${PROJECT_DIR}/.env.template" "${ENV_FILE}" "${BRANCH}" "${BRANCH_SLUG}" "${PROJECT_ID}" "${DEVOPS_JSON}" "${IS_MAIN}" <<'PY'
+  python3 - "${PROJECT_DIR}/.env.template" "${ENV_FILE}" "${BRANCH}" "${BRANCH_SLUG}" "${PROJECT_ID}" "${DEVOPS_JSON}" "${IS_MAIN}" "${IMAGE_TAG}" <<'PY'
 import sys
 import os
 import secrets
 import re
 import json
 
-template_path, env_path, branch, branch_slug, project_id, devops_json_path, is_main_str = sys.argv[1:8]
+template_path, env_path, branch, branch_slug, project_id, devops_json_path, is_main_str, image_tag = sys.argv[1:9]
 is_main = is_main_str == "true"
 
 env_vars = {}
+template_keys = set()
 with open(template_path, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
-            env_vars[k.strip()] = v.strip()
+            key = k.strip()
+            env_vars[key] = v.strip()
+            template_keys.add(key)
+
+def is_reserved_command_namespace(key):
+    return key.startswith(("DOCKER_", "COMPOSE_", "BUILDKIT_", "BUILDX_"))
+
+# Project values are data, not process environment. The controller supplies
+# them through a private inherited descriptor so loader and shell variables
+# can never affect this privileged deployment process.
+project_overrides = {}
+overrides_fd_text = os.environ.get("DEVOPS_ENV_OVERRIDES_FD", "")
+if overrides_fd_text:
+    if not re.fullmatch(r"[0-9]+", overrides_fd_text):
+        raise ValueError("invalid project environment override descriptor")
+    overrides_fd = int(overrides_fd_text)
+    if overrides_fd < 3:
+        raise ValueError("invalid project environment override descriptor")
+    with os.fdopen(overrides_fd, "r", encoding="utf-8", closefd=True) as handle:
+        project_overrides = json.load(handle)
+    if not isinstance(project_overrides, dict):
+        raise ValueError("project environment overrides must be a JSON object")
+    for key, value in project_overrides.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise ValueError("project environment override contains an invalid key")
+        if not isinstance(value, str) or any(character in value for character in ("\r", "\n", "\x00")):
+            raise ValueError("project environment override contains an invalid value")
 
 # Load existing env file if present — preserve secrets to avoid
 # password mismatches with persistent data volumes (Postgres, etc.)
@@ -286,7 +320,13 @@ default_sealed_keys = [
 # Merge existing values into template — existing secrets take priority,
 # unless they match placeholder/change-me patterns.
 for k, v in existing_vars.items():
-    if v and v not in ("change_me", "placeholder", "") and not re.search(r'(change[-_]me|placeholder)', v, re.IGNORECASE):
+    if (
+        k in template_keys
+        and not is_reserved_command_namespace(k)
+        and v
+        and v not in ("change_me", "placeholder", "")
+        and not re.search(r'(change[-_]me|placeholder)', v, re.IGNORECASE)
+    ):
         env_vars[k] = v
 
 # Load devops.json if present
@@ -311,6 +351,8 @@ else:
 
 # Generate secure random secrets ONLY for placeholders that have no existing value.
 for key in sealed_keys:
+    if key not in template_keys or is_reserved_command_namespace(key):
+        continue
     val = env_vars.get(key, "")
     if not val or val in ("change_me", "placeholder", "") or re.search(r'(change[-_]me|placeholder)', val, re.IGNORECASE):
         if key == "OPENSEARCH_INITIAL_ADMIN_PASSWORD":
@@ -318,16 +360,12 @@ for key in sealed_keys:
         else:
             env_vars[key] = secrets.token_hex(32)
 
-# Compose project name is always project_id-branch_slug
-env_vars["COMPOSE_PROJECT_NAME"] = f"{project_id}-{branch_slug}"
-env_vars["ENV_NAME"] = branch_slug
-
 # Port assignment from devops.json or from template defaults
 port_set = "main" if is_main else "default"
 ports = devops.get("ports", {}).get(port_set, {})
 for svc, port in ports.items():
     svc_upper = svc.upper() + "_PORT"
-    if svc_upper not in env_vars or not env_vars[svc_upper]:
+    if svc_upper in template_keys and (svc_upper not in env_vars or not env_vars[svc_upper]):
         env_vars[svc_upper] = str(port)
 
 # Replace only exact values that came from an older tracked template. This
@@ -335,6 +373,8 @@ for svc, port in ports.items():
 env_defaults = devops.get("env_defaults", {}).get(port_set, {})
 legacy_defaults = devops.get("env_legacy_defaults", {}).get(port_set, {})
 for k, legacy_values in legacy_defaults.items():
+    if k not in template_keys or is_reserved_command_namespace(k):
+        continue
     if not isinstance(legacy_values, list):
         raise ValueError(f"env_legacy_defaults.{port_set}.{k} must be an array")
     existing = env_vars.get(k, "").strip()
@@ -346,20 +386,46 @@ for k, legacy_values in legacy_defaults.items():
 
 # Env defaults from devops.json, only if no existing value.
 for k, default_val in env_defaults.items():
+    if k not in template_keys or is_reserved_command_namespace(k):
+        continue
     existing = env_vars.get(k, "").strip()
     if not existing or existing in ("change_me", "placeholder", "") or re.search(r'(change[-_]me|placeholder)', existing, re.IGNORECASE):
         env_vars[k] = str(default_val)
 
+# Apply non-empty project overrides only to keys declared by the current
+# template. Empty values retain the generated/default/existing value, matching
+# the previous deployment behavior. Masked secrets are resolved before storage.
+for key, value in project_overrides.items():
+    if key in template_keys and not is_reserved_command_namespace(key) and value:
+        env_vars[key] = value
+
+# Controller metadata wins over project data for deployment control fields.
+controller_template_keys = {
+    "DEPLOY_ID", "DEPLOY_REF", "DEPLOY_SHA", "DEPLOY_BRANCH", "IMAGE_TAG",
+    "PROJECT_ID", "REPO_URL", "REGISTRY_HOST", "BASE_DIR", "PROJECT_LOG_DIR",
+    "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_ACTOR", "GITHUB_REPOSITORY",
+    "GITHUB_WORKFLOW", "COMMIT_MESSAGE",
+}
+controller_values = {key: os.environ.get(key, "") for key in controller_template_keys}
+controller_values["IMAGE_TAG"] = image_tag
+for key in template_keys.intersection(controller_template_keys):
+    value = controller_values.get(key, "")
+    if value:
+        env_vars[key] = value
+
+# Docker/Compose/BuildKit/Buildx namespaces alter privileged command behavior
+# and may never come from project templates, old env files, or overrides.
+for key in list(env_vars):
+    if is_reserved_command_namespace(key):
+        del env_vars[key]
+
+# Compose identity is the only namespace value and is always controller-derived.
+env_vars["COMPOSE_PROJECT_NAME"] = f"{project_id}-{branch_slug}"
+env_vars["ENV_NAME"] = branch_slug
+
 # Write env file
 with open(env_path, "w", encoding="utf-8") as f:
     f.write("# Generated deployment env for project " + project_id + " branch " + branch + "\n")
-    # Only declared template keys may be overridden by the controller.
-    for k in sorted(env_vars):
-        if k in os.environ and os.environ[k]:
-            value = os.environ[k]
-            if "\n" in value or "\r" in value or "\x00" in value:
-                raise ValueError(f"invalid multiline value for {k}")
-            env_vars[k] = value
     for k, v in sorted(env_vars.items()):
         f.write(f"{k}={v}\n")
 PY
@@ -378,83 +444,33 @@ if [ ! -f "${COMPOSE_FILE}" ]; then
   exit 1
 fi
 
+# Copy repository-controlled Compose and dotenv inputs into a private
+# controller-only directory, then validate the exact Compose snapshot before
+# Docker Compose can resolve any directive against the controller filesystem.
+# Every subsequent Compose command uses these same immutable-from-project
+# snapshots, closing validation/execution races with already-running services.
+if [ -z "${DEVOPS_CONTROL_BIN:-}" ] || [ ! -x "${DEVOPS_CONTROL_BIN}" ]; then
+  echo "Error: controller Compose-policy validator is unavailable." >&2
+  exit 1
+fi
+compose_input_dir=$(mktemp -d "${STATE_DIR}/compose-input.XXXXXX")
+chmod 700 "${compose_input_dir}"
+"${DEVOPS_CONTROL_BIN}" snapshot-compose-input \
+  "${COMPOSE_FILE}" "${ENV_FILE}" "${PROJECT_DIR}" "${compose_input_dir}"
+runtime_compose_file="${compose_input_dir}/compose.yml"
+runtime_env_file="${compose_input_dir}/project.env"
+
 # Render and validate the effective Compose model before granting it access to
 # the host Docker daemon. The rendered file contains secrets and is ephemeral.
 # The controller runtime is Alpine/BusyBox, whose mktemp only accepts a
 # template ending in X characters. The file is parsed by content, so it does
 # not need a .json suffix.
 compose_config_json=$(mktemp "${STATE_DIR}/compose-config.XXXXXX")
-if ! "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" config --format json > "${compose_config_json}"; then
+if ! "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${runtime_compose_file}" --env-file "${runtime_env_file}" config --format json > "${compose_config_json}"; then
   echo "Error: Compose config is invalid or this Compose version cannot emit JSON." >&2
   exit 1
 fi
-python3 - "${compose_config_json}" "${PROJECT_DIR}" "${LOG_DIR}" "${COMPOSE_PROJECT_NAME}" <<'PY'
-import json
-import os
-import sys
-
-config_path, project_dir, log_dir, compose_project = sys.argv[1:5]
-with open(config_path, encoding="utf-8") as handle:
-    config = json.load(handle)
-
-allowed_roots = [os.path.realpath(project_dir), os.path.realpath(log_dir)]
-
-def under_allowed_root(path):
-    resolved = os.path.realpath(path)
-    return any(resolved == root or resolved.startswith(root + os.sep) for root in allowed_roots)
-
-errors = []
-declared_volumes = config.get("volumes") or {}
-for kind, resources in (("volume", declared_volumes), ("network", config.get("networks") or {})):
-    for logical_name, resource in resources.items():
-        resource = resource or {}
-        if resource.get("external"):
-            errors.append(f"{kind} {logical_name} is external")
-        resource_name = resource.get("name", "")
-        if not resource_name.startswith(compose_project + "_"):
-            errors.append(
-                f"{kind} {logical_name} resolves to {resource_name!r} outside Compose project {compose_project}"
-            )
-
-services = config.get("services", {})
-for name, service in services.items():
-    if service.get("privileged"):
-        errors.append(f"{name}: privileged mode is forbidden")
-    for namespace in ("network_mode", "pid", "ipc"):
-        value = service.get(namespace) or ""
-        if value == "host":
-            errors.append(f"{name}: host {namespace} is forbidden")
-        elif value.startswith("container:"):
-            errors.append(f"{name}: {namespace} from another container is forbidden")
-    for reference in service.get("volumes_from") or []:
-        if reference.startswith("container:"):
-            errors.append(f"{name}: volumes_from from another container is forbidden")
-        elif reference.split(":", 1)[0] not in services:
-            errors.append(f"{name}: volumes_from references an undeclared service: {reference}")
-    if service.get("cap_add"):
-        errors.append(f"{name}: cap_add is forbidden")
-    if service.get("devices"):
-        errors.append(f"{name}: device access is forbidden")
-    for mount in service.get("volumes") or []:
-        if not isinstance(mount, dict):
-            continue
-        source = mount.get("source", "")
-        if mount.get("type") == "bind":
-            if not source or not under_allowed_root(source):
-                errors.append(f"{name}: bind mount outside project roots is forbidden: {source}")
-        elif mount.get("type") == "volume" and source and source not in declared_volumes:
-            errors.append(f"{name}: undeclared named volume is forbidden: {source}")
-    for port in service.get("ports") or []:
-        if isinstance(port, dict):
-            host_ip = port.get("host_ip") or "0.0.0.0"
-            if host_ip not in ("127.0.0.1", "::1"):
-                errors.append(f"{name}: published port must bind to loopback, not {host_ip}")
-
-if errors:
-    for error in errors:
-        print(f"Compose policy violation: {error}", file=sys.stderr)
-    raise SystemExit(1)
-PY
+"${DEVOPS_CONTROL_BIN}" validate-compose-rendered "${compose_config_json}" "${COMPOSE_PROJECT_NAME}"
 rm -f "${compose_config_json}"
 compose_config_json=""
 
@@ -471,14 +487,7 @@ echo "  Compose file: ${COMPOSE_FILE}"
 echo "  Env file: ${ENV_FILE}"
 echo "========================================="
 
-if grep -q "^IMAGE_TAG=" "${ENV_FILE}"; then
-  ESCAPED_IMAGE_TAG=$(printf '%s\n' "${IMAGE_TAG}" | sed 's:[\/&]:\\&:g;$!s/$/\\/')
-  sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${ESCAPED_IMAGE_TAG}/" "${ENV_FILE}"
-else
-  printf '\nIMAGE_TAG=%s\n' "${IMAGE_TAG}" >> "${ENV_FILE}"
-fi
-
-if ! timeout 300 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" pull; then
+if ! timeout 300 "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${runtime_compose_file}" --env-file "${runtime_env_file}" pull; then
   echo "Error: image pull failed or timed out; refusing to deploy stale cached images." >&2
   exit 1
 fi
@@ -502,13 +511,13 @@ while IFS='=' read -r key value; do
       fi
       ;;
   esac
-done < <(grep '^[^#]*_PORT=' "$ENV_FILE" 2>/dev/null || true)
+done < <(grep '^[^#]*_PORT=' "${runtime_env_file}" 2>/dev/null || true)
 
-"${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d --force-recreate --remove-orphans
+"${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${runtime_compose_file}" --env-file "${runtime_env_file}" up -d --force-recreate --remove-orphans
 
 # Create admin user if MEDUSA_ADMIN_EMAIL is set
-MEDUSA_ADMIN_EMAIL="$(dotenv_value "${ENV_FILE}" MEDUSA_ADMIN_EMAIL)"
-MEDUSA_ADMIN_PASSWORD="$(dotenv_value "${ENV_FILE}" MEDUSA_ADMIN_PASSWORD)"
+MEDUSA_ADMIN_EMAIL="$(dotenv_value "${runtime_env_file}" MEDUSA_ADMIN_EMAIL)"
+MEDUSA_ADMIN_PASSWORD="$(dotenv_value "${runtime_env_file}" MEDUSA_ADMIN_PASSWORD)"
 if [ -n "${MEDUSA_ADMIN_EMAIL:-}" ] && [ -n "${MEDUSA_ADMIN_PASSWORD:-}" ]; then
   BACKEND_CONTAINER="${COMPOSE_PROJECT_NAME}-backend"
   echo "Creating admin user ${MEDUSA_ADMIN_EMAIL}..."

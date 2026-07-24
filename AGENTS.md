@@ -23,7 +23,7 @@
 | **Local dev** | `./deploy/local.sh start` (generated secrets in ignored `.env.local`, BASE_DIR defaults to `./data`) |
 | **Prod deploy** | `bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)` |
 | **Prod teardown** | `bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/teardown.sh)` |
-| **Devops UI** | `http://localhost:8787` (local) / `http://{server-ip}:8787` (prod) |
+| **Devops UI** | `http://localhost:8787` (local) / `https://{devops-domain}` through the trusted TLS proxy (prod) |
 | **Prod token** | Set in `.env.prod` on server — never committed |
 | **GitHub PAT** | Set via `GITHUB_TOKEN` env var — never committed |
 
@@ -58,13 +58,17 @@ Use `./deploy/local.sh status` for a read-only, timeout-bounded health check and
 
 ### Production Bootstrap
 ```bash
-GITHUB_TOKEN=<your_github_pat> bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)
+DEPLOY_CONTROL_PUBLIC_URL=https://<devops-domain> \
+  TRUSTED_PROXY_CIDRS=<proxy-ip-or-cidr> GITHUB_TOKEN=<your_github_pat> \
+  bash <(curl -fsSL https://raw.githubusercontent.com/sauraku/devops/main/deploy/bootstrap.sh)
 ```
 - Pulls `ghcr.io/sauraku/devops:main` Docker image
 - Auto-generates env file with random secrets at `~/.devops-control/.env.prod`
 - Mounts `/var/run/docker.sock` for container management
 - Data persists in `~/.devops-control/` (mounted to `/opt/devops-control` in container)
 - `BASE_DIR=/opt/devops-control` forced via `-e` flag
+- With `COOKIE_SECURE=true`, configure the exact proxy addresses in `TRUSTED_PROXY_CIDRS` and the external HTTPS origin in `DEPLOY_CONTROL_PUBLIC_URL`; the proxy must set `X-Forwarded-Proto=https`, maintain a valid `X-Forwarded-For` chain, and preserve `Host`
+- Bootstrap verifies local `/api/health`, then public `/api/health` and `/login` with normal TLS verification; a failed public check rolls the upgrade back
 
 ### Production Teardown
 ```bash
@@ -106,19 +110,19 @@ The `ghcr.io/sauraku/devops:main` image includes:
 
 ### Check project container health
 ```bash
-curl -s -b /tmp/sc http://{server-ip}:8787/api/projects/{project-id}/status | python3 -m json.tool
+curl -s -b /tmp/sc https://{devops-domain}/api/projects/{project-id}/status | python3 -m json.tool
 ```
 
 ### Trigger deploy via API
 ```bash
-curl -s -b /tmp/sc -X POST "http://{server-ip}:8787/api/projects/{project-id}/deploy" \
+curl -s -b /tmp/sc -X POST "https://{devops-domain}/api/projects/{project-id}/deploy" \
   -H "Content-Type: application/json" -H "X-CSRF-Token: $CSRF" \
   -d '{"ref":"main","branch":"main","confirmation":"deploy"}'
 ```
 
 ### Start/restart runner
 ```bash
-curl -s -b /tmp/sc -X POST "http://{server-ip}:8787/api/projects/{project-id}/runner" \
+curl -s -b /tmp/sc -X POST "https://{devops-domain}/api/projects/{project-id}/runner" \
   -H "Content-Type: application/json" -H "X-CSRF-Token: $CSRF" \
   -d '{"action":"start"}'
 ```

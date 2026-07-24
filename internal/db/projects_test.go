@@ -50,6 +50,67 @@ func TestCredentialsAndEnvironmentAreEncryptedAndSeparated(t *testing.T) {
 	}
 }
 
+func TestPatchProjectEnvOverridesPreservesOmittedAndClearsNamedKey(t *testing.T) {
+	InitCrypto(strings.Repeat("p", 64))
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	project := &models.Project{ID: "medusa", Name: "Medusa", BranchName: "main"}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	full := map[string]string{
+		"SMTP_HOST": "smtp.example.test",
+		"SMTP_PORT": "587",
+		"SMTP_USER": "mailer",
+		"SMTP_PASS": "smtp-secret",
+		"SMTP_FROM": "orders@example.test",
+	}
+	if err := database.SaveProjectEnvOverrides(project.ID, full); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := database.PatchProjectEnvOverrides(
+		project.ID,
+		map[string]string{"SMTP_HOST": "smtp2.example.test"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Updated) != 1 || result.Updated[0] != "SMTP_HOST" {
+		t.Fatalf("updated keys = %v, want [SMTP_HOST]", result.Updated)
+	}
+	got, err := database.GetProjectEnvOverrides(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(full) || got["SMTP_PORT"] != "587" || got["SMTP_PASS"] != "smtp-secret" {
+		t.Fatalf("partial patch lost omitted SMTP values: %#v", got)
+	}
+
+	result, err = database.PatchProjectEnvOverrides(project.ID, nil, []string{"SMTP_USER"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Cleared) != 1 || result.Cleared[0] != "SMTP_USER" {
+		t.Fatalf("cleared keys = %v, want [SMTP_USER]", result.Cleared)
+	}
+	got, err = database.GetProjectEnvOverrides(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := got["SMTP_USER"]; exists {
+		t.Fatalf("explicitly cleared SMTP_USER remains: %#v", got)
+	}
+	if len(got) != len(full)-1 || got["SMTP_HOST"] != "smtp2.example.test" || got["SMTP_PASS"] != "smtp-secret" {
+		t.Fatalf("clear removed an unnamed SMTP value: %#v", got)
+	}
+}
+
 func TestMigrateLegacyProjectEnvOverridesIsEncryptedAndAtomic(t *testing.T) {
 	InitCrypto(strings.Repeat("m", 64))
 	database, err := Open(t.TempDir())

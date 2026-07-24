@@ -18,13 +18,19 @@ load_dotenv() {
       return 1
     fi
     case "$key" in
-      HOME|PATH|PWD|OLDPWD|SHLVL|SHELL|BASH_ENV|ENV|CDPATH|GLOBIGNORE|IFS|LD_*|DYLD_*|TMPDIR|*_PROXY|DOCKER_*|PYTHON*|NODE_*)
+      HOME|PATH|PWD|OLDPWD|SHLVL|SHELL|BASH_ENV|ENV|CDPATH|GLOBIGNORE|IFS|LD_*|DYLD_*|TMPDIR|*_PROXY|DOCKER_*|COMPOSE_*|BUILDKIT_*|BUILDX_*|PYTHON*|NODE_*)
         continue
         ;;
     esac
     if [[ "$value" == *$'\n'* ]]; then
       echo "Invalid multiline environment value for $key in $file" >&2
       return 1
+    fi
+    # A caller may intentionally protect controller-owned state with readonly.
+    # Inspect attributes without expanding or logging the variable's value.
+    local declaration
+    if declaration="$(declare -p "$key" 2>/dev/null)" && [[ "$declaration" =~ ^declare\ -[^[:space:]]*r ]]; then
+      continue
     fi
     export "$key=$value"
   done < "$file"

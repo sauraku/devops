@@ -1,5 +1,7 @@
 package models
 
+import "net/netip"
+
 type Config struct {
 	Token               string
 	Host                string
@@ -23,6 +25,7 @@ type Config struct {
 	CookieSecure        bool
 	EnableTerminal      bool
 	SSHKnownHosts       string
+	TrustedProxyCIDRs   []netip.Prefix
 }
 
 type ContainerState struct {

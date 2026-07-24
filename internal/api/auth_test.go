@@ -1,12 +1,22 @@
 package api
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 )
+
+type failOnRead struct{}
+
+func (failOnRead) Read([]byte) (int, error) {
+	panic("request body was read")
+}
+
+func (failOnRead) Close() error { return nil }
 
 func TestSignedSessionAndCSRF(t *testing.T) {
 	auth := NewAuthenticator(strings.Repeat("m", 64), strings.Repeat("c", 64), false, nil)
@@ -62,6 +72,35 @@ func TestProjectTokenIsScoped(t *testing.T) {
 	}
 	if auth.VerifyBearerToken(req) {
 		t.Fatal("project token was accepted as the master token")
+	}
+}
+
+func TestMasterAndProjectTokenHeadersAreDisjoint(t *testing.T) {
+	const master = "master-token-with-at-least-thirty-two-characters"
+	auth := NewAuthenticator(master, "cookie-secret", false, nil)
+
+	masterRequest := httptest.NewRequest(http.MethodGet, "/api/projects", nil)
+	masterRequest.Header.Set(masterTokenHeader, master)
+	if !auth.VerifyBearerToken(masterRequest) {
+		t.Fatal("master token was rejected in the master-only header")
+	}
+	if auth.VerifyProjectToken(masterRequest, "medusa") {
+		t.Fatal("master-only header authenticated as a project runner")
+	}
+
+	legacyMaster := httptest.NewRequest(http.MethodGet, "/api/projects", nil)
+	legacyMaster.Header.Set(projectTokenHeader, master)
+	if auth.VerifyBearerToken(legacyMaster) {
+		t.Fatal("project-only header authenticated as the master token")
+	}
+
+	projectRequest := httptest.NewRequest(http.MethodPost, "/api/projects/medusa/deploy", nil)
+	projectRequest.Header.Set(projectTokenHeader, auth.ProjectToken("medusa"))
+	if !auth.VerifyProjectToken(projectRequest, "medusa") {
+		t.Fatal("project token was rejected in the project-only header")
+	}
+	if auth.VerifyBearerToken(projectRequest) {
+		t.Fatal("project-only header authenticated as the master token")
 	}
 }
 
@@ -140,5 +179,122 @@ func TestLoginBackoffIsScopedToRemoteIP(t *testing.T) {
 	}
 	if recorder := failed("192.0.2.2:1234"); recorder.Code != http.StatusOK {
 		t.Fatalf("different remote IP status = %d, want 200", recorder.Code)
+	}
+}
+
+func TestLoginBackoffUsesTrustedForwardedClientIP(t *testing.T) {
+	auth := NewAuthenticatorWithTrustedProxies(
+		"correct-token",
+		strings.Repeat("c", 64),
+		false,
+		nil,
+		[]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+	)
+	failed := func(clientIP string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(url.Values{"token": {"wrong-token"}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-Forwarded-For", clientIP)
+		req.RemoteAddr = "10.0.0.2:443"
+		recorder := httptest.NewRecorder()
+		auth.LoginHandler(recorder, req)
+		return recorder
+	}
+
+	if recorder := failed("198.51.100.10, 192.0.2.1"); recorder.Code != http.StatusOK {
+		t.Fatalf("first client status = %d, want 200", recorder.Code)
+	}
+	if recorder := failed("198.51.100.11, 192.0.2.1"); recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("same first-untrusted-hop status = %d, want 429", recorder.Code)
+	}
+	if recorder := failed("198.51.100.10, 192.0.2.2"); recorder.Code != http.StatusOK {
+		t.Fatalf("different forwarded client status = %d, want 200", recorder.Code)
+	}
+}
+
+func TestSecureLoginRequiresEffectiveHTTPSBeforeReadingToken(t *testing.T) {
+	auth := NewAuthenticatorWithTrustedProxies(
+		"correct-token",
+		strings.Repeat("c", 64),
+		true,
+		nil,
+		[]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+	)
+
+	plaintext := httptest.NewRequest(http.MethodPost, "/login", io.NopCloser(failOnRead{}))
+	plaintext.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	plaintext.RemoteAddr = "10.0.0.2:443"
+	plaintext.Header.Set("X-Forwarded-Proto", "http")
+	plaintextRecorder := httptest.NewRecorder()
+	auth.LoginHandler(plaintextRecorder, plaintext)
+	if plaintextRecorder.Code != http.StatusUpgradeRequired {
+		t.Fatalf("plaintext login status = %d, want 426", plaintextRecorder.Code)
+	}
+
+	secure := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("token=correct-token"))
+	secure.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	secure.RemoteAddr = "10.0.0.2:443"
+	secure.Header.Set("X-Forwarded-Proto", "https")
+	secureRecorder := httptest.NewRecorder()
+	auth.LoginHandler(secureRecorder, secure)
+	if secureRecorder.Code != http.StatusSeeOther {
+		t.Fatalf("trusted HTTPS login status = %d, want 303", secureRecorder.Code)
+	}
+
+	forged := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("token=correct-token"))
+	forged.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	forged.RemoteAddr = "192.0.2.10:443"
+	forged.Header.Set("X-Forwarded-Proto", "https")
+	forgedRecorder := httptest.NewRecorder()
+	auth.LoginHandler(forgedRecorder, forged)
+	if forgedRecorder.Code != http.StatusUpgradeRequired {
+		t.Fatalf("untrusted forged HTTPS login status = %d, want 426", forgedRecorder.Code)
+	}
+}
+
+func TestSecureBrowserRoutesNeverRenderLoginFormOverPlaintext(t *testing.T) {
+	auth := NewAuthenticatorWithTrustedProxies(
+		"correct-token",
+		strings.Repeat("c", 64),
+		true,
+		nil,
+		[]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+	)
+
+	tests := []struct {
+		name    string
+		path    string
+		handler http.HandlerFunc
+	}{
+		{name: "login", path: "/login", handler: auth.LoginHandler},
+		{name: "unauthenticated root", path: "/", handler: auth.RequireAuth(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("unauthenticated request reached protected handler")
+		})},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plaintext := httptest.NewRequest(http.MethodGet, test.path, nil)
+			plaintext.RemoteAddr = "10.0.0.2:443"
+			plaintext.Header.Set("X-Forwarded-Proto", "http")
+			plaintextRecorder := httptest.NewRecorder()
+			test.handler(plaintextRecorder, plaintext)
+			if plaintextRecorder.Code != http.StatusUpgradeRequired {
+				t.Fatalf("plaintext status = %d, want 426", plaintextRecorder.Code)
+			}
+			if strings.Contains(plaintextRecorder.Body.String(), "name=\"token\"") {
+				t.Fatal("plaintext response rendered the token form")
+			}
+
+			secure := httptest.NewRequest(http.MethodGet, test.path, nil)
+			secure.RemoteAddr = "10.0.0.2:443"
+			secure.Header.Set("X-Forwarded-Proto", "https")
+			secureRecorder := httptest.NewRecorder()
+			test.handler(secureRecorder, secure)
+			if secureRecorder.Code != http.StatusOK {
+				t.Fatalf("trusted HTTPS status = %d, want 200", secureRecorder.Code)
+			}
+			if !strings.Contains(secureRecorder.Body.String(), "name=\"token\"") {
+				t.Fatal("trusted HTTPS response did not render the token form")
+			}
+		})
 	}
 }

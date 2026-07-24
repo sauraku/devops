@@ -26,10 +26,13 @@ build-fast:
 run: build
 	./$(BINARY)
 
-test: ui-build
+test:
+	cd $(UI_DIR) && npm test
+	$(MAKE) ui-build
 	go test ./...
 	go vet ./...
 	bash -n deploy/*.sh deploy/runner/*.sh scripts/*.sh
+	@set -e; for test_script in tests/*.sh; do bash "$$test_script"; done
 
 ## Development: run UI dev server with Go backend
 dev:

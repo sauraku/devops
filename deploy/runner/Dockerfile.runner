@@ -25,12 +25,14 @@ ENV RUNNER_VERSION=2.335.1
 RUN mkdir actions-runner && cd actions-runner \
     && ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
-         amd64) RUNNER_ARCH="x64" ;; \
-         arm64) RUNNER_ARCH="arm64" ;; \
-         armhf) RUNNER_ARCH="arm" ;; \
-         *) RUNNER_ARCH="x64" ;; \
+         amd64) RUNNER_ARCH="x64"; RUNNER_SHA256="4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf" ;; \
+         arm64) RUNNER_ARCH="arm64"; RUNNER_SHA256="6d1e85bfd1a506a8b17c1f1b9b57dba458ffed90898799aaa9f599520b0d9207" ;; \
+         armhf) RUNNER_ARCH="arm"; RUNNER_SHA256="d9810476ceebb6739913ed16afd5c61664e53312a444ee5226e9010a4219a864" ;; \
+         *) echo "Unsupported runner architecture: $ARCH" >&2; exit 1 ;; \
        esac \
-    && curl -o actions-runner.tar.gz -L "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" \
+    && curl --fail --show-error --location --output actions-runner.tar.gz \
+      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" \
+    && printf '%s  %s\n' "$RUNNER_SHA256" actions-runner.tar.gz | sha256sum -c - \
     && tar xzf actions-runner.tar.gz \
     && rm actions-runner.tar.gz
 

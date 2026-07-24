@@ -26,16 +26,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Validate shell scripts
-        run: bash -n deploy/*.sh deploy/runner/*.sh scripts/*.sh
+      - name: Install UI dependencies
+        run: npm ci --prefix ui
 
-      - name: Build UI for Go embedding
-        run: npm ci --prefix ui && npm run build --prefix ui
-
-      - name: Test and vet Go
-        run: |
-          go test ./...
-          go vet ./...
+      - name: Test, vet, and build embedded UI
+        run: make test
 
       - name: Log in to GHCR
         uses: docker/login-action@v3

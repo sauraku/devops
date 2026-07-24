@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -381,6 +382,82 @@ func (db *DB) SaveProjectEnvOverrides(projectID string, overrides map[string]str
 		ON CONFLICT(project_id) DO UPDATE SET encrypted_overrides=excluded.encrypted_overrides, updated_at=excluded.updated_at
 	`, projectID, encrypted, time.Now().UTC().Format(time.RFC3339))
 	return err
+}
+
+type ProjectEnvPatchResult struct {
+	Added   []string
+	Updated []string
+	Cleared []string
+}
+
+// PatchProjectEnvOverrides applies an encrypted read-modify-write transaction.
+// Omitted keys are preserved; deletion requires an explicit clear key.
+func (db *DB) PatchProjectEnvOverrides(projectID string, set map[string]string, clearKeys []string) (*ProjectEnvPatchResult, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	current := make(map[string]string)
+	var stored string
+	err = tx.QueryRow("SELECT encrypted_overrides FROM project_env WHERE project_id = ?", projectID).Scan(&stored)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err == nil {
+		plain, decryptErr := decrypt(stored)
+		if decryptErr != nil {
+			return nil, fmt.Errorf("decrypt project environment: %w", decryptErr)
+		}
+		if unmarshalErr := json.Unmarshal([]byte(plain), &current); unmarshalErr != nil {
+			return nil, fmt.Errorf("decode project environment: %w", unmarshalErr)
+		}
+		if current == nil {
+			current = make(map[string]string)
+		}
+	}
+
+	result := &ProjectEnvPatchResult{}
+	for key, value := range set {
+		oldValue, existed := current[key]
+		switch {
+		case !existed:
+			result.Added = append(result.Added, key)
+		case oldValue != value:
+			result.Updated = append(result.Updated, key)
+		}
+		current[key] = value
+	}
+	for _, key := range clearKeys {
+		if _, existed := current[key]; existed {
+			delete(current, key)
+			result.Cleared = append(result.Cleared, key)
+		}
+	}
+	sort.Strings(result.Added)
+	sort.Strings(result.Updated)
+	sort.Strings(result.Cleared)
+
+	plain, err := json.Marshal(current)
+	if err != nil {
+		return nil, fmt.Errorf("encode project environment: %w", err)
+	}
+	encrypted, err := encrypt(string(plain))
+	if err != nil {
+		return nil, fmt.Errorf("encrypt project environment: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO project_env (project_id, encrypted_overrides, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(project_id) DO UPDATE SET encrypted_overrides=excluded.encrypted_overrides, updated_at=excluded.updated_at
+	`, projectID, encrypted, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (db *DB) GetProjectEnvOverrides(projectID string) (map[string]string, error) {

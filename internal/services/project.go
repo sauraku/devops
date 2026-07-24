@@ -18,7 +18,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sauraku/devops-control/internal/db"
@@ -32,22 +34,34 @@ var (
 )
 
 type ProjectService struct {
-	db               *db.DB
-	docker           *docker.Client
-	audit            *AuditService
-	cfg              *models.Config
-	githubAPIBaseURL string
-	githubHTTPClient *http.Client
+	db                     *db.DB
+	docker                 *docker.Client
+	audit                  *AuditService
+	cfg                    *models.Config
+	githubAPIBaseURL       string
+	githubHTTPClient       *http.Client
+	runnerMonitorMu        sync.Mutex
+	runnerMonitors         map[string]context.CancelFunc
+	runnerLifecycleMu      sync.Mutex
+	runnerLifecycleLocks   map[string]*sync.Mutex
+	runnerRecoveryMu       sync.Mutex
+	runnerRecoveryState    map[string]*runnerRecoveryAttemptState
+	recoverRunnerFn        func(*models.Project, string) error
+	preservedRunnerOpsFn   func(*models.Project) preservedRunnerRecoveryOps
+	registrationRecoveryFn func(*models.Project, string) error
 }
 
 func NewProjectService(database *db.DB, dockerClient *docker.Client, audit *AuditService, cfg *models.Config) *ProjectService {
 	return &ProjectService{
-		db:               database,
-		docker:           dockerClient,
-		audit:            audit,
-		cfg:              cfg,
-		githubAPIBaseURL: "https://api.github.com",
-		githubHTTPClient: &http.Client{Timeout: 15 * time.Second},
+		db:                   database,
+		docker:               dockerClient,
+		audit:                audit,
+		cfg:                  cfg,
+		githubAPIBaseURL:     "https://api.github.com",
+		githubHTTPClient:     &http.Client{Timeout: 15 * time.Second},
+		runnerMonitors:       make(map[string]context.CancelFunc),
+		runnerLifecycleLocks: make(map[string]*sync.Mutex),
+		runnerRecoveryState:  make(map[string]*runnerRecoveryAttemptState),
 	}
 }
 
@@ -203,9 +217,12 @@ func (s *ProjectService) CreateOrUpdate(req *models.ProjectRequest) (*models.Pro
 		return nil, fmt.Errorf("no runner token configured; configure a token before enabling the listener")
 	}
 	if registryPassword != nil {
-		ok, msg := s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, *registryPassword)
+		registryAuth, ok, msg := s.docker.RegistryLoginIsolated(p.RegistryHost, p.RegistryUsername, *registryPassword)
 		if !ok {
 			return nil, fmt.Errorf("registry login failed: %s", msg)
+		}
+		if err := registryAuth.Close(); err != nil {
+			return nil, fmt.Errorf("remove isolated registry credentials: %w", err)
 		}
 	}
 
@@ -291,7 +308,11 @@ func (s *ProjectService) Delete(projectID string) error {
 	if err := s.db.CreateLock(lock); err != nil {
 		return fmt.Errorf("cannot delete project while another operation is active: %w", err)
 	}
-	defer s.db.ReleaseLock(projectID, deleteID)
+	defer func() {
+		if err := s.db.ReleaseLock(projectID, deleteID); err != nil {
+			log.Printf("release project deletion lock for project %s operation %s: %v", projectID, deleteID, err)
+		}
+	}()
 
 	projectDir := p.AppDir
 	if projectDir == "" {
@@ -571,10 +592,731 @@ func (s *ProjectService) validateRepoURL(rawURL string) error {
 
 const (
 	runnerRegistrationRequestMarker = "DEVOPS_RUNNER_REGISTRATION_REQUIRED"
+	runnerDeletionHint              = "The runner registration has been deleted from the server"
 	runnerRegistrationTokenPath     = "/run/devops-runner-registration/token"
 	runnerRegistrationStagingPath   = "/run/devops-runner-registration/.token.tmp"
 	runnerReadyTimeout              = 5 * time.Minute
+	runnerMonitorPollInterval       = 30 * time.Second
+	runnerTransitionRecoveryDelay   = 90 * time.Second
+	runnerRecoveryBackoffInitial    = 30 * time.Second
+	runnerRecoveryBackoffMaximum    = 5 * time.Minute
+	runnerRecoveryServerDelayMax    = time.Hour
 )
+
+type runnerRecoveryAttemptState struct {
+	failures    int
+	nextAttempt time.Time
+	lastError   string
+}
+
+type githubRunnerVerificationError struct {
+	message string
+	retryAt time.Time
+}
+
+func (e *githubRunnerVerificationError) Error() string {
+	return e.message
+}
+
+func githubRunnerRetryAt(headers http.Header, now time.Time) time.Time {
+	var retryAt time.Time
+	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
+		if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
+			retryAt = now.Add(time.Duration(seconds) * time.Second)
+		} else if parsed, err := http.ParseTime(raw); err == nil && parsed.After(now) {
+			retryAt = parsed
+		}
+	}
+	if raw := strings.TrimSpace(headers.Get("X-RateLimit-Reset")); raw != "" {
+		if unixSeconds, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			resetAt := time.Unix(unixSeconds, 0)
+			if resetAt.After(retryAt) && resetAt.After(now) {
+				retryAt = resetAt
+			}
+		}
+	}
+	if maximum := now.Add(runnerRecoveryServerDelayMax); retryAt.After(maximum) {
+		return maximum
+	}
+	return retryAt
+}
+
+func runnerVerificationRetryAt(err error) time.Time {
+	var verificationErr *githubRunnerVerificationError
+	if errors.As(err, &verificationErr) {
+		return verificationErr.retryAt
+	}
+	return time.Time{}
+}
+
+func runnerRecoveryBackoff(projectID string, failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	delay := runnerRecoveryBackoffInitial
+	for attempt := 1; attempt < failures && delay < runnerRecoveryBackoffMaximum; attempt++ {
+		if delay > runnerRecoveryBackoffMaximum/2 {
+			delay = runnerRecoveryBackoffMaximum
+			break
+		}
+		delay *= 2
+	}
+	if delay > runnerRecoveryBackoffMaximum {
+		delay = runnerRecoveryBackoffMaximum
+	}
+
+	// Stable per-project jitter prevents several failed runners from retrying
+	// GitHub in lockstep while keeping tests and operational timing predictable.
+	jitterRange := delay / 5
+	if jitterRange <= 0 {
+		return delay
+	}
+	var hash uint64 = 1469598103934665603
+	for _, value := range fmt.Sprintf("%s:%d", projectID, failures) {
+		hash ^= uint64(value)
+		hash *= 1099511628211
+	}
+	width := uint64(2*jitterRange + 1)
+	jitter := time.Duration(int64(hash%width) - int64(jitterRange))
+	delay += jitter
+	if delay < time.Second {
+		return time.Second
+	}
+	if delay > runnerRecoveryBackoffMaximum {
+		return runnerRecoveryBackoffMaximum
+	}
+	return delay
+}
+
+func runnerLogsReady(logs string) bool {
+	lower := strings.ToLower(logs)
+	for _, marker := range []string{"runner already configured.", "listening for jobs", "running job:"} {
+		if strings.LastIndex(lower, marker) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func runnerRegistrationRequested(logs string) bool {
+	requestIndex := strings.LastIndex(logs, runnerRegistrationRequestMarker)
+	if requestIndex < 0 {
+		return false
+	}
+	lower := strings.ToLower(logs)
+	readyIndex := -1
+	for _, marker := range []string{"runner already configured.", "listening for jobs", "running job:"} {
+		if index := strings.LastIndex(lower, marker); index > readyIndex {
+			readyIndex = index
+		}
+	}
+	return requestIndex > readyIndex
+}
+
+func runnerTransitionStartedAt(previous time.Time, now time.Time, summary *models.ContainerState, ready bool) time.Time {
+	if summary == nil || !summary.Exists || (summary.Running && ready) {
+		return time.Time{}
+	}
+	if summary.State == "created" || summary.State == "restarting" {
+		if previous.IsZero() {
+			return now
+		}
+		return previous
+	}
+	// Docker restart policies briefly report a crash-looping container as
+	// running between backoff intervals. Preserve the transition window until
+	// this runner generation emits a readiness marker.
+	if !previous.IsZero() && summary.Running {
+		return previous
+	}
+	return time.Time{}
+}
+
+func (s *ProjectService) runnerRegistrationCredential(projectID string) (string, error) {
+	credential, err := s.db.GetRunnerToken(projectID)
+	if err != nil {
+		return "", fmt.Errorf("load runner credential: %w", err)
+	}
+	if credential == "" {
+		credential = s.cfg.GithubToken
+	}
+	if credential == "" {
+		return "", fmt.Errorf("runner credential is not configured")
+	}
+	return credential, nil
+}
+
+func (s *ProjectService) runnerCredentials(projectID string) (registrationCredential, verificationCredential string, err error) {
+	registrationCredential, err = s.runnerRegistrationCredential(projectID)
+	if err != nil {
+		return "", "", err
+	}
+	if isGitHubPersonalAccessToken(registrationCredential) {
+		verificationCredential = registrationCredential
+	} else if isGitHubPersonalAccessToken(s.cfg.GithubToken) {
+		registrationCredential = s.cfg.GithubToken
+		verificationCredential = s.cfg.GithubToken
+	}
+	if verificationCredential == "" {
+		return "", "", fmt.Errorf("a GitHub personal access token is required to verify runner registration")
+	}
+	return registrationCredential, verificationCredential, nil
+}
+
+type runnerRegistrationState uint8
+
+const (
+	runnerRegistrationUnknown runnerRegistrationState = iota
+	runnerRegistrationPresent
+	runnerRegistrationAbsent
+)
+
+func (s *ProjectService) githubRunnerRegistrationState(ctx context.Context, p *models.Project, credential string) (runnerRegistrationState, error) {
+	if p == nil {
+		return runnerRegistrationUnknown, fmt.Errorf("project is required")
+	}
+	if !isGitHubPersonalAccessToken(credential) {
+		return runnerRegistrationUnknown, fmt.Errorf("GitHub runner verification requires a personal access token")
+	}
+	if err := s.validateRepoURL(p.RepoURL); err != nil {
+		return runnerRegistrationUnknown, fmt.Errorf("cannot verify runner registration: %w", err)
+	}
+	owner, repo, ok := strings.Cut(repoOwnerRepo(p.RepoURL), "/")
+	if !ok || owner == "" || repo == "" {
+		return runnerRegistrationUnknown, fmt.Errorf("cannot verify runner registration: repository URL is invalid")
+	}
+	expectedName := fmt.Sprintf("runner-%s-%s", p.ID, branchSlug(p.BranchName))
+	baseURL := strings.TrimRight(s.githubAPIBaseURL, "/")
+	if baseURL == "" {
+		baseURL = "https://api.github.com"
+	}
+	client := s.githubHTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+
+	for page := 1; page <= 100; page++ {
+		endpoint := fmt.Sprintf("%s/repos/%s/%s/actions/runners?per_page=100&page=%d",
+			baseURL, url.PathEscape(owner), url.PathEscape(repo), page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return runnerRegistrationUnknown, fmt.Errorf("create GitHub runner verification request: %w", err)
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Authorization", "Bearer "+credential)
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		resp, err := client.Do(req)
+		if err != nil {
+			return runnerRegistrationUnknown, fmt.Errorf("verify GitHub runner registration: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+			return runnerRegistrationUnknown, &githubRunnerVerificationError{
+				message: fmt.Sprintf("verify GitHub runner registration: GitHub returned %s", resp.Status),
+				retryAt: githubRunnerRetryAt(resp.Header, time.Now()),
+			}
+		}
+		var result struct {
+			TotalCount int `json:"total_count"`
+			Runners    []struct {
+				Name string `json:"name"`
+			} `json:"runners"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return runnerRegistrationUnknown, fmt.Errorf("decode GitHub runner list: %w", decodeErr)
+		}
+		for _, runner := range result.Runners {
+			if runner.Name == expectedName {
+				return runnerRegistrationPresent, nil
+			}
+		}
+		if len(result.Runners) < 100 || page*100 >= result.TotalCount {
+			return runnerRegistrationAbsent, nil
+		}
+	}
+	return runnerRegistrationUnknown, fmt.Errorf("GitHub runner list exceeded the verification limit")
+}
+
+func (s *ProjectService) handleRunnerRecoveryHint(ctx context.Context, p *models.Project, localUnavailable bool) error {
+	registrationCredential, verificationCredential, err := s.runnerCredentials(p.ID)
+	if err != nil {
+		return err
+	}
+	registrationState, err := s.githubRunnerRegistrationState(ctx, p, verificationCredential)
+	if err != nil {
+		return err
+	}
+	switch registrationState {
+	case runnerRegistrationPresent:
+		if !localUnavailable {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return s.restoreVerifiedPresentRunner(ctx, p)
+	case runnerRegistrationAbsent:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.recoverRunnerFn != nil {
+			return s.recoverRunnerFn(p, registrationCredential)
+		}
+		return s.replaceVerifiedAbsentRunner(ctx, p, registrationCredential)
+	default:
+		return fmt.Errorf("GitHub runner registration state is unknown")
+	}
+}
+
+type runnerRecoverySignal struct {
+	registrationRequested bool
+	localUnavailable      bool
+}
+
+func (s *ProjectService) handleRunnerRecoverySignal(ctx context.Context, p *models.Project, signal runnerRecoverySignal) error {
+	if signal.registrationRequested {
+		credential, err := s.runnerRegistrationCredential(p.ID)
+		if err != nil {
+			return err
+		}
+		if s.registrationRecoveryFn != nil {
+			return s.registrationRecoveryFn(p, credential)
+		}
+		return s.recoverRunnerRegistrationHandoff(ctx, p, credential)
+	}
+	return s.handleRunnerRecoveryHint(ctx, p, signal.localUnavailable)
+}
+
+type registrationHandoffRecoveryOps struct {
+	containerExists        bool
+	saveStatus             func(string)
+	verifyOwnership        func() error
+	stopMonitor            func()
+	restartPreservingState func() error
+	installMonitor         func()
+}
+
+func restartRunnerRegistrationHandoff(ops registrationHandoffRecoveryOps) error {
+	ops.saveStatus("starting")
+	if ops.containerExists {
+		if err := ops.verifyOwnership(); err != nil {
+			ops.saveStatus("error")
+			ops.installMonitor()
+			return fmt.Errorf("verify runner registration handoff ownership: %w", err)
+		}
+	}
+	ops.stopMonitor()
+	if err := ops.restartPreservingState(); err != nil {
+		ops.saveStatus("error")
+		ops.installMonitor()
+		return fmt.Errorf("restart runner registration handoff with preserved state: %w", err)
+	}
+	ops.saveStatus("active")
+	// startRunnerContainerLocked installs the monitor after readiness. Keeping
+	// this handoff explicit also makes injected/test implementations correct.
+	ops.installMonitor()
+	return nil
+}
+
+func (s *ProjectService) recoverRunnerRegistrationHandoff(ctx context.Context, p *models.Project, credential string) error {
+	unlock := s.lockRunnerLifecycle(p.ID)
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	summary := s.docker.ContainerSummary(p.RunnerContainer)
+	err := restartRunnerRegistrationHandoff(registrationHandoffRecoveryOps{
+		containerExists: summary.Exists,
+		saveStatus: func(status string) {
+			_ = s.db.SaveRunnerStatus(p.ID, status)
+		},
+		verifyOwnership: func() error {
+			return s.docker.VerifyComposeOwnership(
+				p.RunnerContainer, fmt.Sprintf("devops-runner-%s", p.ID), "github-runner",
+			)
+		},
+		stopMonitor:            func() { s.stopRunnerMonitor(p.ID) },
+		restartPreservingState: func() error { return s.startRunnerContainerLocked(p, credential) },
+		installMonitor:         func() { s.startRunnerMonitor(p) },
+	})
+	if err != nil {
+		return err
+	}
+	if s.audit != nil {
+		s.audit.Log(
+			"runner_recovery",
+			"ok",
+			p.ID,
+			"registration handoff was interrupted; restarted runner with preserved state and completed registration",
+			"",
+		)
+	}
+	return nil
+}
+
+type preservedRunnerRecoveryOps struct {
+	containerExists   bool
+	forceRecreate     bool
+	saveStatus        func(string)
+	verifyOwnership   func() error
+	stopMonitor       func()
+	startExisting     func() error
+	recreatePreserved func() error
+	waitReady         func() (bool, string, string)
+	installMonitor    func()
+}
+
+func restoreRunnerWithPreservedState(ops preservedRunnerRecoveryOps) error {
+	ops.saveStatus("starting")
+	if ops.containerExists {
+		if err := ops.verifyOwnership(); err != nil {
+			ops.saveStatus("error")
+			ops.installMonitor()
+			return fmt.Errorf("verify preserved runner ownership: %w", err)
+		}
+	}
+	ops.stopMonitor()
+	var err error
+	if ops.containerExists && !ops.forceRecreate {
+		err = ops.startExisting()
+	} else {
+		err = ops.recreatePreserved()
+	}
+	if err == nil {
+		ready, state, logs := ops.waitReady()
+		if !ready {
+			err = fmt.Errorf("preserved runner did not become ready (state=%s): %s", state, truncateStr(logs, 200))
+		}
+	}
+	if err != nil {
+		ops.saveStatus("error")
+		ops.installMonitor()
+		return err
+	}
+	ops.saveStatus("active")
+	ops.installMonitor()
+	return nil
+}
+
+func (s *ProjectService) restoreVerifiedPresentRunner(ctx context.Context, p *models.Project) error {
+	unlock := s.lockRunnerLifecycle(p.ID)
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var ops preservedRunnerRecoveryOps
+	if s.preservedRunnerOpsFn != nil {
+		ops = s.preservedRunnerOpsFn(p)
+	} else {
+		summary := s.docker.ContainerSummary(p.RunnerContainer)
+		ops = preservedRunnerRecoveryOps{
+			containerExists: summary.Exists,
+			forceRecreate:   summary.State == "created" || summary.State == "restarting" || summary.Running,
+			saveStatus: func(status string) {
+				_ = s.db.SaveRunnerStatus(p.ID, status)
+			},
+			verifyOwnership: func() error {
+				return s.docker.VerifyComposeOwnership(
+					p.RunnerContainer, fmt.Sprintf("devops-runner-%s", p.ID), "github-runner",
+				)
+			},
+			stopMonitor:   func() { s.stopRunnerMonitor(p.ID) },
+			startExisting: func() error { return s.docker.StartContainer(p.RunnerContainer) },
+			recreatePreserved: func() error {
+				if summary.Exists {
+					if err := s.stopRunnerResourcesLocked(p, false); err != nil {
+						return err
+					}
+				}
+				return s.recreateRunnerWithPreservedStateLocked(p)
+			},
+			waitReady: func() (bool, string, string) {
+				return s.docker.WaitForRunnerReady(p.RunnerContainer, runnerReadyTimeout)
+			},
+			installMonitor: func() { s.startRunnerMonitor(p) },
+		}
+	}
+	err := restoreRunnerWithPreservedState(ops)
+	if err != nil {
+		return fmt.Errorf("restore runner with preserved registration: %w", err)
+	}
+	if s.audit != nil {
+		s.audit.Log("runner_recovery", "ok", p.ID, "GitHub registration present; restored local runner with preserved state", "")
+	}
+	return nil
+}
+
+func (s *ProjectService) replaceVerifiedAbsentRunner(ctx context.Context, p *models.Project, registrationCredential string) error {
+	projectName := fmt.Sprintf("devops-runner-%s", p.ID)
+	unlock := s.lockRunnerLifecycle(p.ID)
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_ = s.db.SaveRunnerStatus(p.ID, "starting")
+	err := replaceRunnerResources(
+		func() error { return s.stopRunnerForRecoveryLocked(p) },
+		func() error { return s.docker.RemoveComposeVolumes(projectName) },
+		func() error { return s.startRunnerLocked(p, registrationCredential) },
+	)
+	if err != nil {
+		// If clean startup failed after cancelling the old monitor, install a
+		// controller-owned monitor on the now-absent container so recovery is
+		// retried. If the old monitor is still active this is a no-op.
+		_ = s.db.SaveRunnerStatus(p.ID, "error")
+		s.startRunnerMonitor(p)
+		return err
+	}
+	_ = s.db.SaveRunnerStatus(p.ID, "active")
+	if s.audit != nil {
+		s.audit.Log("runner_recovery", "ok", p.ID, "GitHub absence verified; replaced runner container and state volume", "")
+	}
+	return nil
+}
+
+func replaceRunnerResources(stop, discardState, startClean func() error) error {
+	if err := stop(); err != nil {
+		return fmt.Errorf("stop compromised runner: %w", err)
+	}
+	// Remove only volumes carrying this exact Compose project label. A fresh
+	// container cannot inherit state or tmpfs contents from the compromised job.
+	if err := discardState(); err != nil {
+		return fmt.Errorf("discard compromised runner state: %w", err)
+	}
+	if err := startClean(); err != nil {
+		return fmt.Errorf("start clean runner: %w", err)
+	}
+	return nil
+}
+
+func (s *ProjectService) runnerRecoveryNextAttempt(projectID string) time.Time {
+	s.runnerRecoveryMu.Lock()
+	defer s.runnerRecoveryMu.Unlock()
+	if state := s.runnerRecoveryState[projectID]; state != nil {
+		return state.nextAttempt
+	}
+	return time.Time{}
+}
+
+func (s *ProjectService) recordRunnerRecoveryFailure(p *models.Project, recoveryErr error, now time.Time) time.Time {
+	message := recoveryErr.Error()
+	s.runnerRecoveryMu.Lock()
+	if s.runnerRecoveryState == nil {
+		s.runnerRecoveryState = make(map[string]*runnerRecoveryAttemptState)
+	}
+	state := s.runnerRecoveryState[p.ID]
+	if state == nil {
+		state = &runnerRecoveryAttemptState{}
+		s.runnerRecoveryState[p.ID] = state
+	}
+	state.failures++
+	state.nextAttempt = now.Add(runnerRecoveryBackoff(p.ID, state.failures))
+	if retryAt := runnerVerificationRetryAt(recoveryErr); retryAt.After(state.nextAttempt) {
+		state.nextAttempt = retryAt
+	}
+	report := state.lastError != message
+	state.lastError = message
+	nextAttempt := state.nextAttempt
+	s.runnerRecoveryMu.Unlock()
+
+	if report {
+		_ = s.db.SaveRunnerStatus(p.ID, "recovery_error")
+		log.Printf(
+			"runner recovery for %s failed: %v; next attempt no earlier than %s",
+			p.ID,
+			recoveryErr,
+			nextAttempt.UTC().Format(time.RFC3339),
+		)
+		if s.audit != nil {
+			s.audit.Log(
+				"runner_recovery",
+				"failed",
+				p.ID,
+				fmt.Sprintf(
+					"automatic recovery failed; next_attempt=%s reason=%s",
+					nextAttempt.UTC().Format(time.RFC3339),
+					truncateStr(message, 240),
+				),
+				"",
+			)
+		}
+	}
+	return nextAttempt
+}
+
+func (s *ProjectService) clearRunnerRecoveryFailure(p *models.Project) {
+	s.runnerRecoveryMu.Lock()
+	state := s.runnerRecoveryState[p.ID]
+	delete(s.runnerRecoveryState, p.ID)
+	s.runnerRecoveryMu.Unlock()
+	if state == nil || state.lastError == "" {
+		return
+	}
+	log.Printf("runner recovery for %s is healthy again", p.ID)
+	if s.audit != nil {
+		s.audit.Log("runner_recovery", "ok", p.ID, "automatic runner recovery is healthy again", "")
+	}
+}
+
+func (s *ProjectService) startRunnerMonitor(p *models.Project) {
+	if p == nil || p.ID == "" || p.RunnerContainer == "" {
+		return
+	}
+	ctx, installed := s.installRunnerMonitor(p.ID)
+	if !installed {
+		return
+	}
+
+	safeGo("runnerMonitor", func() {
+		initialLogs := s.docker.ContainerLogs(p.RunnerContainer, 200)
+		since := time.Now().UTC()
+		firstPoll := true
+		pendingRegistration := runnerRegistrationRequested(initialLogs)
+		pendingDeletionVerification := strings.Contains(initialLogs, runnerDeletionHint)
+		readyObserved := runnerLogsReady(initialLogs) && !pendingRegistration
+		var transitionStarted time.Time
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		resetTimer := func(delay time.Duration) {
+			if delay < 0 {
+				delay = 0
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(delay)
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case pollStarted := <-timer.C:
+				var logs string
+				if firstPoll {
+					logs = initialLogs
+					firstPoll = false
+				} else {
+					logs = s.docker.ContainerLogsSince(p.RunnerContainer, 200, since.Format(time.RFC3339Nano))
+				}
+				since = pollStarted.UTC()
+				summary := s.docker.ContainerSummary(p.RunnerContainer)
+				if strings.Contains(logs, runnerRegistrationRequestMarker) {
+					pendingRegistration = runnerRegistrationRequested(logs)
+				} else if runnerLogsReady(logs) {
+					pendingRegistration = false
+				}
+				if runnerLogsReady(logs) && !runnerRegistrationRequested(logs) {
+					readyObserved = true
+				}
+				if summary.State == "created" || summary.State == "restarting" {
+					readyObserved = false
+				}
+				transitionStarted = runnerTransitionStartedAt(
+					transitionStarted, pollStarted, summary, readyObserved,
+				)
+				sustainedTransition := !transitionStarted.IsZero() &&
+					pollStarted.Sub(transitionStarted) >= runnerTransitionRecoveryDelay
+				localUnavailable := !summary.Exists ||
+					(!summary.Running && summary.State != "created" && summary.State != "restarting") ||
+					sustainedTransition
+				if strings.Contains(logs, runnerDeletionHint) {
+					pendingDeletionVerification = true
+				}
+				pendingVerification := pendingDeletionVerification || localUnavailable
+				if !pendingRegistration && !pendingVerification {
+					resetTimer(runnerMonitorPollInterval)
+					continue
+				}
+				if nextAttempt := s.runnerRecoveryNextAttempt(p.ID); nextAttempt.After(pollStarted) {
+					delay := time.Until(nextAttempt)
+					if delay > runnerMonitorPollInterval {
+						delay = runnerMonitorPollInterval
+					}
+					resetTimer(delay)
+					continue
+				}
+				verifyCtx, verifyCancel := context.WithTimeout(ctx, 20*time.Second)
+				err := s.handleRunnerRecoverySignal(verifyCtx, p, runnerRecoverySignal{
+					registrationRequested: pendingRegistration,
+					localUnavailable:      localUnavailable,
+				})
+				verifyCancel()
+				if err != nil {
+					nextAttempt := s.recordRunnerRecoveryFailure(p, err, time.Now())
+					if ctx.Err() != nil {
+						// A failed lifecycle recovery installs a replacement
+						// monitor. Persistent backoff state transfers to it.
+						return
+					}
+					delay := time.Until(nextAttempt)
+					if delay > runnerMonitorPollInterval {
+						delay = runnerMonitorPollInterval
+					}
+					resetTimer(delay)
+					continue
+				}
+				s.clearRunnerRecoveryFailure(p)
+				if ctx.Err() != nil {
+					// Verified recovery cancels this monitor before replacing
+					// the container; only the replacement monitor may proceed.
+					return
+				}
+				if summary.Running {
+					_ = s.db.SaveRunnerStatus(p.ID, "active")
+				}
+				pendingRegistration = false
+				pendingDeletionVerification = false
+				transitionStarted = time.Time{}
+				resetTimer(runnerMonitorPollInterval)
+			}
+		}
+	})
+}
+
+func (s *ProjectService) installRunnerMonitor(projectID string) (context.Context, bool) {
+	s.runnerMonitorMu.Lock()
+	defer s.runnerMonitorMu.Unlock()
+	if s.runnerMonitors == nil {
+		s.runnerMonitors = make(map[string]context.CancelFunc)
+	}
+	if _, exists := s.runnerMonitors[projectID]; exists {
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.runnerMonitors[projectID] = cancel
+	return ctx, true
+}
+
+func (s *ProjectService) stopRunnerMonitor(projectID string) {
+	s.runnerMonitorMu.Lock()
+	cancel := s.runnerMonitors[projectID]
+	delete(s.runnerMonitors, projectID)
+	s.runnerMonitorMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *ProjectService) lockRunnerLifecycle(projectID string) func() {
+	s.runnerLifecycleMu.Lock()
+	if s.runnerLifecycleLocks == nil {
+		s.runnerLifecycleLocks = make(map[string]*sync.Mutex)
+	}
+	lock := s.runnerLifecycleLocks[projectID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.runnerLifecycleLocks[projectID] = lock
+	}
+	s.runnerLifecycleMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
 
 func isGitHubPersonalAccessToken(token string) bool {
 	return strings.HasPrefix(token, "ghp_") ||
@@ -703,16 +1445,21 @@ func (s *ProjectService) copyRunnerRegistrationToken(ctx context.Context, contai
 }
 
 func (s *ProjectService) startRunner(p *models.Project, runnerToken string) error {
-	registrationToken, err := s.runnerRegistrationToken(context.Background(), p.RepoURL, runnerToken)
-	if err != nil {
-		return err
-	}
+	unlock := s.lockRunnerLifecycle(p.ID)
+	defer unlock()
+	return s.startRunnerLocked(p, runnerToken)
+}
 
+func (s *ProjectService) startRunnerLocked(p *models.Project, runnerToken string) error {
+	return s.startRunnerContainerLocked(p, runnerToken)
+}
+
+func (s *ProjectService) runnerComposeEnvironment(p *models.Project) map[string]string {
 	// Generate scoped runner token to avoid leaking the master deploy token
 	mac := hmac.New(sha256.New, []byte(s.cfg.Token))
 	mac.Write([]byte("runner:" + p.ID))
 	scopedToken := hex.EncodeToString(mac.Sum(nil))
-	env := map[string]string{
+	return map[string]string{
 		"REPO_URL":              p.RepoURL,
 		"RUNNER_NAME":           fmt.Sprintf("runner-%s-%s", p.ID, branchSlug(p.BranchName)),
 		"RUNNER_CONTAINER_NAME": p.RunnerContainer,
@@ -723,12 +1470,16 @@ func (s *ProjectService) startRunner(p *models.Project, runnerToken string) erro
 		"RUNNER_NETWORK":        s.cfg.RunnerNetwork,
 		"RUNNER_IMAGE":          s.cfg.RunnerImage,
 	}
+}
 
-	if err := s.stopRunner(p); err != nil {
+func (s *ProjectService) startRunnerContainerLocked(p *models.Project, runnerToken string) error {
+	if err := s.stopRunnerLocked(p); err != nil {
 		return err
 	}
 	composeFile := filepath.Join(s.cfg.ProjectRoot, "deploy", "runner", "docker-compose.runner.yml")
-	if err := s.docker.ComposeUp(composeFile, fmt.Sprintf("devops-runner-%s", p.ID), env, "github-runner"); err != nil {
+	if err := s.docker.ComposeUp(
+		composeFile, fmt.Sprintf("devops-runner-%s", p.ID), s.runnerComposeEnvironment(p), "github-runner",
+	); err != nil {
 		return err
 	}
 	needsRegistration, err := s.waitForRunnerRegistrationRequest(p.RunnerContainer, 90*time.Second)
@@ -737,6 +1488,11 @@ func (s *ProjectService) startRunner(p *models.Project, runnerToken string) erro
 		return err
 	}
 	if needsRegistration {
+		registrationToken, err := s.runnerRegistrationToken(context.Background(), p.RepoURL, runnerToken)
+		if err != nil {
+			s.docker.RemoveContainer(p.RunnerContainer)
+			return err
+		}
 		copyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err = s.copyRunnerRegistrationToken(copyCtx, p.RunnerContainer, registrationToken)
 		cancel()
@@ -754,10 +1510,48 @@ func (s *ProjectService) startRunner(p *models.Project, runnerToken string) erro
 		s.docker.RemoveContainer(p.RunnerContainer)
 		return fmt.Errorf("runner did not become ready (state=%s): %s", state, truncateStr(logs, 200))
 	}
+	s.clearRunnerRecoveryFailure(p)
+	s.startRunnerMonitor(p)
+	return nil
+}
+
+func (s *ProjectService) recreateRunnerWithPreservedStateLocked(p *models.Project) error {
+	composeFile := filepath.Join(s.cfg.ProjectRoot, "deploy", "runner", "docker-compose.runner.yml")
+	if err := s.docker.ComposeUp(
+		composeFile, fmt.Sprintf("devops-runner-%s", p.ID), s.runnerComposeEnvironment(p), "github-runner",
+	); err != nil {
+		return err
+	}
+	needsRegistration, err := s.waitForRunnerRegistrationRequest(p.RunnerContainer, 90*time.Second)
+	if err != nil {
+		s.docker.RemoveContainer(p.RunnerContainer)
+		return err
+	}
+	if needsRegistration {
+		s.docker.RemoveContainer(p.RunnerContainer)
+		return fmt.Errorf("preserved runner state is unavailable while GitHub registration still exists")
+	}
 	return nil
 }
 
 func (s *ProjectService) stopRunner(p *models.Project) error {
+	unlock := s.lockRunnerLifecycle(p.ID)
+	defer unlock()
+	return s.stopRunnerLocked(p)
+}
+
+func (s *ProjectService) stopRunnerLocked(p *models.Project) error {
+	return s.stopRunnerResourcesLocked(p, true)
+}
+
+func (s *ProjectService) stopRunnerForRecoveryLocked(p *models.Project) error {
+	return s.stopRunnerResourcesLocked(p, false)
+}
+
+func (s *ProjectService) stopRunnerResourcesLocked(p *models.Project, cancelMonitor bool) error {
+	if cancelMonitor {
+		s.stopRunnerMonitor(p.ID)
+	}
 	projectName := fmt.Sprintf("devops-runner-%s", p.ID)
 	if summary := s.docker.ContainerSummary(p.RunnerContainer); !summary.Exists {
 		return nil
@@ -826,6 +1620,43 @@ func (s *ProjectService) ReconcileContainers() {
 			if err := s.docker.StartContainer(containerName); err != nil {
 				log.Printf("Reconcile: failed to restart %s: %v", containerName, err)
 			}
+		}
+		runnerSummary := s.docker.ContainerSummary(p.RunnerContainer)
+		if runnerSummary.Exists && (runnerSummary.Running || runnerSummary.State == "created" || runnerSummary.State == "restarting") {
+			projectName := fmt.Sprintf("devops-runner-%s", p.ID)
+			if err := s.docker.VerifyComposeOwnership(p.RunnerContainer, projectName, "github-runner"); err == nil {
+				s.startRunnerMonitor(p)
+			}
+		} else if runnerSummary.Exists && (p.RunnerStatus == "active" || p.RunnerStatus == "starting") {
+			projectName := fmt.Sprintf("devops-runner-%s", p.ID)
+			if err := s.docker.VerifyComposeOwnership(p.RunnerContainer, projectName, "github-runner"); err != nil {
+				log.Printf("Reconcile: refusing unowned runner %s: %v", p.ID, err)
+			} else if err := s.docker.StartContainer(p.RunnerContainer); err != nil {
+				log.Printf("Reconcile: failed to restart runner %s: %v", p.ID, err)
+				_ = s.db.SaveRunnerStatus(p.ID, "error")
+			} else {
+				s.startRunnerMonitor(p)
+			}
+		} else if !runnerSummary.Exists && (p.RunnerStatus == "active" || p.RunnerStatus == "starting") {
+			token, _ := s.db.GetRunnerToken(p.ID)
+			if token == "" {
+				token = s.cfg.GithubToken
+			}
+			if token == "" {
+				log.Printf("Reconcile: runner %s should be active but has no configured credential", p.ID)
+				_ = s.db.SaveRunnerStatus(p.ID, "error")
+				continue
+			}
+			_ = s.db.SaveRunnerStatus(p.ID, "starting")
+			project := p
+			safeGo("reconcileRunner", func() {
+				if err := s.startRunner(project, token); err != nil {
+					log.Printf("Reconcile: failed to start runner %s: %v", project.ID, err)
+					_ = s.db.SaveRunnerStatus(project.ID, "error")
+					return
+				}
+				_ = s.db.SaveRunnerStatus(project.ID, "active")
+			})
 		}
 	}
 }
@@ -896,8 +1727,27 @@ func (s *ProjectService) ensureEnvTemplate(p *models.Project) {
 	if repository == "" {
 		return
 	}
+	dockerConfigDir := ""
+	registryPassword, err := s.db.GetRegistryPassword(p.ID)
+	if err != nil {
+		log.Printf("ensureEnvTemplate: load registry credentials for %s: %v", p.ID, err)
+		return
+	}
+	if registryPassword != "" {
+		registryAuth, ok, message := s.docker.RegistryLoginIsolated(p.RegistryHost, p.RegistryUsername, registryPassword)
+		if !ok {
+			log.Printf("ensureEnvTemplate: registry login for %s failed: %s", p.ID, message)
+			return
+		}
+		defer func() {
+			if err := registryAuth.Close(); err != nil {
+				log.Printf("ensureEnvTemplate: remove isolated registry credentials for %s: %v", p.ID, err)
+			}
+		}()
+		dockerConfigDir = registryAuth.ConfigDir()
+	}
 	configImage := fmt.Sprintf("%s/%s-deploy-config:%s", p.RegistryHost, repository, p.BranchName)
-	if out, err := s.extractFromConfigImage(configImage, p.AppDir); err == nil {
+	if out, err := s.extractFromConfigImage(configImage, p.AppDir, dockerConfigDir); err == nil {
 		log.Printf("ensureEnvTemplate: extracted template from %s", configImage)
 		return
 	} else {
@@ -918,28 +1768,35 @@ func (s *ProjectService) ensureEnvTemplate(p *models.Project) {
 	}
 }
 
-func (s *ProjectService) extractFromConfigImage(image, destDir string) (string, error) {
+func (s *ProjectService) extractFromConfigImage(image, destDir, dockerConfigDir string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	pullCmd := exec.CommandContext(ctx, "docker", "pull", image)
+	pullCmd.Env = docker.CommandEnvForConfig(dockerConfigDir)
 	pullOut, pullErr := pullCmd.CombinedOutput()
 	if pullErr != nil {
 		return string(pullOut), pullErr
 	}
 
 	createCmd := exec.CommandContext(ctx, "docker", "create", image)
+	createCmd.Env = docker.CommandEnvForConfig(dockerConfigDir)
 	createOut, createErr := createCmd.CombinedOutput()
 	if createErr != nil {
 		return string(createOut), createErr
 	}
 	containerID := strings.TrimSpace(string(createOut))
 
-	defer exec.Command("docker", "rm", "-f", containerID).Run()
+	defer func() {
+		removeCmd := exec.Command("docker", "rm", "-f", containerID)
+		removeCmd.Env = docker.CommandEnvForConfig(dockerConfigDir)
+		_ = removeCmd.Run()
+	}()
 
 	cpCmd := exec.CommandContext(ctx, "docker", "cp",
 		fmt.Sprintf("%s:/app/.env.template", containerID),
 		filepath.Join(destDir, ".env.template"))
+	cpCmd.Env = docker.CommandEnvForConfig(dockerConfigDir)
 	cpOut, cpErr := cpCmd.CombinedOutput()
 
 	// Also extract the remaining project contract files. The configuration image
@@ -947,16 +1804,20 @@ func (s *ProjectService) extractFromConfigImage(image, destDir string) (string, 
 	// the portal cannot apply its declared environment metadata.
 	composePath := filepath.Join(destDir, "docker-compose.yml")
 	if _, err := os.Stat(composePath); os.IsNotExist(err) {
-		composeOut, composeErr := exec.CommandContext(ctx, "docker", "cp",
+		composeCmd := exec.CommandContext(ctx, "docker", "cp",
 			fmt.Sprintf("%s:/app/docker-compose.yml", containerID),
-			composePath).CombinedOutput()
+			composePath)
+		composeCmd.Env = docker.CommandEnvForConfig(dockerConfigDir)
+		composeOut, composeErr := composeCmd.CombinedOutput()
 		if composeErr != nil {
 			return string(composeOut), composeErr
 		}
 	}
-	devopsOut, devopsErr := exec.CommandContext(ctx, "docker", "cp",
+	devopsCmd := exec.CommandContext(ctx, "docker", "cp",
 		fmt.Sprintf("%s:/app/devops.json", containerID),
-		filepath.Join(destDir, "devops.json")).CombinedOutput()
+		filepath.Join(destDir, "devops.json"))
+	devopsCmd.Env = docker.CommandEnvForConfig(dockerConfigDir)
+	devopsOut, devopsErr := devopsCmd.CombinedOutput()
 	if devopsErr != nil {
 		return string(devopsOut), devopsErr
 	}
@@ -994,6 +1855,7 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 	contract := projectEnvironmentContract(s.loadDevopsConfig(filepath.Join(p.AppDir, "devops.json")))
 	secretKeys := map[string]bool{"password": true, "secret": true, "token": true, "key": true, "pass": true}
 	var vars []EnvVar
+	declared := make(map[string]bool)
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1007,6 +1869,7 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 		if !envKeyRE.MatchString(key) {
 			continue
 		}
+		declared[key] = true
 		def := ""
 		if len(parts) == 2 {
 			def = strings.TrimSpace(parts[1])
@@ -1025,20 +1888,28 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 		if isSecret && def != "" {
 			def = "********"
 		}
+		controllerManaged := contract.controllerManaged[key] || isReservedProjectEnvOverrideKey(key)
 		operatorRequired := true // legacy projects retain strict blank-template gating
 		if contract.present {
-			operatorRequired = contract.operatorRequired[key] && !contract.controllerManaged[key]
+			operatorRequired = contract.operatorRequired[key] && !controllerManaged
+		} else if controllerManaged {
+			operatorRequired = false
 		}
 		vars = append(vars, EnvVar{
 			Key:               key,
 			Default:           def,
 			IsSecret:          isSecret,
 			OperatorRequired:  operatorRequired,
-			ControllerManaged: contract.controllerManaged[key],
+			ControllerManaged: controllerManaged,
 		})
 	}
 
 	overrides := s.loadEnvOverrides(projectID)
+	for key := range overrides {
+		if !declared[key] || contract.controllerManaged[key] || isReservedProjectEnvOverrideKey(key) {
+			delete(overrides, key)
+		}
+	}
 	// Mask secret override values
 	for k, v := range overrides {
 		if v == "" {
@@ -1060,9 +1931,9 @@ func (s *ProjectService) ReadEnvTemplate(projectID string) ([]EnvVar, map[string
 
 var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// SaveEnvConfig validates against the project's declared template and stores
-// the complete override map encrypted at rest.
-func (s *ProjectService) SaveEnvConfig(projectID string, overrides map[string]string) error {
+// SaveEnvConfig validates and atomically patches the project's encrypted
+// overrides. Omitted keys are preserved; deletion requires an explicit clear.
+func (s *ProjectService) SaveEnvConfig(projectID string, overrides map[string]string, clearKeys []string) error {
 	p, err := s.db.GetProject(projectID)
 	if err != nil {
 		return fmt.Errorf("project not found: %s", projectID)
@@ -1082,24 +1953,112 @@ func (s *ProjectService) SaveEnvConfig(projectID string, overrides map[string]st
 			allowed[key] = true
 		}
 	}
-	existing := s.loadEnvOverrides(projectID)
-	envMap := make(map[string]string, len(overrides))
+	existing, err := s.db.GetProjectEnvOverrides(projectID)
+	if err != nil {
+		return fmt.Errorf("read saved project environment: %w", err)
+	}
+	if existing == nil {
+		existing = make(map[string]string)
+	}
+	contract := projectEnvironmentContract(s.loadDevopsConfig(filepath.Join(p.AppDir, "devops.json")))
+	clearSet := make(map[string]bool, len(clearKeys))
+	explicitClearSet := make(map[string]bool, len(clearKeys))
+	for _, key := range clearKeys {
+		if !envKeyRE.MatchString(key) {
+			return fmt.Errorf("invalid environment key %q in clear list", key)
+		}
+		clearSet[key] = true
+		explicitClearSet[key] = true
+	}
+	// Remove legacy values that predate controller-owned namespace enforcement.
+	// They must never survive merely because the UI no longer sends them.
+	for key := range existing {
+		if isReservedProjectEnvOverrideKey(key) || contract.controllerManaged[key] {
+			clearSet[key] = true
+		}
+	}
+
+	envPatch := make(map[string]string, len(overrides))
 	for k, v := range overrides {
+		if explicitClearSet[k] {
+			return fmt.Errorf("environment key %q cannot be both set and cleared", k)
+		}
+		if isReservedProjectEnvOverrideKey(k) || contract.controllerManaged[k] {
+			oldValue, existed := existing[k]
+			if v == "" || v == "********" || (existed && v == oldValue) {
+				clearSet[k] = true
+				continue
+			}
+			return fmt.Errorf("environment key %q is controlled by the deployment system", k)
+		}
 		if !allowed[k] {
 			return fmt.Errorf("environment key %q is not declared in .env.template", k)
 		}
 		if v == "********" {
-			if oldVal, ok := existing[k]; ok {
-				envMap[k] = oldVal
-			}
+			// A masked value is a UI sentinel, not a replacement secret.
 			continue
 		}
 		if strings.ContainsAny(v, "\r\n\x00") {
 			return fmt.Errorf("environment value for %s must be a single line", k)
 		}
-		envMap[k] = v
+		envPatch[k] = v
 	}
-	return s.db.SaveProjectEnvOverrides(projectID, envMap)
+
+	cleared := make([]string, 0, len(clearSet))
+	for key := range clearSet {
+		cleared = append(cleared, key)
+	}
+	sort.Strings(cleared)
+	result, err := s.db.PatchProjectEnvOverrides(projectID, envPatch, cleared)
+	if err != nil {
+		return fmt.Errorf("patch project environment: %w", err)
+	}
+	if s.audit != nil {
+		s.audit.Log(
+			"project_env_patch",
+			"ok",
+			projectID,
+			fmt.Sprintf(
+				"added=%s updated=%s cleared=%s",
+				strings.Join(result.Added, ","),
+				strings.Join(result.Updated, ","),
+				strings.Join(result.Cleared, ","),
+			),
+			"",
+		)
+	}
+	return nil
+}
+
+func isDeploymentControllerEnvKey(key string) bool {
+	switch key {
+	case "DEPLOY_ID", "DEPLOY_REF", "DEPLOY_SHA", "DEPLOY_BRANCH", "IMAGE_TAG",
+		"PROJECT_ID", "REPO_URL", "REGISTRY_HOST", "BASE_DIR", "PROJECT_LOG_DIR",
+		"GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_ACTOR", "GITHUB_REPOSITORY",
+		"GITHUB_WORKFLOW", "COMMIT_MESSAGE":
+		return true
+	default:
+		return false
+	}
+}
+
+func isReservedProjectEnvOverrideKey(key string) bool {
+	if isDeploymentControllerEnvKey(key) {
+		return true
+	}
+	for _, prefix := range [...]string{"DOCKER_", "COMPOSE_", "BUILDKIT_", "BUILDX_"} {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	switch key {
+	case projectEnvOverridesFDEnv, "ENV_NAME",
+		"PROJECT_DIR", "PROJECT_ENV_FILE", "PROJECT_COMPOSE_FILE", "PROJECT_DEVOPS_FILE", "DEVOPS_JSON",
+		"PROJECT_STATE_DIR", "PROJECT_RELEASE_DIR", "DEPLOY_PROCESS_PID", "DEPLOY_ACTOR":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *ProjectService) loadEnvOverrides(projectID string) map[string]string {
@@ -1155,6 +2114,8 @@ func (s *ProjectService) RunnerAction(projectID, action string) (string, error) 
 		if err := s.stopRunner(p); err != nil {
 			return "", err
 		}
+		p.RunnerStatus = "stopped"
+		_ = s.db.SaveRunnerStatus(p.ID, p.RunnerStatus)
 		msg = "Runner container stopped."
 	case "restart":
 		if err := s.stopRunner(p); err != nil {

@@ -1,8 +1,11 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -72,7 +75,9 @@ func (s *DeployService) failInterruptedOperation(lock *models.DeployLock) {
 	now := time.Now().UTC()
 	exitCode := -1
 	_ = s.db.UpdateDeploymentStatus(lock.OperationID, models.DeploymentStatusFailed, &exitCode, &now)
-	_ = s.db.ReleaseLock(lock.ProjectID, lock.OperationID)
+	if err := s.db.ReleaseLock(lock.ProjectID, lock.OperationID); err != nil {
+		log.Printf("reconcile lock release for project %s operation %s: %v", lock.ProjectID, lock.OperationID, err)
+	}
 	_ = os.RemoveAll(filepath.Join(s.cfg.DataDir, lock.ProjectID, "deploy-lock"))
 	s.audit.Log("operation_interrupted", "failed", lock.ProjectID,
 		fmt.Sprintf("operation=%s id=%s controller ownership was interrupted; verify external effects", lock.Operation, lock.OperationID), "")
@@ -230,6 +235,16 @@ func (s *DeployService) createDeployment(p *models.Project, req *models.DeployRe
 }
 
 func (s *DeployService) startDeployment(deployment *models.Deployment, p *models.Project, expectedStatus models.DeploymentStatus) error {
+	var registryAuth *docker.RegistryAuth
+	registryAuthHandedOff := false
+	defer func() {
+		if registryAuth != nil && !registryAuthHandedOff {
+			if err := registryAuth.Close(); err != nil {
+				log.Printf("remove isolated registry credentials for %s: %v", p.ID, err)
+			}
+		}
+	}()
+
 	state, err := s.db.GetProjectState(p.ID)
 	if err != nil {
 		return fmt.Errorf("get project state: %w", err)
@@ -243,14 +258,20 @@ func (s *DeployService) startDeployment(deployment *models.Deployment, p *models
 		return fmt.Errorf("load registry credentials: %w", err)
 	}
 	if pass != "" {
-		if ok, message := s.docker.RegistryLogin(p.RegistryHost, p.RegistryUsername, pass); !ok {
+		var ok bool
+		var message string
+		registryAuth, ok, message = s.docker.RegistryLoginIsolated(p.RegistryHost, p.RegistryUsername, pass)
+		if !ok {
 			return fmt.Errorf("registry login failed: %s", message)
 		}
 	}
 
-	env, err := s.deploymentEnv(deployment, p)
+	controllerEnv, projectOverrides, err := s.deploymentEnv(deployment, p)
 	if err != nil {
 		return err
+	}
+	if registryAuth != nil {
+		controllerEnv["DOCKER_CONFIG"] = registryAuth.ConfigDir()
 	}
 	lock := &models.DeployLock{
 		ProjectID:   p.ID,
@@ -267,7 +288,9 @@ func (s *DeployService) startDeployment(deployment *models.Deployment, p *models
 	if expectedStatus == models.DeploymentStatusPendingApproval {
 		transitioned, err := s.db.TransitionDeploymentStatus(deployment.ID, expectedStatus, models.DeploymentStatusPending)
 		if err != nil || !transitioned {
-			_ = s.db.ReleaseLock(p.ID, deployment.ID)
+			if releaseErr := s.db.ReleaseLock(p.ID, deployment.ID); releaseErr != nil {
+				log.Printf("release unqueued deployment lock for project %s operation %s: %v", p.ID, deployment.ID, releaseErr)
+			}
 			if err != nil {
 				return fmt.Errorf("queue approved deployment: %w", err)
 			}
@@ -277,39 +300,49 @@ func (s *DeployService) startDeployment(deployment *models.Deployment, p *models
 
 	s.audit.Log("deploy_started", "pending", p.ID,
 		fmt.Sprintf("deploy=%s ref=%s sha=%s", deployment.ID, deployment.Ref, deployment.SHA), "")
-	safeGo("runDeploy", func() { s.runDeploy(deployment, p, env) })
+	safeGo("runDeploy", func() {
+		if registryAuth != nil {
+			defer func() {
+				if err := registryAuth.Close(); err != nil {
+					log.Printf("remove isolated registry credentials for %s: %v", p.ID, err)
+				}
+			}()
+		}
+		s.runDeploy(deployment, p, controllerEnv, projectOverrides)
+	})
+	registryAuthHandedOff = true
 	return nil
 }
 
-func (s *DeployService) deploymentEnv(deployment *models.Deployment, p *models.Project) (map[string]string, error) {
-	env := map[string]string{
-		"DEPLOY_ID":         deployment.ID,
-		"DEPLOY_REF":        deployment.Ref,
-		"DEPLOY_SHA":        deployment.SHA,
-		"DEPLOY_BRANCH":     deployment.Branch,
-		"IMAGE_TAG":         deployment.ImageTag,
-		"PROJECT_ID":        p.ID,
-		"REPO_URL":          p.RepoURL,
-		"REGISTRY_HOST":     p.RegistryHost,
-		"BASE_DIR":          s.cfg.BaseDir,
-		"PROJECT_LOG_DIR":   filepath.Join(s.cfg.BaseDir, "Logs", p.ID),
-		"GITHUB_RUN_ID":     deployment.GitHubRunID,
-		"GITHUB_RUN_NUMBER": deployment.GitHubRunNumber,
-		"GITHUB_ACTOR":      deployment.GitHubActor,
-		"GITHUB_REPOSITORY": deployment.GitHubRepo,
-		"GITHUB_WORKFLOW":   deployment.GitHubWorkflow,
-		"COMMIT_MESSAGE":    deployment.CommitMessage,
+func (s *DeployService) deploymentEnv(deployment *models.Deployment, p *models.Project) (map[string]string, map[string]string, error) {
+	controllerBinary, err := os.Executable()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve controller executable: %w", err)
+	}
+	controllerEnv := map[string]string{
+		"DEPLOY_ID":          deployment.ID,
+		"DEPLOY_REF":         deployment.Ref,
+		"DEPLOY_SHA":         deployment.SHA,
+		"DEPLOY_BRANCH":      deployment.Branch,
+		"IMAGE_TAG":          deployment.ImageTag,
+		"PROJECT_ID":         p.ID,
+		"REPO_URL":           p.RepoURL,
+		"REGISTRY_HOST":      p.RegistryHost,
+		"BASE_DIR":           s.cfg.BaseDir,
+		"PROJECT_LOG_DIR":    filepath.Join(s.cfg.BaseDir, "Logs", p.ID),
+		"GITHUB_RUN_ID":      deployment.GitHubRunID,
+		"GITHUB_RUN_NUMBER":  deployment.GitHubRunNumber,
+		"GITHUB_ACTOR":       deployment.GitHubActor,
+		"GITHUB_REPOSITORY":  deployment.GitHubRepo,
+		"GITHUB_WORKFLOW":    deployment.GitHubWorkflow,
+		"COMMIT_MESSAGE":     deployment.CommitMessage,
+		"DEVOPS_CONTROL_BIN": controllerBinary,
 	}
 	overrides, err := s.db.GetProjectEnvOverrides(p.ID)
 	if err != nil {
-		return nil, fmt.Errorf("load project environment: %w", err)
+		return nil, nil, fmt.Errorf("load project environment: %w", err)
 	}
-	for key, value := range overrides {
-		if _, exists := env[key]; !exists {
-			env[key] = value
-		}
-	}
-	return env, nil
+	return controllerEnv, overrides, nil
 }
 
 var (
@@ -393,7 +426,7 @@ func validateGitHubDeployRequest(p *models.Project, req *models.DeployRequest, c
 	return nil
 }
 
-func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env map[string]string) {
+func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, controllerEnv, projectOverrides map[string]string) {
 	script := filepath.Join(s.cfg.ProjectRoot, "deploy", "project.sh")
 
 	appDir := p.AppDir
@@ -405,7 +438,7 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = appDir
-	cmd.Env = deploymentProcessEnv(env)
+	cmd.Env = deploymentProcessEnv(controllerEnv)
 
 	logFile, err := os.Create(d.LogPath)
 	if err != nil {
@@ -419,7 +452,7 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 	}
 
 	s.running.Store(d.ID, deployHandle{cancel: cancel, pid: 0})
-	err = cmd.Start()
+	overrideStream, err := startCommandWithProjectOverrides(cmd, projectOverrides)
 	if err == nil {
 		s.running.Store(d.ID, deployHandle{cancel: cancel, pid: cmd.Process.Pid})
 		transitioned, transitionErr := s.db.TransitionDeploymentStatus(d.ID, models.DeploymentStatusPending, models.DeploymentStatusRunning)
@@ -434,6 +467,10 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 			}
 		} else {
 			err = cmd.Wait()
+		}
+		streamErr := overrideStream.finish()
+		if err == nil && streamErr != nil {
+			err = fmt.Errorf("stream project environment overrides: %w", streamErr)
 		}
 	} else {
 		cancel()
@@ -459,46 +496,149 @@ func (s *DeployService) runDeploy(d *models.Deployment, p *models.Project, env m
 	if updateErr != nil {
 		log.Printf("runDeploy: update deployment %s completion: %v", d.ID, updateErr)
 	}
-	_ = s.db.ReleaseLock(p.ID, d.ID)
+	if err := s.db.ReleaseLock(p.ID, d.ID); err != nil {
+		log.Printf("release completed deployment lock for project %s operation %s: %v", p.ID, d.ID, err)
+	}
 	if !completed {
 		return
 	}
 
-	stateFile, err := s.db.GetProjectState(p.ID)
-	if err != nil || stateFile == nil {
-		stateFile = map[string]any{}
+	if err := s.recordDeploymentCompletionState(p.ID, d, status, exitCode, finishedAt); err != nil {
+		log.Printf("runDeploy: update project %s deployment state: %v", p.ID, err)
 	}
-	stateFile["last_deploy_status"] = string(status)
-	stateFile["last_deploy_message"] = fmt.Sprintf("deploy %s completed with exit code %d", d.ID, exitCode)
-	stateFile["last_run_at"] = finishedAt.Format(time.RFC3339)
-	stateFile["active_deploy_id"] = ""
-	stateFile["last_deployed_commit"] = d.SHA
-	stateFile["last_deployed_image_tag"] = d.ImageTag
-	_ = s.db.UpsertProjectState(p.ID, stateFile)
 
 	s.audit.Log("deploy_finished", string(status), p.ID, fmt.Sprintf("deploy=%s exit_code=%d", d.ID, exitCode), "")
 }
 
-// deploymentProcessEnv starts deployments with a deliberately narrow process
-// environment. The controller's Docker auth location is required for private
-// registry pulls, so it must survive that narrowing. Project environment
-// overrides must never replace command resolution, Docker selection, or
-// project-control paths used by deploy/project.sh.
-func deploymentProcessEnv(deploymentEnv map[string]string) []string {
+// recordDeploymentCompletionState patches only fields owned by the deployment
+// operation. In particular, pause and operator metadata may be changed while a
+// deployment is running and must never be overwritten from a stale snapshot.
+func (s *DeployService) recordDeploymentCompletionState(projectID string, d *models.Deployment, status models.DeploymentStatus, exitCode int, finishedAt time.Time) error {
+	return s.db.UpsertProjectState(projectID, map[string]any{
+		"last_deploy_status":      string(status),
+		"last_deploy_message":     fmt.Sprintf("deploy %s completed with exit code %d", d.ID, exitCode),
+		"last_run_at":             finishedAt.Format(time.RFC3339),
+		"active_deploy_id":        "",
+		"last_deployed_commit":    d.SHA,
+		"last_deployed_image_tag": d.ImageTag,
+	})
+}
+
+const projectEnvOverridesFDEnv = "DEVOPS_ENV_OVERRIDES_FD"
+
+type projectEnvOverrideStream struct {
+	writer *os.File
+	done   <-chan error
+}
+
+// startCommandWithProjectOverrides starts cmd with project overrides on a
+// private inherited descriptor. Writing starts only after the process exists,
+// so payloads larger than the pipe buffer cannot deadlock cmd.Start.
+func startCommandWithProjectOverrides(cmd *exec.Cmd, overrides map[string]string) (*projectEnvOverrideStream, error) {
+	if overrides == nil {
+		overrides = map[string]string{}
+	}
+	payload, err := json.Marshal(overrides)
+	if err != nil {
+		return nil, fmt.Errorf("encode project environment overrides: %w", err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create project environment override pipe: %w", err)
+	}
+	if err := writer.SetWriteDeadline(time.Time{}); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return nil, fmt.Errorf("configure project environment override pipe: %w", err)
+	}
+	fd := 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, reader)
+	cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", projectEnvOverridesFDEnv, fd))
+	if err := cmd.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return nil, err
+	}
+	_ = reader.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, writeErr := io.Copy(writer, bytes.NewReader(payload))
+		closeErr := writer.Close()
+		if writeErr == nil {
+			writeErr = closeErr
+		}
+		done <- writeErr
+	}()
+	return &projectEnvOverrideStream{writer: writer, done: done}, nil
+}
+
+// finish is called after cmd.Wait. Closing the writer here also releases a
+// blocked write if a failed child left the inherited read descriptor unread.
+func (s *projectEnvOverrideStream) finish() error {
+	_ = s.writer.SetWriteDeadline(time.Now())
+	_ = s.writer.Close()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-s.done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("project environment override writer did not stop")
+	}
+}
+
+var (
+	deploymentControllerEnvKeys = envKeySet(
+		"DEPLOY_ID", "DEPLOY_REF", "DEPLOY_SHA", "DEPLOY_BRANCH", "IMAGE_TAG",
+		"PROJECT_ID", "REPO_URL", "REGISTRY_HOST", "BASE_DIR", "PROJECT_LOG_DIR",
+		"GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_ACTOR", "GITHUB_REPOSITORY",
+		"GITHUB_WORKFLOW", "COMMIT_MESSAGE", "DOCKER_CONFIG", "DEVOPS_CONTROL_BIN",
+	)
+	backupControllerEnvKeys = envKeySet(
+		"DEPLOY_ID", "TARGET_BRANCH", "BACKUP_KIND", "BACKUP_REASON",
+		"BACKUP_DIR_PATH", "BACKUP_MANIFEST_FILE", "ENV_FILE", "BASE_DIR",
+		"PROJECT_ID", "PROJECT_DIR", "PROJECT_STATE_DIR", "PROJECT_LOG_DIR",
+		"COMPOSE_PROJECT_NAME", "POSTGRES_CONTAINER",
+	)
+	restoreControllerEnvKeys = envKeySet(
+		"DEPLOY_ID", "BACKUP_ID", "BACKUP_DIR_PATH", "BACKUP_MANIFEST_FILE",
+		"ENV_FILE", "COMPOSE_FILE", "BASE_DIR", "PROJECT_ID", "PROJECT_DIR",
+		"PROJECT_STATE_DIR", "PROJECT_LOG_DIR", "TARGET_BRANCH",
+		"COMPOSE_PROJECT_NAME", "POSTGRES_CONTAINER", "RESTORE_COMMAND_JSON",
+	)
+	rollbackControllerEnvKeys = envKeySet(
+		"DEPLOY_ID", "BASE_DIR", "PROJECT_ID", "REPO_URL", "REGISTRY_HOST",
+		"PROJECT_LOG_DIR", "DOCKER_CONFIG",
+	)
+)
+
+func envKeySet(keys ...string) map[string]struct{} {
+	result := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		result[key] = struct{}{}
+	}
+	return result
+}
+
+// controllerProcessEnv is the single process-environment boundary for
+// deploy/backup/restore/rollback scripts. Docker connection settings come only
+// from the controller process. Operation maps are reduced to an exact
+// per-operation allowlist so project-controlled command namespaces cannot be
+// introduced accidentally.
+func controllerProcessEnv(controllerEnv map[string]string, allowedKeys map[string]struct{}) []string {
 	processEnv := map[string]string{
 		"PATH": os.Getenv("PATH"),
 		"HOME": os.Getenv("HOME"),
 	}
-	for _, key := range []string{"DOCKER_CONFIG", "DOCKER_HOST", "DOCKER_CONTEXT"} {
-		if value := os.Getenv(key); value != "" {
+	for key, value := range docker.TrustedDockerCommandEnv() {
+		processEnv[key] = value
+	}
+	for key, value := range controllerEnv {
+		if _, ok := allowedKeys[key]; ok {
 			processEnv[key] = value
 		}
-	}
-	for key, value := range deploymentEnv {
-		if docker.IsReservedCommandEnvKey(key) {
-			continue
-		}
-		processEnv[key] = value
 	}
 
 	keys := make([]string, 0, len(processEnv))
@@ -512,6 +652,22 @@ func deploymentProcessEnv(deploymentEnv map[string]string) []string {
 		result = append(result, fmt.Sprintf("%s=%s", key, processEnv[key]))
 	}
 	return result
+}
+
+func deploymentProcessEnv(controllerEnv map[string]string) []string {
+	return controllerProcessEnv(controllerEnv, deploymentControllerEnvKeys)
+}
+
+func backupProcessEnv(controllerEnv map[string]string) []string {
+	return controllerProcessEnv(controllerEnv, backupControllerEnvKeys)
+}
+
+func restoreProcessEnv(controllerEnv map[string]string) []string {
+	return controllerProcessEnv(controllerEnv, restoreControllerEnvKeys)
+}
+
+func rollbackProcessEnv(controllerEnv map[string]string) []string {
+	return controllerProcessEnv(controllerEnv, rollbackControllerEnvKeys)
 }
 
 func (s *DeployService) Abort(projectID string) error {
@@ -538,24 +694,31 @@ func (s *DeployService) Abort(projectID string) error {
 		_ = s.db.UpdateDeploymentStatus(d.ID, models.DeploymentStatusAborted, &ec, &now)
 	}
 	if len(deployments) > 0 {
-		_ = s.db.ReleaseLock(projectID, deployments[0].ID)
+		if err := s.db.ReleaseLock(projectID, deployments[0].ID); err != nil {
+			return fmt.Errorf("abort: release operation lock: %w", err)
+		}
 	}
 
 	// Clean up the file lock after the owning process has been signalled.
 	lockDir := filepath.Join(s.cfg.DataDir, projectID, "deploy-lock")
 	os.RemoveAll(lockDir)
 
-	state, err := s.db.GetProjectState(projectID)
-	if err != nil {
-		return fmt.Errorf("abort: get project state: %w", err)
+	if err := s.recordDeploymentAbortState(projectID); err != nil {
+		return fmt.Errorf("abort: update project state: %w", err)
 	}
-	state["last_deploy_status"] = "aborted"
-	state["last_deploy_message"] = "aborted by user"
-	state["active_deploy_id"] = ""
-	_ = s.db.UpsertProjectState(projectID, state)
 
 	s.audit.Log("deploy_abort", "ok", projectID, fmt.Sprintf("aborted %d running deployments", len(deployments)), "")
 	return nil
+}
+
+// recordDeploymentAbortState patches only fields owned by abort. Pause state
+// belongs to the operator and may be updated concurrently with this operation.
+func (s *DeployService) recordDeploymentAbortState(projectID string) error {
+	return s.db.UpsertProjectState(projectID, map[string]any{
+		"last_deploy_status":  "aborted",
+		"last_deploy_message": "aborted by user",
+		"active_deploy_id":    "",
+	})
 }
 
 func (s *DeployService) GetLog(projectID, deployID string) (string, error) {

@@ -2,11 +2,13 @@ package services
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -350,8 +352,636 @@ func TestRunnerRegistrationTokenErrorDoesNotExposeCredentialOrResponse(t *testin
 	}
 }
 
+func TestGitHubRunnerPresenceRequiresExactConfiguredRunner(t *testing.T) {
+	const pat = "gh" + "p_runner_verification"
+	project := &models.Project{
+		ID:         "medusa",
+		BranchName: "main",
+		RepoURL:    "https://github.com/sauraku/medusa",
+	}
+	tests := []struct {
+		name    string
+		runners string
+		state   runnerRegistrationState
+	}{
+		{
+			name:    "exact runner present",
+			runners: `{"total_count":2,"runners":[{"name":"unrelated"},{"name":"runner-medusa-main"}]}`,
+			state:   runnerRegistrationPresent,
+		},
+		{
+			name:    "similar runner is not accepted",
+			runners: `{"total_count":2,"runners":[{"name":"runner-medusa-main-attacker"},{"name":"runner-medusa-dev"}]}`,
+			state:   runnerRegistrationAbsent,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method != http.MethodGet {
+					t.Errorf("method = %s", r.Method)
+				}
+				if r.URL.Path != "/repos/sauraku/medusa/actions/runners" {
+					t.Errorf("path = %s", r.URL.Path)
+				}
+				if r.URL.Query().Get("per_page") != "100" || r.URL.Query().Get("page") != "1" {
+					t.Errorf("query = %s", r.URL.RawQuery)
+				}
+				if r.Header.Get("Authorization") != "Bearer "+pat {
+					t.Errorf("authorization header was not the controller PAT")
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader(test.runners)),
+					Header:     make(http.Header),
+				}, nil
+			})}
+			service := &ProjectService{
+				cfg:              &models.Config{AllowedRepoPrefixes: []string{"https://github.com/sauraku/"}},
+				githubAPIBaseURL: "https://api.github.test",
+				githubHTTPClient: client,
+			}
+			state, err := service.githubRunnerRegistrationState(context.Background(), project, pat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state != test.state {
+				t.Fatalf("state = %v, want %v", state, test.state)
+			}
+		})
+	}
+}
+
+func TestGitHubRunnerPresenceFailsClosedOnAPIErrors(t *testing.T) {
+	const pat = "gh" + "p_runner_verification"
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Status:     "403 Forbidden",
+			Body:       io.NopCloser(strings.NewReader(`{"message":"sensitive GitHub response"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	service := &ProjectService{
+		cfg:              &models.Config{AllowedRepoPrefixes: []string{"https://github.com/"}},
+		githubAPIBaseURL: "https://api.github.test",
+		githubHTTPClient: client,
+	}
+	project := &models.Project{ID: "medusa", BranchName: "main", RepoURL: "https://github.com/sauraku/medusa"}
+	state, err := service.githubRunnerRegistrationState(context.Background(), project, pat)
+	if err == nil || state != runnerRegistrationUnknown {
+		t.Fatalf("GitHub verification returned state=%v, err=%v", state, err)
+	}
+	if strings.Contains(err.Error(), pat) || strings.Contains(err.Error(), "sensitive GitHub response") {
+		t.Fatalf("verification error exposed sensitive data: %v", err)
+	}
+}
+
+func TestGitHubRunnerPresenceCarriesServerRetryHints(t *testing.T) {
+	const pat = "gh" + "p_runner_verification"
+	retryAt := time.Now().Add(3 * time.Minute).Truncate(time.Second)
+	headers := make(http.Header)
+	headers.Set("Retry-After", "30")
+	headers.Set("X-RateLimit-Reset", strconv.FormatInt(retryAt.Unix(), 10))
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Body:       io.NopCloser(strings.NewReader(`{"message":"rate limited"}`)),
+			Header:     headers,
+		}, nil
+	})}
+	service := &ProjectService{
+		cfg:              &models.Config{AllowedRepoPrefixes: []string{"https://github.com/"}},
+		githubAPIBaseURL: "https://api.github.test",
+		githubHTTPClient: client,
+	}
+	project := &models.Project{ID: "medusa", BranchName: "main", RepoURL: "https://github.com/sauraku/medusa"}
+	_, err := service.githubRunnerRegistrationState(context.Background(), project, pat)
+	if err == nil {
+		t.Fatal("rate-limited GitHub response was accepted")
+	}
+	if got := runnerVerificationRetryAt(err); got.Before(retryAt) {
+		t.Fatalf("retry at = %s, want at least %s", got, retryAt)
+	}
+}
+
+func TestRunnerRegistrationRequestRecoveryBypassesDestructiveVerification(t *testing.T) {
+	db.InitCrypto(strings.Repeat("h", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	project := &models.Project{
+		ID: "medusa", BranchName: "main", RepoURL: "https://github.com/sauraku/medusa",
+		RunnerContainer: "devops-runner-medusa",
+	}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	const pat = "gh" + "p_runner_handoff"
+	if err := database.SaveRunnerToken(project.ID, pat); err != nil {
+		t.Fatal(err)
+	}
+
+	githubCalled := false
+	handoffCalled := false
+	service := &ProjectService{
+		db:  database,
+		cfg: &models.Config{AllowedRepoPrefixes: []string{"https://github.com/sauraku/"}},
+		githubHTTPClient: &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			githubCalled = true
+			return nil, io.ErrUnexpectedEOF
+		})},
+		registrationRecoveryFn: func(got *models.Project, credential string) error {
+			handoffCalled = true
+			if got.ID != project.ID || credential != pat {
+				t.Fatalf("handoff got project=%s credential=%q", got.ID, credential)
+			}
+			return nil
+		},
+	}
+	if err := service.handleRunnerRecoverySignal(context.Background(), project, runnerRecoverySignal{
+		registrationRequested: true,
+		localUnavailable:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !handoffCalled {
+		t.Fatal("registration handoff was not resumed")
+	}
+	if githubCalled {
+		t.Fatal("registration handoff used destructive GitHub absence verification")
+	}
+}
+
+func TestRunnerRegistrationMarkersCoverControllerCrashPhases(t *testing.T) {
+	tests := []struct {
+		name string
+		logs string
+		want bool
+	}{
+		{
+			name: "crash before token copy",
+			logs: runnerRegistrationRequestMarker,
+			want: true,
+		},
+		{
+			name: "new handoff after an older ready generation",
+			logs: "Listening for Jobs\n" + runnerRegistrationRequestMarker,
+			want: true,
+		},
+		{
+			name: "configuration completed before controller restart",
+			logs: runnerRegistrationRequestMarker + "\nListening for Jobs",
+			want: false,
+		},
+		{
+			name: "persisted configured state",
+			logs: "Runner already configured.\nListening for Jobs",
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := runnerRegistrationRequested(test.logs); got != test.want {
+				t.Fatalf("runnerRegistrationRequested() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRestartRunnerRegistrationHandoffPreservesState(t *testing.T) {
+	var operations []string
+	var statuses []string
+	err := restartRunnerRegistrationHandoff(registrationHandoffRecoveryOps{
+		containerExists: true,
+		saveStatus: func(status string) {
+			statuses = append(statuses, status)
+		},
+		verifyOwnership: func() error {
+			operations = append(operations, "verify-ownership")
+			return nil
+		},
+		stopMonitor: func() {
+			operations = append(operations, "stop-monitor")
+		},
+		restartPreservingState: func() error {
+			operations = append(operations, "compose-restart-preserving-volume")
+			return nil
+		},
+		installMonitor: func() {
+			operations = append(operations, "install-monitor")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(operations, ","); got != "verify-ownership,stop-monitor,compose-restart-preserving-volume,install-monitor" {
+		t.Fatalf("operations = %s", got)
+	}
+	if got := strings.Join(statuses, ","); got != "starting,active" {
+		t.Fatalf("statuses = %s", got)
+	}
+}
+
+func TestRunnerTransitionRecoverySurvivesRestartLoopRunningWindows(t *testing.T) {
+	start := time.Unix(100, 0)
+	transition := runnerTransitionStartedAt(time.Time{}, start, &models.ContainerState{
+		Exists: true,
+		State:  "restarting",
+	}, false)
+	if !transition.Equal(start) {
+		t.Fatalf("transition start = %s, want %s", transition, start)
+	}
+	transition = runnerTransitionStartedAt(transition, start.Add(time.Minute), &models.ContainerState{
+		Exists:  true,
+		Running: true,
+		State:   "running",
+	}, false)
+	if !transition.Equal(start) {
+		t.Fatal("brief running window reset crash-loop transition")
+	}
+	transition = runnerTransitionStartedAt(transition, start.Add(2*time.Minute), &models.ContainerState{
+		Exists:  true,
+		Running: true,
+		State:   "running",
+	}, true)
+	if !transition.IsZero() {
+		t.Fatal("readiness did not clear crash-loop transition")
+	}
+}
+
+func TestRunnerRecoveryHintRequiresVerifiedGitHubAbsence(t *testing.T) {
+	db.InitCrypto(strings.Repeat("r", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	project := &models.Project{
+		ID:              "medusa",
+		Name:            "Medusa",
+		BranchName:      "main",
+		RepoURL:         "https://github.com/sauraku/medusa",
+		RunnerContainer: "devops-runner-medusa",
+	}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	const pat = "gh" + "p_runner_recovery"
+	if err := database.SaveRunnerToken(project.ID, pat); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name             string
+		response         string
+		localUnavailable bool
+		wantReplace      bool
+		wantRestart      bool
+	}{
+		{
+			name:        "live runner cannot be replaced by an untrusted hint",
+			response:    `{"total_count":1,"runners":[{"name":"runner-medusa-main"}]}`,
+			wantReplace: false,
+		},
+		{
+			name:             "missing local container preserves present registration",
+			response:         `{"total_count":1,"runners":[{"name":"runner-medusa-main"}]}`,
+			localUnavailable: true,
+			wantRestart:      true,
+		},
+		{
+			name:        "server-deleted runner is replaced",
+			response:    `{"total_count":0,"runners":[]}`,
+			wantReplace: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			replaced := false
+			restarted := false
+			var recoveryOperations []string
+			var recoveryStatuses []string
+			client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader(test.response)),
+					Header:     make(http.Header),
+				}, nil
+			})}
+			service := &ProjectService{
+				db:               database,
+				cfg:              &models.Config{AllowedRepoPrefixes: []string{"https://github.com/sauraku/"}},
+				githubAPIBaseURL: "https://api.github.test",
+				githubHTTPClient: client,
+				recoverRunnerFn: func(got *models.Project, credential string) error {
+					if got.ID != project.ID || credential != pat {
+						t.Fatalf("recovery got project=%s credential=%q", got.ID, credential)
+					}
+					replaced = true
+					return nil
+				},
+				preservedRunnerOpsFn: func(got *models.Project) preservedRunnerRecoveryOps {
+					if got.ID != project.ID {
+						t.Fatalf("restart got project=%s", got.ID)
+					}
+					return preservedRunnerRecoveryOps{
+						containerExists: false,
+						saveStatus: func(status string) {
+							recoveryStatuses = append(recoveryStatuses, status)
+						},
+						stopMonitor: func() {
+							recoveryOperations = append(recoveryOperations, "stop-monitor")
+						},
+						recreatePreserved: func() error {
+							restarted = true
+							recoveryOperations = append(recoveryOperations, "compose-recreate-preserved")
+							return nil
+						},
+						waitReady: func() (bool, string, string) {
+							recoveryOperations = append(recoveryOperations, "wait-ready")
+							return true, "running", "Listening for Jobs"
+						},
+						installMonitor: func() {
+							recoveryOperations = append(recoveryOperations, "install-monitor")
+						},
+					}
+				},
+			}
+			if err := service.handleRunnerRecoveryHint(context.Background(), project, test.localUnavailable); err != nil {
+				t.Fatal(err)
+			}
+			if replaced != test.wantReplace {
+				t.Fatalf("replaced = %v, want %v", replaced, test.wantReplace)
+			}
+			if restarted != test.wantRestart {
+				t.Fatalf("restarted = %v, want %v", restarted, test.wantRestart)
+			}
+			if test.wantRestart {
+				if got := strings.Join(recoveryOperations, ","); got != "stop-monitor,compose-recreate-preserved,wait-ready,install-monitor" {
+					t.Fatalf("preserved recovery operations = %s", got)
+				}
+				if got := strings.Join(recoveryStatuses, ","); got != "starting,active" {
+					t.Fatalf("preserved recovery statuses = %s", got)
+				}
+			}
+		})
+	}
+}
+
+func TestRunnerRecoveryHintFailsClosedWhenGitHubCannotVerify(t *testing.T) {
+	db.InitCrypto(strings.Repeat("v", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	project := &models.Project{
+		ID: "medusa", Name: "Medusa", BranchName: "main",
+		RepoURL: "https://github.com/sauraku/medusa", RunnerContainer: "devops-runner-medusa",
+	}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	const pat = "gh" + "p_runner_recovery"
+	if err := database.SaveRunnerToken(project.ID, pat); err != nil {
+		t.Fatal(err)
+	}
+	replaced := false
+	restarted := false
+	service := &ProjectService{
+		db:  database,
+		cfg: &models.Config{AllowedRepoPrefixes: []string{"https://github.com/sauraku/"}},
+		githubHTTPClient: &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return nil, io.ErrUnexpectedEOF
+		})},
+		recoverRunnerFn: func(*models.Project, string) error {
+			replaced = true
+			return nil
+		},
+		preservedRunnerOpsFn: func(*models.Project) preservedRunnerRecoveryOps {
+			restarted = true
+			return preservedRunnerRecoveryOps{}
+		},
+	}
+	if err := service.handleRunnerRecoveryHint(context.Background(), project, true); err == nil {
+		t.Fatal("GitHub verification failure was accepted")
+	}
+	if replaced || restarted {
+		t.Fatal("runner state changed without successful GitHub verification")
+	}
+}
+
+func TestPreservedRunnerRecoveryStartsOwnedContainerAndHandsOffMonitor(t *testing.T) {
+	var operations []string
+	var statuses []string
+	err := restoreRunnerWithPreservedState(preservedRunnerRecoveryOps{
+		containerExists: true,
+		saveStatus: func(status string) {
+			statuses = append(statuses, status)
+		},
+		verifyOwnership: func() error {
+			operations = append(operations, "verify-ownership")
+			return nil
+		},
+		stopMonitor: func() {
+			operations = append(operations, "stop-monitor")
+		},
+		startExisting: func() error {
+			operations = append(operations, "start-existing")
+			return nil
+		},
+		waitReady: func() (bool, string, string) {
+			operations = append(operations, "wait-ready")
+			return true, "running", "Listening for Jobs"
+		},
+		installMonitor: func() {
+			operations = append(operations, "install-monitor")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(operations, ","); got != "verify-ownership,stop-monitor,start-existing,wait-ready,install-monitor" {
+		t.Fatalf("operations = %s", got)
+	}
+	if got := strings.Join(statuses, ","); got != "starting,active" {
+		t.Fatalf("statuses = %s", got)
+	}
+}
+
+func TestPreservedRunnerRecoveryRecreatesCrashLoopWithoutDiscardingState(t *testing.T) {
+	var operations []string
+	err := restoreRunnerWithPreservedState(preservedRunnerRecoveryOps{
+		containerExists: true,
+		forceRecreate:   true,
+		saveStatus:      func(string) {},
+		verifyOwnership: func() error {
+			operations = append(operations, "verify-ownership")
+			return nil
+		},
+		stopMonitor: func() {
+			operations = append(operations, "stop-monitor")
+		},
+		startExisting: func() error {
+			operations = append(operations, "start-existing")
+			return nil
+		},
+		recreatePreserved: func() error {
+			operations = append(operations, "compose-recreate-preserved")
+			return nil
+		},
+		waitReady: func() (bool, string, string) {
+			operations = append(operations, "wait-ready")
+			return true, "running", "Listening for Jobs"
+		},
+		installMonitor: func() {
+			operations = append(operations, "install-monitor")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(operations, ","); got != "verify-ownership,stop-monitor,compose-recreate-preserved,wait-ready,install-monitor" {
+		t.Fatalf("operations = %s", got)
+	}
+}
+
+func TestPreservedRunnerRecoveryDoesNotMarkActiveBeforeReadiness(t *testing.T) {
+	var statuses []string
+	monitorInstalled := false
+	err := restoreRunnerWithPreservedState(preservedRunnerRecoveryOps{
+		containerExists: false,
+		saveStatus: func(status string) {
+			statuses = append(statuses, status)
+		},
+		stopMonitor:       func() {},
+		recreatePreserved: func() error { return nil },
+		waitReady: func() (bool, string, string) {
+			return false, "restarting", "not ready"
+		},
+		installMonitor: func() {
+			monitorInstalled = true
+		},
+	})
+	if err == nil {
+		t.Fatal("unready preserved runner was accepted")
+	}
+	if got := strings.Join(statuses, ","); got != "starting,error" {
+		t.Fatalf("statuses = %s", got)
+	}
+	if !monitorInstalled {
+		t.Fatal("retry monitor was not installed after readiness failure")
+	}
+}
+
+func TestRunnerRecoveryBackoffIsBoundedAndFailureAuditIsEdgeTriggered(t *testing.T) {
+	db.InitCrypto(strings.Repeat("b", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	project := &models.Project{ID: "medusa", Name: "Medusa"}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	service := &ProjectService{
+		db:                  database,
+		audit:               NewAuditService(database),
+		runnerRecoveryState: make(map[string]*runnerRecoveryAttemptState),
+	}
+	now := time.Unix(1000, 0)
+	first := service.recordRunnerRecoveryFailure(project, errors.New("GitHub unavailable"), now)
+	second := service.recordRunnerRecoveryFailure(project, errors.New("GitHub unavailable"), now.Add(time.Second))
+	if !second.After(first) {
+		t.Fatalf("second retry %s did not back off beyond first retry %s", second, first)
+	}
+	for failures := 1; failures <= 20; failures++ {
+		delay := runnerRecoveryBackoff(project.ID, failures)
+		if delay < time.Second || delay > runnerRecoveryBackoffMaximum {
+			t.Fatalf("failure %d delay = %s, outside bounds", failures, delay)
+		}
+	}
+	logs, err := database.ListAuditLogs(project.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Action != "runner_recovery" || logs[0].Status != "failed" {
+		t.Fatalf("same failure produced non-edge-triggered audit logs: %#v", logs)
+	}
+
+	service.clearRunnerRecoveryFailure(project)
+	logs, err = database.ListAuditLogs(project.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 || logs[0].Status != "ok" || logs[1].Status != "failed" {
+		t.Fatalf("recovery transition audit logs = %#v", logs)
+	}
+}
+
+func TestRunnerMonitorHandoffAllowsOnlyOneGeneration(t *testing.T) {
+	service := &ProjectService{runnerMonitors: make(map[string]context.CancelFunc)}
+	first, installed := service.installRunnerMonitor("medusa")
+	if !installed {
+		t.Fatal("first monitor was not installed")
+	}
+	if duplicate, installed := service.installRunnerMonitor("medusa"); installed || duplicate != nil {
+		t.Fatal("duplicate monitor was installed")
+	}
+
+	service.stopRunnerMonitor("medusa")
+	select {
+	case <-first.Done():
+	default:
+		t.Fatal("old monitor was not cancelled before replacement")
+	}
+
+	replacement, installed := service.installRunnerMonitor("medusa")
+	if !installed {
+		t.Fatal("replacement monitor was not installed")
+	}
+	select {
+	case <-replacement.Done():
+		t.Fatal("replacement monitor inherited the old cancellation")
+	default:
+	}
+	service.stopRunnerMonitor("medusa")
+}
+
+func TestVerifiedRunnerReplacementDiscardsStateBeforeCleanStart(t *testing.T) {
+	var operations []string
+	err := replaceRunnerResources(
+		func() error {
+			operations = append(operations, "stop-container")
+			return nil
+		},
+		func() error {
+			operations = append(operations, "remove-compose-volume")
+			return nil
+		},
+		func() error {
+			operations = append(operations, "start-clean-container")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(operations, ","); got != "stop-container,remove-compose-volume,start-clean-container" {
+		t.Fatalf("replacement order = %s", got)
+	}
+}
+
 func TestRunnerEntrypointConsumesRegistrationFileBeforeConfig(t *testing.T) {
 	runnerDir := t.TempDir()
+	runnerRuntimeDir := t.TempDir()
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	captureFile := filepath.Join(t.TempDir(), "config-args")
 	const registrationToken = "short-lived-registration-token"
@@ -383,6 +1013,7 @@ printf '%s\n' "$@" > "$RUNNER_CONFIG_CAPTURE"
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
 		"RUNNER_DIR=" + runnerDir,
+		"RUNNER_RUNTIME_DIR=" + runnerRuntimeDir,
 		"RUNNER_VERSION=test-version",
 		"REPO_URL=https://github.com/sauraku/medusa",
 		"RUNNER_REGISTRATION_TOKEN_FILE=" + tokenFile,
@@ -406,6 +1037,7 @@ printf '%s\n' "$@" > "$RUNNER_CONFIG_CAPTURE"
 
 func TestRunnerEntrypointRejectsPATFile(t *testing.T) {
 	runnerDir := t.TempDir()
+	runnerRuntimeDir := t.TempDir()
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	const pat = "gh" + "p_lived_credential"
 	if err := os.WriteFile(tokenFile, []byte(pat), 0o600); err != nil {
@@ -420,6 +1052,7 @@ func TestRunnerEntrypointRejectsPATFile(t *testing.T) {
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
 		"RUNNER_DIR=" + runnerDir,
+		"RUNNER_RUNTIME_DIR=" + runnerRuntimeDir,
 		"RUNNER_VERSION=test-version",
 		"REPO_URL=https://github.com/sauraku/medusa",
 		"RUNNER_REGISTRATION_TOKEN_FILE=" + tokenFile,
@@ -514,5 +1147,248 @@ func TestUpdateEnvFileWithOverridesWritesSortedAtomically(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary env files left behind: %v", matches)
+	}
+}
+
+func TestSaveEnvConfigRejectsCommandNamespacesButStoresApplicationValues(t *testing.T) {
+	db.InitCrypto(strings.Repeat("e", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	appDir := t.TempDir()
+	template := strings.Join([]string{
+		"APP_VALUE=",
+		"DOCKER_TLS_VERIFY=",
+		"COMPOSE_PROFILES=",
+		"LD_PRELOAD=",
+		"IMAGE_TAG=",
+		"PROJECT_ID=",
+		"COMPOSE_PROJECT_NAME=",
+		"ENV_NAME=",
+		"PROJECT_ENV_FILE=",
+		projectEnvOverridesFDEnv + "=",
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(appDir, ".env.template"), []byte(template), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := &models.Project{ID: "medusa", Name: "Medusa", BranchName: "main", AppDir: appDir}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	service := NewProjectService(database, docker.NewClient(), NewAuditService(database), &models.Config{})
+
+	want := map[string]string{
+		"APP_VALUE":  "application-value",
+		"LD_PRELOAD": "/container/loader.so",
+	}
+	if err := service.SaveEnvConfig(project.ID, want, nil); err != nil {
+		t.Fatalf("save application environment: %v", err)
+	}
+	got, err := database.GetProjectEnvOverrides(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Fatalf("saved %s = %q, want %q", key, got[key], value)
+		}
+	}
+
+	for _, key := range []string{
+		"IMAGE_TAG", "PROJECT_ID", "COMPOSE_PROJECT_NAME", "ENV_NAME",
+		"PROJECT_ENV_FILE", projectEnvOverridesFDEnv, "DOCKER_TLS_VERIFY", "COMPOSE_PROFILES",
+	} {
+		if err := service.SaveEnvConfig(project.ID, map[string]string{key: "attacker-controlled"}, nil); err == nil || !strings.Contains(err.Error(), "controlled by the deployment system") {
+			t.Fatalf("reserved key %s returned %v", key, err)
+		}
+	}
+}
+
+func TestLegacyReservedOverridesAreHiddenAndMigratedByNormalSave(t *testing.T) {
+	db.InitCrypto(strings.Repeat("l", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	appDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(appDir, ".env.template"), []byte(`SMTP_HOST=
+ENV_NAME=
+COMPOSE_PROJECT_NAME=
+COMPOSE_PROFILES=
+DOCKER_HOST=
+BUILDKIT_HOST=
+BUILDX_CONFIG=
+IMAGE_TAG=
+POSTGRES_PASSWORD=
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "devops.json"), []byte(`{
+  "environment": {
+    "operator_required": ["SMTP_HOST"],
+    "generated_secrets": ["POSTGRES_PASSWORD"]
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := &models.Project{ID: "medusa", Name: "Medusa", BranchName: "main", AppDir: appDir}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]string{
+		"SMTP_HOST":            "smtp.old.example",
+		"ENV_NAME":             "legacy-env",
+		"COMPOSE_PROJECT_NAME": "legacy-compose",
+		"COMPOSE_PROFILES":     "legacy-profile",
+		"DOCKER_HOST":          "tcp://legacy-docker:2375",
+		"BUILDKIT_HOST":        "tcp://legacy-buildkit:1234",
+		"BUILDX_CONFIG":        "/legacy/buildx",
+		"IMAGE_TAG":            "legacy-image",
+		"POSTGRES_PASSWORD":    "legacy-generated-secret",
+	}
+	if err := database.SaveProjectEnvOverrides(project.ID, legacy); err != nil {
+		t.Fatal(err)
+	}
+	service := NewProjectService(database, docker.NewClient(), NewAuditService(database), &models.Config{})
+
+	variables, visibleOverrides, err := service.ReadEnvTemplate(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visibleOverrides) != 1 || visibleOverrides["SMTP_HOST"] != "smtp.old.example" {
+		t.Fatalf("visible overrides = %#v, want only SMTP_HOST", visibleOverrides)
+	}
+	for _, variable := range variables {
+		if variable.Key != "SMTP_HOST" && !variable.ControllerManaged {
+			t.Fatalf("reserved variable %s was not marked controller-managed", variable.Key)
+		}
+	}
+
+	if err := service.SaveEnvConfig(project.ID, map[string]string{
+		"SMTP_HOST":            "smtp.new.example",
+		"ENV_NAME":             legacy["ENV_NAME"],
+		"COMPOSE_PROJECT_NAME": "",
+		"COMPOSE_PROFILES":     legacy["COMPOSE_PROFILES"],
+		"DOCKER_HOST":          "",
+		"BUILDKIT_HOST":        "********",
+		"BUILDX_CONFIG":        legacy["BUILDX_CONFIG"],
+		"IMAGE_TAG":            "********",
+		"POSTGRES_PASSWORD":    "********",
+	}, nil); err != nil {
+		t.Fatalf("normal save did not migrate legacy controls: %v", err)
+	}
+	stored, err := database.GetProjectEnvOverrides(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored["SMTP_HOST"] != "smtp.new.example" {
+		t.Fatalf("stored overrides after migration = %#v", stored)
+	}
+
+	for _, forged := range []map[string]string{
+		{"IMAGE_TAG": "forged-image"},
+		{"POSTGRES_PASSWORD": "forged-secret"},
+		{"COMPOSE_PROFILES": "forged-profile"},
+		{"DOCKER_HOST": "tcp://forged-docker:2375"},
+	} {
+		if err := service.SaveEnvConfig(project.ID, forged, nil); err == nil || !strings.Contains(err.Error(), "controlled by the deployment system") {
+			t.Fatalf("forged controlled override returned %v", err)
+		}
+	}
+}
+
+func TestSaveEnvConfigPatchesSMTPAndAuditsKeyNamesOnly(t *testing.T) {
+	db.InitCrypto(strings.Repeat("s", 64))
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	appDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(appDir, ".env.template"), []byte(strings.Join([]string{
+		"SMTP_HOST=",
+		"SMTP_PORT=",
+		"SMTP_USER=",
+		"SMTP_PASS=",
+		"SMTP_FROM=",
+	}, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := &models.Project{ID: "medusa", Name: "Medusa", BranchName: "main", AppDir: appDir}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	service := NewProjectService(database, docker.NewClient(), NewAuditService(database), &models.Config{})
+	full := map[string]string{
+		"SMTP_HOST": "smtp.example.test",
+		"SMTP_PORT": "587",
+		"SMTP_USER": "mailer",
+		"SMTP_PASS": "smtp-secret",
+		"SMTP_FROM": "orders@example.test",
+	}
+	if err := service.SaveEnvConfig(project.ID, full, nil); err != nil {
+		t.Fatalf("save complete SMTP configuration: %v", err)
+	}
+	if err := service.SaveEnvConfig(project.ID, map[string]string{
+		"SMTP_HOST": "smtp2.example.test",
+	}, nil); err != nil {
+		t.Fatalf("patch SMTP host: %v", err)
+	}
+	if err := service.SaveEnvConfig(project.ID, map[string]string{
+		"SMTP_PASS": "********",
+	}, nil); err != nil {
+		t.Fatalf("preserve masked SMTP password: %v", err)
+	}
+	if err := service.SaveEnvConfig(project.ID, nil, []string{"SMTP_USER"}); err != nil {
+		t.Fatalf("clear SMTP user: %v", err)
+	}
+
+	got, err := database.GetProjectEnvOverrides(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := got["SMTP_USER"]; exists {
+		t.Fatalf("explicitly cleared SMTP_USER remains: %#v", got)
+	}
+	if len(got) != len(full)-1 {
+		t.Fatalf("saved SMTP fields = %#v, want only SMTP_USER removed", got)
+	}
+	if got["SMTP_HOST"] != "smtp2.example.test" || got["SMTP_PORT"] != "587" ||
+		got["SMTP_PASS"] != "smtp-secret" || got["SMTP_FROM"] != "orders@example.test" {
+		t.Fatalf("partial save lost or changed omitted SMTP fields: %#v", got)
+	}
+
+	logs, err := database.ListAuditLogs(project.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 4 {
+		t.Fatalf("env audit entries = %d, want 4", len(logs))
+	}
+	joinedMessages := ""
+	for _, entry := range logs {
+		if entry.Action != "project_env_patch" || entry.Status != "ok" {
+			t.Fatalf("unexpected env audit entry: %#v", entry)
+		}
+		joinedMessages += entry.Message + "\n" + entry.Metadata + "\n"
+	}
+	for _, value := range []string{
+		"smtp.example.test", "smtp2.example.test", "587", "mailer",
+		"smtp-secret", "orders@example.test", "********",
+	} {
+		if strings.Contains(joinedMessages, value) {
+			t.Fatalf("audit log exposed environment value %q: %s", value, joinedMessages)
+		}
+	}
+	for _, key := range []string{"SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM"} {
+		if !strings.Contains(joinedMessages, key) {
+			t.Fatalf("audit log omitted changed key name %s: %s", key, joinedMessages)
+		}
 	}
 }

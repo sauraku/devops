@@ -16,12 +16,14 @@ import (
 )
 
 type Handler struct {
-	projects *services.ProjectService
-	deploys  *services.DeployService
-	backups  *services.BackupService
-	audit    *services.AuditService
-	auth     *Authenticator
-	cfg      *models.Config
+	projects        *services.ProjectService
+	deploys         *services.DeployService
+	backups         *services.BackupService
+	audit           *services.AuditService
+	auth            *Authenticator
+	cfg             *models.Config
+	requestTrust    *RequestTrust
+	terminalLimiter *terminalAttemptLimiter
 }
 
 func NewHandler(
@@ -31,14 +33,23 @@ func NewHandler(
 	auditService *services.AuditService,
 	auth *Authenticator,
 	cfg *models.Config,
+	requestTrust *RequestTrust,
 ) *Handler {
+	if requestTrust == nil {
+		panic("request trust policy is required")
+	}
+	if auth != nil && auth.requestTrust != requestTrust {
+		panic("authenticator and handler must share the request trust policy")
+	}
 	return &Handler{
-		projects: projectService,
-		deploys:  deployService,
-		backups:  backupService,
-		audit:    auditService,
-		auth:     auth,
-		cfg:      cfg,
+		projects:        projectService,
+		deploys:         deployService,
+		backups:         backupService,
+		audit:           auditService,
+		auth:            auth,
+		cfg:             cfg,
+		requestTrust:    requestTrust,
+		terminalLimiter: newTerminalAttemptLimiter(),
 	}
 }
 
@@ -94,7 +105,7 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 
 	project, err := h.projects.CreateOrUpdate(&req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		serviceError(w, http.StatusBadRequest, "project configuration is invalid", err)
 		return
 	}
 
@@ -107,7 +118,7 @@ func (h *Handler) CreateProject(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ProjectStatus(w http.ResponseWriter, r *http.Request, projectID string) {
 	status, err := h.projects.Status(projectID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		serviceError(w, http.StatusNotFound, "project not found", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
@@ -127,7 +138,7 @@ func (h *Handler) ProjectDeploy(w http.ResponseWriter, r *http.Request, projectI
 
 	p, err := h.projects.Get(projectID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		serviceError(w, http.StatusNotFound, "project not found", err)
 		return
 	}
 	normalized, err := services.ValidateDeployRequest(p, &req, isProjectTokenAuth(r))
@@ -141,7 +152,7 @@ func (h *Handler) ProjectDeploy(w http.ResponseWriter, r *http.Request, projectI
 	if req.GitHubRunID != "" && !p.AutoApply {
 		deployment, err := h.deploys.RequestApproval(projectID, &req)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			serviceError(w, http.StatusBadRequest, "deployment approval request failed", err)
 			return
 		}
 		writeDeploymentOperation(w, http.StatusAccepted, projectID, deployment)
@@ -150,7 +161,7 @@ func (h *Handler) ProjectDeploy(w http.ResponseWriter, r *http.Request, projectI
 
 	deployment, err := h.deploys.Deploy(projectID, &req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		serviceError(w, http.StatusBadRequest, "deployment could not be started", err)
 		return
 	}
 
@@ -179,7 +190,7 @@ func (h *Handler) ProjectApproveDeployment(w http.ResponseWriter, r *http.Reques
 	}
 	deployment, err := h.deploys.Approve(projectID, deployID)
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		serviceError(w, http.StatusConflict, "deployment approval failed", err)
 		return
 	}
 	writeDeploymentOperation(w, http.StatusAccepted, projectID, deployment)
@@ -203,7 +214,7 @@ func (h *Handler) ProjectConfig(w http.ResponseWriter, r *http.Request, projectI
 
 	project, err := h.projects.CreateOrUpdate(&req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		serviceError(w, http.StatusBadRequest, "project configuration is invalid", err)
 		return
 	}
 
@@ -216,7 +227,7 @@ func (h *Handler) ProjectConfig(w http.ResponseWriter, r *http.Request, projectI
 func (h *Handler) ProjectPause(w http.ResponseWriter, r *http.Request, projectID string) {
 	state, err := h.projects.Status(projectID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		serviceError(w, http.StatusNotFound, "project not found", err)
 		return
 	}
 	if !state.Capabilities["pause"] {
@@ -254,7 +265,7 @@ func (h *Handler) ProjectPause(w http.ResponseWriter, r *http.Request, projectID
 func (h *Handler) ProjectResume(w http.ResponseWriter, r *http.Request, projectID string) {
 	state, err := h.projects.Status(projectID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		serviceError(w, http.StatusNotFound, "project not found", err)
 		return
 	}
 	if !state.Capabilities["resume"] {
@@ -304,7 +315,7 @@ func (h *Handler) ProjectCreateBackup(w http.ResponseWriter, r *http.Request, pr
 
 	deployment, err := h.backups.Create(projectID, body.Branch, body.Reason)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		serviceError(w, http.StatusBadRequest, "backup could not be started", err)
 		return
 	}
 
@@ -405,7 +416,7 @@ func (h *Handler) ProjectRestore(w http.ResponseWriter, r *http.Request, project
 
 	deployment, err := h.backups.Restore(projectID, body.BackupID)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		serviceError(w, http.StatusBadRequest, "restore could not be started", err)
 		return
 	}
 
@@ -428,7 +439,7 @@ func (h *Handler) ProjectRollback(w http.ResponseWriter, r *http.Request, projec
 
 	deployment, err := h.backups.Rollback(projectID, body.Commit)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		serviceError(w, http.StatusBadRequest, "rollback could not be started", err)
 		return
 	}
 
@@ -461,7 +472,7 @@ func (h *Handler) ProjectRunnerAction(w http.ResponseWriter, r *http.Request, pr
 
 	msg, err := h.projects.RunnerAction(projectID, body.Action)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		serviceError(w, http.StatusBadRequest, "runner action failed", err)
 		return
 	}
 
@@ -477,7 +488,7 @@ func (h *Handler) ProjectContainerAction(w http.ResponseWriter, r *http.Request,
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		internalError(w, err)
 		return
 	}
 
@@ -689,7 +700,7 @@ func (h *Handler) ProjectDeploymentLog(w http.ResponseWriter, r *http.Request, p
 func (h *Handler) ProjectEnvTemplate(w http.ResponseWriter, r *http.Request, projectID string) {
 	vars, overrides, err := h.projects.ReadEnvTemplate(projectID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		serviceError(w, http.StatusNotFound, "environment template not found", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -701,13 +712,14 @@ func (h *Handler) ProjectEnvTemplate(w http.ResponseWriter, r *http.Request, pro
 func (h *Handler) ProjectSaveEnvConfig(w http.ResponseWriter, r *http.Request, projectID string) {
 	var body struct {
 		Overrides map[string]string `json:"overrides"`
+		ClearKeys []string          `json:"clear_keys"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := h.projects.SaveEnvConfig(projectID, body.Overrides); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err := h.projects.SaveEnvConfig(projectID, body.Overrides, body.ClearKeys); err != nil {
+		serviceError(w, http.StatusBadRequest, "environment configuration is invalid", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

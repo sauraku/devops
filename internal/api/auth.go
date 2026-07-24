@@ -6,8 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +22,8 @@ const (
 	loginInitialBackoff   = time.Second
 	loginMaxBackoff       = time.Minute
 	loginAttemptRetention = 10 * time.Minute
+	masterTokenHeader     = "X-DevOps-Control-Token"
+	projectTokenHeader    = "X-Deploy-Control-Token"
 )
 
 type loginAttempt struct {
@@ -37,15 +39,28 @@ type Authenticator struct {
 	audit         *services.AuditService
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
+	requestTrust  *RequestTrust
 }
 
 func NewAuthenticator(token, cookieSecret string, cookieSecure bool, audit *services.AuditService) *Authenticator {
+	return NewAuthenticatorWithRequestTrust(token, cookieSecret, cookieSecure, audit, NewRequestTrust(nil))
+}
+
+func NewAuthenticatorWithTrustedProxies(token, cookieSecret string, cookieSecure bool, audit *services.AuditService, trustedProxyCIDRs []netip.Prefix) *Authenticator {
+	return NewAuthenticatorWithRequestTrust(token, cookieSecret, cookieSecure, audit, NewRequestTrust(trustedProxyCIDRs))
+}
+
+func NewAuthenticatorWithRequestTrust(token, cookieSecret string, cookieSecure bool, audit *services.AuditService, requestTrust *RequestTrust) *Authenticator {
+	if requestTrust == nil {
+		requestTrust = NewRequestTrust(nil)
+	}
 	return &Authenticator{
 		token:         token,
 		cookieSecret:  []byte(cookieSecret),
 		cookieSecure:  cookieSecure,
 		audit:         audit,
 		loginAttempts: make(map[string]loginAttempt),
+		requestTrust:  requestTrust,
 	}
 }
 
@@ -54,7 +69,7 @@ func (a *Authenticator) VerifyBearerToken(r *http.Request) bool {
 	if strings.HasPrefix(auth, "Bearer ") && secureEqual(auth[7:], a.token) {
 		return true
 	}
-	headerToken := r.Header.Get("X-Deploy-Control-Token")
+	headerToken := r.Header.Get(masterTokenHeader)
 	return headerToken != "" && secureEqual(headerToken, a.token)
 }
 
@@ -65,7 +80,7 @@ func (a *Authenticator) ProjectToken(projectID string) string {
 }
 
 func (a *Authenticator) VerifyProjectToken(r *http.Request, projectID string) bool {
-	token := strings.TrimSpace(r.Header.Get("X-Deploy-Control-Token"))
+	token := strings.TrimSpace(r.Header.Get(projectTokenHeader))
 	return token != "" && secureEqual(token, a.ProjectToken(projectID))
 }
 
@@ -100,6 +115,9 @@ func (a *Authenticator) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			if strings.HasPrefix(r.URL.Path, "/api/") {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			} else {
+				if !a.allowBrowserTransport(w, r) {
+					return
+				}
 				sendLoginPage(w)
 			}
 			return
@@ -109,6 +127,9 @@ func (a *Authenticator) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
+	if !a.allowBrowserTransport(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		if r.Method == http.MethodGet {
 			sendLoginPage(w)
@@ -117,7 +138,7 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	ip := loginRemoteIP(r.RemoteAddr)
+	ip := a.requestTrust.clientIP(r)
 	if retryAfter, blocked := a.loginBlocked(ip, time.Now()); blocked {
 		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
 		writeError(w, http.StatusTooManyRequests, "too many login attempts; try again later")
@@ -168,12 +189,12 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func loginRemoteIP(remoteAddr string) string {
-	ip, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil || ip == "" {
-		return remoteAddr
+func (a *Authenticator) allowBrowserTransport(w http.ResponseWriter, r *http.Request) bool {
+	if !a.cookieSecure || a.requestTrust.isHTTPS(r) {
+		return true
 	}
-	return ip
+	writeError(w, http.StatusUpgradeRequired, "HTTPS is required")
+	return false
 }
 
 func (a *Authenticator) loginBlocked(ip string, now time.Time) (time.Duration, bool) {

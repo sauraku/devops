@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Use the RUNNER_DIR environment variable passed from docker-compose
 RUNNER_DIR="${RUNNER_DIR:-/home/runner/actions-runner}"
+RUNNER_RUNTIME_DIR="${RUNNER_RUNTIME_DIR:-/run/devops-runner-registration}"
 
 # If RUNNER_DIR is mounted to a host directory, ensure its binaries are updated to match the container's version
 if [ "$RUNNER_DIR" != "/home/runner/actions-runner" ]; then
@@ -31,16 +32,18 @@ if [ "$RUNNER_DIR" != "/home/runner/actions-runner" ]; then
   fi
 fi
 
-# Check if runner is already configured. An unconfigured runner asks the
-# controller for a short-lived registration token; no GitHub PAT is accepted in
-# this container and no credential is inherited through the environment.
-if [ ! -f "$RUNNER_DIR/.runner" ] && [ ! -f "$RUNNER_DIR/.runner_migrated" ]; then
+configure_runner() {
+  local labels
+  if [ -L "$RUNNER_RUNTIME_DIR" ] || [ ! -d "$RUNNER_RUNTIME_DIR" ] || [ ! -O "$RUNNER_RUNTIME_DIR" ]; then
+    echo "❌ Error: Runner runtime directory must be an owned, non-symlink directory: $RUNNER_RUNTIME_DIR" >&2
+    return 74
+  fi
   if [ -z "${REPO_URL:-}" ]; then
     echo "❌ Error: Runner is not configured, and REPO_URL is missing!" >&2
-    exit 1
+    return 1
   fi
 
-  REGISTRATION_TOKEN_FILE="${RUNNER_REGISTRATION_TOKEN_FILE:-/run/devops-runner-registration/token}"
+  REGISTRATION_TOKEN_FILE="${RUNNER_REGISTRATION_TOKEN_FILE:-${RUNNER_RUNTIME_DIR}/token}"
   cleanup_registration_token() {
     rm -f -- "$REGISTRATION_TOKEN_FILE" 2>/dev/null || true
   }
@@ -53,24 +56,24 @@ if [ ! -f "$RUNNER_DIR/.runner" ] && [ ! -f "$RUNNER_DIR/.runner_migrated" ]; th
   done
   if [ ! -f "$REGISTRATION_TOKEN_FILE" ]; then
     echo "❌ Error: Timed out waiting for runner registration credential." >&2
-    exit 1
+    return 1
   fi
 
   RUNNER_TOKEN="$(<"$REGISTRATION_TOKEN_FILE")"
   if [ -z "$RUNNER_TOKEN" ] || [[ "$RUNNER_TOKEN" == *$'\n'* ]] || [[ "$RUNNER_TOKEN" == *$'\r'* ]]; then
     unset RUNNER_TOKEN
     echo "❌ Error: Runner registration credential is invalid." >&2
-    exit 1
+    return 1
   fi
   if [[ "$RUNNER_TOKEN" == ghp_* || "$RUNNER_TOKEN" == github_pat_* || "$RUNNER_TOKEN" =~ ^[A-Fa-f0-9]{40}$ ]]; then
     unset RUNNER_TOKEN
     echo "❌ Error: Refusing a long-lived GitHub credential in the runner container." >&2
-    exit 1
+    return 1
   fi
   if ! rm -f -- "$REGISTRATION_TOKEN_FILE" || [ -e "$REGISTRATION_TOKEN_FILE" ]; then
     unset RUNNER_TOKEN
     echo "❌ Error: Could not remove runner registration credential before startup." >&2
-    exit 1
+    return 1
   fi
   trap - EXIT
 
@@ -88,9 +91,16 @@ if [ ! -f "$RUNNER_DIR/.runner" ] && [ ! -f "$RUNNER_DIR/.runner_migrated" ]; th
     echo "Please retrieve a new registration token from:"
     echo "👉 $REPO_URL/settings/actions/runners"
     echo "----------------------------------------------------------------------"
-    exit 1
+    return 1
   fi
   unset RUNNER_TOKEN
+}
+
+# Check if runner is already configured. An unconfigured runner asks the
+# controller for a short-lived registration token; no GitHub PAT is accepted in
+# this container and no credential is inherited through the environment.
+if [ ! -f "$RUNNER_DIR/.runner" ] && [ ! -f "$RUNNER_DIR/.runner_migrated" ]; then
+  configure_runner
 else
   echo "ℹ️ Runner already configured."
 fi
@@ -101,20 +111,7 @@ cd "$RUNNER_DIR"
 # Registration credentials must not remain available to repository jobs.
 unset RUNNER_TOKEN REGISTRATION_TOKEN_FILE
 
-RUN_LOG=$(mktemp)
-trap 'rm -f "$RUN_LOG"' EXIT
-
-set +e
-./run.sh 2>&1 | tee "$RUN_LOG"
-runner_status=${PIPESTATUS[0]}
-set -e
-
-# Check if the runner failed because registration was deleted from server
-if grep -q "The runner registration has been deleted from the server" "$RUN_LOG" 2>/dev/null; then
-  echo "⚠️ Detected that the runner registration was deleted from the GitHub server."
-  echo "🧹 Removing invalid local configuration files..."
-  rm -f "$RUNNER_DIR/.runner" "$RUNNER_DIR/.runner_migrated" "$RUNNER_DIR/.credentials" "$RUNNER_DIR/.credentials_rsaparams"
-  exit 1
-fi
-
-exit "$runner_status"
+# Repository-controlled stdout cannot authorize registration cleanup. The
+# controller independently monitors deletion hints, verifies exact absence via
+# GitHub, and replaces the entire container and state volume when necessary.
+exec ./run.sh
