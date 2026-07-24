@@ -179,8 +179,16 @@ func validateComposeSourceCommand(args []string) (bool, error) {
 		_, _, err := composepolicy.SnapshotInputs(args[1], args[2], args[3], args[4])
 		return true, err
 	case "validate-compose-rendered":
-		if len(args) != 3 {
-			return true, fmt.Errorf("usage: devops-control validate-compose-rendered <rendered-json-file> <compose-project>")
+		if len(args) != 3 && len(args) != 5 {
+			return true, fmt.Errorf("usage: devops-control validate-compose-rendered <rendered-json-file> <compose-project> [authenticated-ghcr-repository image-tag]")
+		}
+		if len(args) == 5 {
+			policy := composepolicy.AuthenticatedImagePolicy{
+				Registry:   "ghcr.io",
+				Repository: args[3],
+				Tag:        args[4],
+			}
+			return true, composepolicy.ValidateRenderedFile(args[1], args[2], policy)
 		}
 		return true, composepolicy.ValidateRenderedFile(args[1], args[2])
 	default:

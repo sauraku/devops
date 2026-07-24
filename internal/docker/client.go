@@ -828,9 +828,17 @@ func (c *Client) registryLogin(host, username, password, configDir string) (bool
 	cmd := exec.CommandContext(ctx, "docker", "login", host, "-u", username, "--password-stdin")
 	cmd.Stdin = strings.NewReader(password)
 	cmd.Env = dockerCommandEnvWithConfig(nil, configDir)
-	output, err := cmd.CombinedOutput()
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	err := cmd.Run()
 	if err != nil {
-		return false, fmt.Sprintf("docker login failed: %s: %s", err, strings.TrimSpace(string(output)))
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return false, "docker login timed out"
+		}
+		// Registry helpers are external programs and receive the credential on
+		// stdin. Never preserve their output: a broken or hostile helper could
+		// reflect that credential into controller logs and operation errors.
+		return false, fmt.Sprintf("docker login failed: %s", err)
 	}
 	return true, "Login Succeeded"
 }

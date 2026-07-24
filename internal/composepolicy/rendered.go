@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/distribution/reference"
 )
 
 const maxRenderedComposeSize = 8 << 20
@@ -17,7 +19,17 @@ type renderedResourceConfig struct {
 	DriverOpts map[string]any `json:"driver_opts"`
 }
 
-func ValidateRenderedFile(path, projectName string) error {
+// AuthenticatedImagePolicy constrains images pulled with a credential shared
+// with another control-plane capability. Images from other registries remain
+// allowed, but every image from Registry must belong to Repository (or one of
+// its dash-suffixed packages) and use the exact immutable Tag.
+type AuthenticatedImagePolicy struct {
+	Registry   string
+	Repository string
+	Tag        string
+}
+
+func ValidateRenderedFile(path, projectName string, imagePolicies ...AuthenticatedImagePolicy) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open rendered Compose config: %w", err)
@@ -27,13 +39,13 @@ func ValidateRenderedFile(path, projectName string) error {
 	if err != nil {
 		return fmt.Errorf("read rendered Compose config: %w", err)
 	}
-	return ValidateRendered(data, projectName)
+	return ValidateRendered(data, projectName, imagePolicies...)
 }
 
 // ValidateRendered validates the normalized JSON emitted by Docker Compose.
 // Source validation runs first to stop pre-render file reads; this second layer
 // catches interpolation-dependent values and daemon-facing normalization.
-func ValidateRendered(output []byte, projectName string) error {
+func ValidateRendered(output []byte, projectName string, imagePolicies ...AuthenticatedImagePolicy) error {
 	if len(output) > maxRenderedComposeSize {
 		return fmt.Errorf("Compose policy violation: rendered Compose model exceeds %d bytes", maxRenderedComposeSize)
 	}
@@ -77,6 +89,12 @@ func ValidateRendered(output []byte, projectName string) error {
 	}
 
 	for service, cfg := range config.Services {
+		image, _ := cfg["image"].(string)
+		for _, policy := range imagePolicies {
+			if err := validateAuthenticatedImage(service, image, policy); err != nil {
+				return err
+			}
+		}
 		for _, field := range []string{"network_mode", "pid", "ipc"} {
 			if value, _ := cfg[field].(string); strings.HasPrefix(strings.TrimSpace(value), "container:") {
 				return fmt.Errorf("Compose policy violation: %s uses %s from another container", service, field)
@@ -142,6 +160,51 @@ func ValidateRendered(output []byte, projectName string) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func validateAuthenticatedImage(service, image string, policy AuthenticatedImagePolicy) error {
+	registry := strings.ToLower(strings.TrimSpace(policy.Registry))
+	repository := strings.ToLower(strings.TrimSpace(policy.Repository))
+	tag := strings.TrimSpace(policy.Tag)
+	if registry == "" || repository == "" || tag == "" {
+		return fmt.Errorf("Compose policy violation: authenticated image policy is incomplete")
+	}
+	allowed, err := reference.ParseNamed(repository)
+	if err != nil || reference.Domain(allowed) != registry {
+		return fmt.Errorf("Compose policy violation: authenticated image repository is invalid")
+	}
+	allowedPath := reference.Path(allowed)
+	if parts := strings.Split(allowedPath, "/"); len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("Compose policy violation: authenticated image repository must be owner/repository")
+	}
+
+	named, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		return fmt.Errorf("Compose policy violation: %s image reference %q is invalid", service, image)
+	}
+	imageRegistry := reference.Domain(named)
+	normalizedImageRegistry := strings.ToLower(strings.TrimSuffix(strings.SplitN(imageRegistry, ":", 2)[0], "."))
+	if normalizedImageRegistry != registry {
+		return nil
+	}
+	if imageRegistry != registry {
+		return fmt.Errorf("Compose policy violation: %s uses non-canonical authenticated registry %q", service, imageRegistry)
+	}
+
+	if _, digested := named.(reference.Digested); digested {
+		return fmt.Errorf("Compose policy violation: %s image %q uses a digest instead of authenticated tag %s", service, image, tag)
+	}
+	tagged, ok := named.(reference.Tagged)
+	if !ok || tagged.Tag() != tag {
+		return fmt.Errorf("Compose policy violation: %s image %q does not use authenticated tag %s", service, image, tag)
+	}
+	imagePath := reference.Path(named)
+	suffix := strings.TrimPrefix(imagePath, allowedPath+"-")
+	if imagePath != allowedPath &&
+		(!strings.HasPrefix(imagePath, allowedPath+"-") || suffix == "" || strings.Contains(suffix, "/")) {
+		return fmt.Errorf("Compose policy violation: %s image %q is outside authenticated repository %s at tag %s", service, image, repository, tag)
 	}
 	return nil
 }

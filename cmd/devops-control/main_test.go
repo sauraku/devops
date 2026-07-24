@@ -80,3 +80,30 @@ func TestValidateComposeSourceCommand(t *testing.T) {
 		t.Fatalf("unsafe Compose command handled=%v err=%v", handled, err)
 	}
 }
+
+func TestValidateComposeRenderedCommandEnforcesAuthenticatedImageScope(t *testing.T) {
+	root := t.TempDir()
+	renderedPath := filepath.Join(root, "compose.json")
+	allowed := `{"services":{"backend":{"image":"ghcr.io/sauraku/medusa-backend:sha-abc"}}}`
+	if err := os.WriteFile(renderedPath, []byte(allowed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{
+		"validate-compose-rendered",
+		renderedPath,
+		"medusa-dev",
+		"ghcr.io/sauraku/medusa",
+		"sha-abc",
+	}
+	if handled, err := validateComposeSourceCommand(args); !handled || err != nil {
+		t.Fatalf("allowed authenticated image handled=%v err=%v", handled, err)
+	}
+
+	disallowed := `{"services":{"backend":{"image":"ghcr.io/sauraku/other-private:sha-abc"}}}`
+	if err := os.WriteFile(renderedPath, []byte(disallowed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := validateComposeSourceCommand(args); !handled || err == nil {
+		t.Fatalf("out-of-scope authenticated image handled=%v err=%v", handled, err)
+	}
+}

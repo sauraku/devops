@@ -513,6 +513,8 @@ case "${1:-}" in
   validate-compose-rendered)
     [[ "${2:-}" == */State/medusa/compose-config.* ]]
     [[ "${3:-}" == medusa-main ]]
+    [[ "${4:-}" == ghcr.io/sauraku/medusa ]]
+    [[ "${5:-}" == release-test ]]
     ;;
   *)
     exit 42
@@ -535,12 +537,13 @@ esac
 		t.Setenv(key, "")
 	}
 	controllerEnv := map[string]string{
-		"BASE_DIR":           baseDir,
-		"DEPLOY_ID":          "deploy-private-env-test",
-		"DEPLOY_SHA":         strings.Repeat("a", 40),
-		"IMAGE_TAG":          "release-test",
-		"PROJECT_ID":         "medusa",
-		"DEVOPS_CONTROL_BIN": filepath.Join(binDir, "devops-control"),
+		"BASE_DIR":                      baseDir,
+		"DEPLOY_ID":                     "deploy-private-env-test",
+		"DEPLOY_SHA":                    strings.Repeat("a", 40),
+		"IMAGE_TAG":                     "release-test",
+		"PROJECT_ID":                    "medusa",
+		"DEVOPS_CONTROL_BIN":            filepath.Join(binDir, "devops-control"),
+		"AUTHENTICATED_GHCR_REPOSITORY": "ghcr.io/sauraku/medusa",
 	}
 	overrides := map[string]string{
 		"APP_VALUE":              "operator-value",
@@ -912,4 +915,283 @@ exit 91
 	if _, err := os.Stat(filepath.Join(globalConfigDir, "authenticated")); !os.IsNotExist(err) {
 		t.Fatalf("registry auth remained in global Docker config: %v", err)
 	}
+}
+
+func TestDeploymentRegistryAuthFallsBackToStoredGitHubPATForGHCR(t *testing.T) {
+	root := t.TempDir()
+	capturePath := filepath.Join(root, "docker-login")
+	writeRegistryLoginStub(t, root, capturePath, false)
+
+	database := openDeployTestDB(t, root)
+	project := &models.Project{
+		ID:           "medusa",
+		RepoURL:      "https://github.com/sauraku/medusa.git",
+		RegistryHost: "ghcr.io",
+	}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	pat := "ghp_" + strings.Repeat("a", 36)
+	if err := database.SaveRunnerToken(project.ID, pat); err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewDeployService(database, docker.NewClient(), NewAuditService(database), &models.Config{GithubUser: "pat-owner"})
+	auth, authenticatedRepository, err := service.registryAuthForDeployment(project)
+	if err != nil {
+		t.Fatalf("registry auth: %v", err)
+	}
+	if auth == nil {
+		t.Fatal("stored GitHub PAT did not produce isolated GHCR auth")
+	}
+	if authenticatedRepository != "ghcr.io/sauraku/medusa" {
+		t.Fatalf("authenticated repository = %q, want ghcr.io/sauraku/medusa", authenticatedRepository)
+	}
+	t.Cleanup(func() { _ = auth.Close() })
+
+	got, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "ghcr.io|pat-owner|" + pat; strings.TrimSpace(string(got)) != want {
+		t.Fatalf("registry login = %q, want %q", strings.TrimSpace(string(got)), want)
+	}
+	if info, err := os.Stat(auth.ConfigDir()); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o700 {
+		t.Fatalf("isolated Docker config mode = %o, want 700", info.Mode().Perm())
+	}
+}
+
+func TestDeploymentRegistryAuthExplicitCredentialTakesPrecedence(t *testing.T) {
+	root := t.TempDir()
+	capturePath := filepath.Join(root, "docker-login")
+	writeRegistryLoginStub(t, root, capturePath, false)
+
+	database := openDeployTestDB(t, root)
+	project := &models.Project{
+		ID:               "medusa",
+		RepoURL:          "https://github.com/sauraku/medusa",
+		RegistryHost:     "ghcr.io",
+		RegistryUsername: "registry-operator",
+	}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SaveRunnerToken(project.ID, "ghp_"+strings.Repeat("a", 36)); err != nil {
+		t.Fatal(err)
+	}
+	const explicitPassword = "explicit-registry-password"
+	if err := database.SaveRegistryPassword(project.ID, explicitPassword); err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewDeployService(database, docker.NewClient(), NewAuditService(database), &models.Config{GithubUser: "pat-owner"})
+	auth, authenticatedRepository, err := service.registryAuthForDeployment(project)
+	if err != nil {
+		t.Fatalf("registry auth: %v", err)
+	}
+	if auth == nil {
+		t.Fatal("explicit registry credential did not produce isolated auth")
+	}
+	if authenticatedRepository != "" {
+		t.Fatalf("explicit credential unexpectedly constrained to fallback repository %q", authenticatedRepository)
+	}
+	t.Cleanup(func() { _ = auth.Close() })
+
+	got, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "ghcr.io|registry-operator|" + explicitPassword; strings.TrimSpace(string(got)) != want {
+		t.Fatalf("registry login = %q, want %q", strings.TrimSpace(string(got)), want)
+	}
+}
+
+func TestDeploymentRegistryAuthDoesNotReuseRunnerCredentialOutsideBoundedFallback(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		repoURL string
+		token   string
+	}{
+		{
+			name:    "different registry",
+			host:    "registry.example",
+			repoURL: "https://github.com/sauraku/medusa",
+			token:   "ghp_" + strings.Repeat("a", 36),
+		},
+		{
+			name:    "non GitHub repository",
+			host:    "ghcr.io",
+			repoURL: "https://github.com.evil.example/sauraku/medusa",
+			token:   "ghp_" + strings.Repeat("a", 36),
+		},
+		{
+			name:    "short lived runner token",
+			host:    "ghcr.io",
+			repoURL: "https://github.com/sauraku/medusa",
+			token:   "short-lived-registration-token",
+		},
+		{
+			name:    "short PAT shaped token",
+			host:    "ghcr.io",
+			repoURL: "https://github.com/sauraku/medusa",
+			token:   "ghp_not-a-long-lived-pat",
+		},
+		{
+			name:    "registry host is not exact",
+			host:    "GHCR.IO",
+			repoURL: "https://github.com/sauraku/medusa",
+			token:   "ghp_" + strings.Repeat("a", 36),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			capturePath := filepath.Join(root, "docker-login")
+			writeRegistryLoginStub(t, root, capturePath, false)
+			database := openDeployTestDB(t, root)
+			project := &models.Project{
+				ID:           "medusa",
+				RepoURL:      tc.repoURL,
+				RegistryHost: tc.host,
+			}
+			if err := database.UpsertProject(project); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.SaveRunnerToken(project.ID, tc.token); err != nil {
+				t.Fatal(err)
+			}
+
+			service := NewDeployService(database, docker.NewClient(), NewAuditService(database), &models.Config{GithubUser: "pat-owner"})
+			auth, authenticatedRepository, err := service.registryAuthForDeployment(project)
+			if err != nil {
+				t.Fatalf("registry auth: %v", err)
+			}
+			if auth != nil {
+				_ = auth.Close()
+				t.Fatal("runner credential was reused outside the bounded GHCR fallback")
+			}
+			if authenticatedRepository != "" {
+				t.Fatalf("unexpected authenticated repository %q", authenticatedRepository)
+			}
+			if _, err := os.Stat(capturePath); !os.IsNotExist(err) {
+				t.Fatalf("Docker login was invoked unexpectedly: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeploymentRegistryAuthDoesNotExposeFallbackPATOnLoginFailure(t *testing.T) {
+	root := t.TempDir()
+	capturePath := filepath.Join(root, "docker-login")
+	writeRegistryLoginStub(t, root, capturePath, true)
+
+	database := openDeployTestDB(t, root)
+	project := &models.Project{
+		ID:           "medusa",
+		RepoURL:      "https://github.com/sauraku/medusa",
+		RegistryHost: "ghcr.io",
+	}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	pat := "ghp_" + strings.Repeat("s", 36)
+	if err := database.SaveRunnerToken(project.ID, pat); err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewDeployService(database, docker.NewClient(), NewAuditService(database), &models.Config{GithubUser: "pat-owner"})
+	auth, _, err := service.registryAuthForDeployment(project)
+	if auth != nil {
+		_ = auth.Close()
+		t.Fatal("failed registry login returned an auth handle")
+	}
+	if err == nil || !strings.Contains(err.Error(), "GHCR login with stored GitHub runner credential failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), pat) {
+		t.Fatal("registry login failure exposed the stored GitHub PAT")
+	}
+}
+
+func TestDeploymentRegistryAuthDoesNotExposeExplicitCredentialOnLoginFailure(t *testing.T) {
+	root := t.TempDir()
+	capturePath := filepath.Join(root, "docker-login")
+	writeRegistryLoginStub(t, root, capturePath, true)
+
+	database := openDeployTestDB(t, root)
+	project := &models.Project{
+		ID:               "medusa",
+		RepoURL:          "https://github.com/sauraku/medusa",
+		RegistryHost:     "ghcr.io",
+		RegistryUsername: "registry-operator",
+	}
+	if err := database.UpsertProject(project); err != nil {
+		t.Fatal(err)
+	}
+	password := "explicit-registry-secret"
+	if err := database.SaveRegistryPassword(project.ID, password); err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewDeployService(database, docker.NewClient(), NewAuditService(database), &models.Config{})
+	auth, _, err := service.registryAuthForDeployment(project)
+	if auth != nil {
+		_ = auth.Close()
+		t.Fatal("failed registry login returned an auth handle")
+	}
+	if err == nil || !strings.Contains(err.Error(), "registry login failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatal("registry login failure exposed the explicit registry credential")
+	}
+}
+
+func openDeployTestDB(t *testing.T, root string) *db.DB {
+	t.Helper()
+	db.InitCrypto(strings.Repeat("r", 64))
+	database, err := db.Open(filepath.Join(root, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return database
+}
+
+func writeRegistryLoginStub(t *testing.T, root, capturePath string, fail bool) {
+	t.Helper()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	failure := ""
+	if fail {
+		// Deliberately mimic a hostile helper echoing stdin. The service must
+		// not copy this output into its error.
+		failure = `printf 'login rejected for %s\n' "$password"
+exit 1`
+	}
+	body := fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" != "login" ]]; then
+	exit 1
+fi
+host="${2:-}"
+test "${3:-}" = "-u"
+username="${4:-}"
+test "${5:-}" = "--password-stdin"
+IFS= read -r password || true
+printf '%%s|%%s|%%s\n' "$host" "$username" "$password" >%q
+%s
+`, capturePath, failure)
+	dockerPath := filepath.Join(binDir, "docker")
+	if err := os.WriteFile(dockerPath, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", root)
 }

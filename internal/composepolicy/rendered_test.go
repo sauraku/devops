@@ -48,3 +48,47 @@ func TestValidateRenderedRejectsUnsafeResourceDrivers(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRenderedConstrainsImagesUsingSharedGHCRCredential(t *testing.T) {
+	policy := AuthenticatedImagePolicy{
+		Registry:   "ghcr.io",
+		Repository: "ghcr.io/sauraku/medusa",
+		Tag:        "sha-0123456789abcdef",
+	}
+	for _, image := range []string{
+		"ghcr.io/sauraku/medusa:sha-0123456789abcdef",
+		"ghcr.io/sauraku/medusa-backend:sha-0123456789abcdef",
+		"ghcr.io/sauraku/medusa-storefront:sha-0123456789abcdef",
+		"postgres:15-alpine",
+		"opensearchproject/opensearch:2.19.6",
+	} {
+		config := []byte(`{"services":{"app":{"image":"` + image + `"}}}`)
+		if err := ValidateRendered(config, "medusa-dev", policy); err != nil {
+			t.Fatalf("allowed image %q was rejected: %v", image, err)
+		}
+	}
+}
+
+func TestValidateRenderedRejectsImagesOutsideSharedGHCRCredentialScope(t *testing.T) {
+	policy := AuthenticatedImagePolicy{
+		Registry:   "ghcr.io",
+		Repository: "ghcr.io/sauraku/medusa",
+		Tag:        "sha-0123456789abcdef",
+	}
+	for _, image := range []string{
+		"ghcr.io/sauraku/another-private-package:sha-0123456789abcdef",
+		"ghcr.io/another-owner/medusa-backend:sha-0123456789abcdef",
+		"ghcr.io/sauraku/medusa-backend:latest",
+		"ghcr.io/sauraku/medusa-backend@sha256:0123456789abcdef",
+		"ghcr.io/sauraku/medusa-backend/private:sha-0123456789abcdef",
+		"ghcr.io/sauraku/medusa-/private:sha-0123456789abcdef",
+		"GHCR.IO/sauraku/medusa-backend:sha-0123456789abcdef",
+		"ghcr.io:443/sauraku/medusa-backend:sha-0123456789abcdef",
+		"ghcr.io./sauraku/medusa-backend:sha-0123456789abcdef",
+	} {
+		config := []byte(`{"services":{"app":{"image":"` + image + `"}}}`)
+		if err := ValidateRendered(config, "medusa-dev", policy); err == nil {
+			t.Fatalf("out-of-scope image %q was accepted", image)
+		}
+	}
+}

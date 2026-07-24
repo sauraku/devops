@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -236,6 +237,7 @@ func (s *DeployService) createDeployment(p *models.Project, req *models.DeployRe
 
 func (s *DeployService) startDeployment(deployment *models.Deployment, p *models.Project, expectedStatus models.DeploymentStatus) error {
 	var registryAuth *docker.RegistryAuth
+	var authenticatedGHCRRepository string
 	registryAuthHandedOff := false
 	defer func() {
 		if registryAuth != nil && !registryAuthHandedOff {
@@ -253,17 +255,9 @@ func (s *DeployService) startDeployment(deployment *models.Deployment, p *models
 		return fmt.Errorf("deployments are paused for project %s", p.ID)
 	}
 
-	pass, err := s.db.GetRegistryPassword(p.ID)
+	registryAuth, authenticatedGHCRRepository, err = s.registryAuthForDeployment(p)
 	if err != nil {
-		return fmt.Errorf("load registry credentials: %w", err)
-	}
-	if pass != "" {
-		var ok bool
-		var message string
-		registryAuth, ok, message = s.docker.RegistryLoginIsolated(p.RegistryHost, p.RegistryUsername, pass)
-		if !ok {
-			return fmt.Errorf("registry login failed: %s", message)
-		}
+		return err
 	}
 
 	controllerEnv, projectOverrides, err := s.deploymentEnv(deployment, p)
@@ -272,6 +266,9 @@ func (s *DeployService) startDeployment(deployment *models.Deployment, p *models
 	}
 	if registryAuth != nil {
 		controllerEnv["DOCKER_CONFIG"] = registryAuth.ConfigDir()
+	}
+	if authenticatedGHCRRepository != "" {
+		controllerEnv["AUTHENTICATED_GHCR_REPOSITORY"] = authenticatedGHCRRepository
 	}
 	lock := &models.DeployLock{
 		ProjectID:   p.ID,
@@ -312,6 +309,82 @@ func (s *DeployService) startDeployment(deployment *models.Deployment, p *models
 	})
 	registryAuthHandedOff = true
 	return nil
+}
+
+// registryAuthForDeployment creates per-deployment registry credentials.
+// An explicit registry password always wins. For GitHub repositories using
+// GHCR, a stored long-lived GitHub PAT may also authorize private image pulls;
+// short-lived runner registration tokens and credentials for other
+// repositories or registries are deliberately not reused.
+func (s *DeployService) registryAuthForDeployment(p *models.Project) (*docker.RegistryAuth, string, error) {
+	password, err := s.db.GetRegistryPassword(p.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("load registry credentials: %w", err)
+	}
+
+	username := p.RegistryUsername
+	usedRunnerPAT := false
+	githubRepository, isGitHubRepository := githubHTTPSRepository(p.RepoURL)
+	if password == "" && p.RegistryHost == "ghcr.io" && isGitHubRepository {
+		runnerCredential, err := s.db.GetRunnerToken(p.ID)
+		if err != nil {
+			return nil, "", fmt.Errorf("load runner credential for GHCR login: %w", err)
+		}
+		if isLongLivedGitHubPAT(runnerCredential) {
+			if err := validateSingleLineSecret(runnerCredential); err != nil {
+				return nil, "", fmt.Errorf("stored GitHub runner credential is invalid")
+			}
+			password = runnerCredential
+			usedRunnerPAT = true
+			if username == "" && s.cfg != nil {
+				username = strings.TrimSpace(s.cfg.GithubUser)
+			}
+			if username == "" {
+				return nil, "", fmt.Errorf("GHCR login with stored GitHub runner credential requires a registry username or configured GitHub user")
+			}
+		}
+	}
+	if password == "" {
+		return nil, "", nil
+	}
+
+	registryAuth, ok, _ := s.docker.RegistryLoginIsolated(p.RegistryHost, username, password)
+	if !ok {
+		if usedRunnerPAT {
+			return nil, "", fmt.Errorf("GHCR login with stored GitHub runner credential failed; verify the PAT has package read access")
+		}
+		return nil, "", fmt.Errorf("registry login failed; verify the registry host, username, and credential")
+	}
+	if usedRunnerPAT {
+		return registryAuth, "ghcr.io/" + githubRepository, nil
+	}
+	return registryAuth, "", nil
+}
+
+func githubHTTPSRepository(rawURL string) (string, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), "github.com") ||
+		parsed.User != nil || parsed.Port() != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	parts := strings.Split(strings.Trim(strings.TrimSuffix(parsed.Path, ".git"), "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", false
+	}
+	return strings.ToLower(parts[0] + "/" + parts[1]), true
+}
+
+func isLongLivedGitHubPAT(token string) bool {
+	if legacyGitHubPATRE.MatchString(token) {
+		return true
+	}
+	if strings.HasPrefix(token, "ghp_") || strings.HasPrefix(token, "github_pat_") {
+		// Classic PATs are 40 characters including the ghp_ prefix; current
+		// fine-grained PATs are longer. This lower bound avoids treating a
+		// short-lived runner token or arbitrary prefix-shaped value as a PAT.
+		return len(token) >= 40
+	}
+	return false
 }
 
 func (s *DeployService) deploymentEnv(deployment *models.Deployment, p *models.Project) (map[string]string, map[string]string, error) {
@@ -595,6 +668,7 @@ var (
 		"PROJECT_ID", "REPO_URL", "REGISTRY_HOST", "BASE_DIR", "PROJECT_LOG_DIR",
 		"GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_ACTOR", "GITHUB_REPOSITORY",
 		"GITHUB_WORKFLOW", "COMMIT_MESSAGE", "DOCKER_CONFIG", "DEVOPS_CONTROL_BIN",
+		"AUTHENTICATED_GHCR_REPOSITORY",
 	)
 	backupControllerEnvKeys = envKeySet(
 		"DEPLOY_ID", "TARGET_BRANCH", "BACKUP_KIND", "BACKUP_REASON",

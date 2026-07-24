@@ -470,7 +470,18 @@ if ! "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" -f "${runtime_compose_file
   echo "Error: Compose config is invalid or this Compose version cannot emit JSON." >&2
   exit 1
 fi
-"${DEVOPS_CONTROL_BIN}" validate-compose-rendered "${compose_config_json}" "${COMPOSE_PROJECT_NAME}"
+compose_policy_args=(
+  validate-compose-rendered
+  "${compose_config_json}"
+  "${COMPOSE_PROJECT_NAME}"
+)
+if [ -n "${AUTHENTICATED_GHCR_REPOSITORY:-}" ]; then
+  compose_policy_args+=(
+    "${AUTHENTICATED_GHCR_REPOSITORY}"
+    "${IMAGE_TAG}"
+  )
+fi
+"${DEVOPS_CONTROL_BIN}" "${compose_policy_args[@]}"
 rm -f "${compose_config_json}"
 compose_config_json=""
 
